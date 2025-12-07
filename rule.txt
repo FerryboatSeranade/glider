@@ -1,0 +1,4 @@
+# Rules for different users
+user:user1,proxy_a
+user:user2,proxy_b
+user:user3,proxy_c 
