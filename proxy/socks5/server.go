@@ -197,14 +197,18 @@ func newSession(key string, src, dst net.Addr, srcPC *PktConn, user string) *Ses
 	return &Session{key, src, dst, srcPC, make(chan message, 32), make(chan struct{}), user}
 }
 
+func (s *Socks5) authEnabled() bool {
+	return s.auth != nil && s.auth.HasUsers()
+}
+
 func (s *Socks5) validUser(user, pass string) bool {
-	if len(s.users) == 0 {
+	if s.auth == nil {
 		return true
 	}
-	if expected, ok := s.users[user]; ok {
-		return expected == pass
+	if !s.auth.HasUsers() {
+		return true
 	}
-	return false
+	return s.auth.Validate(user, pass)
 }
 
 func (s *Socks5) dialWithUser(user, network, addr string) (net.Conn, proxy.Dialer, error) {
@@ -265,7 +269,7 @@ func (s *Socks5) handshake(c net.Conn) (socks.Addr, string, error) {
 	}
 
 	// write VER METHOD
-	if len(s.users) > 0 {
+	if s.authEnabled() {
 		_, err := c.Write([]byte{Version, socks.AuthPassword})
 		if err != nil {
 			return nil, "", err

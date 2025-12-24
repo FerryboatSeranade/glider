@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
@@ -19,18 +20,20 @@ import (
 var (
 	version = "0.17.0"
 	config  = parseConfig()
+	pxySw   *proxy.Switcher
 )
 
 func main() {
 	// global rule proxy
 	pxy := rule.NewProxy(config.Forwards, &config.Strategy, config.rules)
+	pxySw = proxy.NewSwitcher(pxy)
 
 	// ipset manager
 	ipsetM, _ := ipset.NewManager(config.rules)
 
 	// check and setup dns server
 	if config.DNS != "" {
-		d, err := dns.NewServer(config.DNS, pxy, &config.DNSConfig)
+		d, err := dns.NewServer(config.DNS, pxySw, &config.DNSConfig)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -45,7 +48,12 @@ func main() {
 		}
 
 		// add a handler to update proxy rules when a domain resolved
-		d.AddHandler(pxy.AddDomainIP)
+		d.AddHandler(func(domain string, ip netip.Addr) error {
+			if cur, ok := pxySw.Current().(*rule.Proxy); ok {
+				return cur.AddDomainIP(domain, ip)
+			}
+			return nil
+		})
 		if ipsetM != nil {
 			d.AddHandler(ipsetM.AddDomainIP)
 		}
@@ -71,12 +79,15 @@ func main() {
 
 	// run proxy servers
 	for _, listen := range config.Listens {
-		local, err := proxy.ServerFromURL(listen, pxy)
+		local, err := proxy.ServerFromURL(listen, pxySw)
 		if err != nil {
 			log.Fatal(err)
 		}
 		go local.ListenAndServe()
 	}
+
+	// admin server
+	startAdminServer(config, pxySw)
 
 	// run services
 	for _, s := range config.Services {

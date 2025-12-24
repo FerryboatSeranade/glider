@@ -27,7 +27,7 @@ type Socks5 struct {
 	addr     string
 	user     string
 	password string
-	users    map[string]string
+	auth     *proxy.UserStore
 	userByIP sync.Map
 }
 
@@ -50,6 +50,11 @@ func NewSocks5(s string, d proxy.Dialer, p proxy.Proxy) (*Socks5, error) {
 		}
 		users[user] = pass
 	}
+	auth := proxy.DefaultUserStore
+	if len(users) > 0 {
+		auth = proxy.NewUserStore()
+		auth.Set(users)
+	}
 
 	h := &Socks5{
 		dialer:   d,
@@ -57,7 +62,7 @@ func NewSocks5(s string, d proxy.Dialer, p proxy.Proxy) (*Socks5, error) {
 		addr:     addr,
 		user:     user,
 		password: pass,
-		users:    users,
+		auth:     auth,
 	}
 
 	return h, nil

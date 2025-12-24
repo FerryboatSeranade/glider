@@ -36,6 +36,8 @@ type Config struct {
 	rules []*rule.Config
 
 	Services []string
+
+	Admin string
 }
 
 func parseConfig() *Config {
@@ -91,6 +93,9 @@ check=disable: disable health check`)
 	// service configs
 	flag.StringSliceUniqVar(&conf.Services, "service", nil, "run specified services, format: SERVICE_NAME[,SERVICE_CONFIG]")
 
+	// admin server
+	flag.StringVar(&conf.Admin, "admin", "", "admin web listen address")
+
 	flag.Usage = usage
 	if err := flag.Parse(); err != nil {
 		// flag.Usage()
@@ -127,11 +132,13 @@ check=disable: disable health check`)
 		proxy.UDPBufSize = conf.UDPBufSize
 	}
 
-	loadRules(conf)
+	if err := loadRules(conf); err != nil {
+		log.Fatal(err)
+	}
 	return conf
 }
 
-func loadRules(conf *Config) {
+func loadRules(conf *Config) error {
 	// rulefiles
 	for _, ruleFile := range conf.RuleFiles {
 		if !path.IsAbs(ruleFile) {
@@ -140,7 +147,7 @@ func loadRules(conf *Config) {
 
 		rule, err := rule.NewConfFromFile(ruleFile)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
 		conf.rules = append(conf.rules, rule)
@@ -155,11 +162,13 @@ func loadRules(conf *Config) {
 		for _, ruleFile := range ruleFolderFiles {
 			rule, err := rule.NewConfFromFile(ruleFile)
 			if err != nil {
-				log.Fatal(err)
+				return err
 			}
 			conf.rules = append(conf.rules, rule)
 		}
 	}
+
+	return nil
 }
 
 func usage() {

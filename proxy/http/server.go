@@ -67,7 +67,7 @@ func (s *HTTP) Serve(cc net.Conn) {
 func (s *HTTP) servRequest(req *request, c *proxy.Conn) {
 	// Auth
 	authUser := ""
-	if len(s.users) > 0 || (s.user != "" && s.password != "") {
+	if s.authEnabled() {
 		user, pass, ok := s.checkAuth(req.auth)
 		if !ok {
 			io.WriteString(c, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n")
@@ -174,17 +174,12 @@ func (s *HTTP) checkAuth(auth string) (string, string, bool) {
 		return user, pass, false
 	}
 
-	if len(s.users) > 0 {
-		if expected, ok := s.users[user]; ok && expected == pass {
+	if s.auth != nil && s.auth.HasUsers() {
+		if s.auth.Validate(user, pass) {
 			return user, pass, true
 		}
 		return user, pass, false
 	}
-
-	if s.user != "" && s.password != "" {
-		return user, pass, user == s.user && pass == s.password
-	}
-
 	return user, pass, true
 }
 
@@ -195,4 +190,8 @@ func (s *HTTP) dialWithUser(user, network, addr string) (net.Conn, proxy.Dialer,
 		}
 	}
 	return s.proxy.Dial(network, addr)
+}
+
+func (s *HTTP) authEnabled() bool {
+	return s.auth != nil && s.auth.HasUsers()
 }
