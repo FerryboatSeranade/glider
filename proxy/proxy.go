@@ -20,6 +20,18 @@ type Proxy interface {
 	Record(dialer Dialer, success bool)
 }
 
+// UserDialer is an optional interface for user-aware routing.
+type UserDialer interface {
+	// DialWithUser connects to the given address via the proxy with a user hint.
+	DialWithUser(user, network, addr string) (c net.Conn, dialer Dialer, err error)
+
+	// DialUDPWithUser connects to the given address via the proxy with a user hint.
+	DialUDPWithUser(user, network, addr string) (pc net.PacketConn, dialer UDPDialer, err error)
+
+	// NextDialerWithUser returns the next dialer with a user hint.
+	NextDialerWithUser(user, dstAddr string) Dialer
+}
+
 var (
 	msg    strings.Builder
 	usages = make(map[string]string)

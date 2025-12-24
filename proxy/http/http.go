@@ -22,6 +22,7 @@ type HTTP struct {
 	addr     string
 	user     string
 	password string
+	users    map[string]string
 	pretend  bool
 }
 
@@ -41,6 +42,13 @@ func NewHTTP(s string, d proxy.Dialer, p proxy.Proxy) (*HTTP, error) {
 	addr := u.Host
 	user := u.User.Username()
 	pass, _ := u.User.Password()
+	users := proxy.ParseUsersParam(u.Query().Get("users"))
+	if user != "" {
+		if users == nil {
+			users = make(map[string]string)
+		}
+		users[user] = pass
+	}
 
 	h := &HTTP{
 		dialer:   d,
@@ -48,6 +56,7 @@ func NewHTTP(s string, d proxy.Dialer, p proxy.Proxy) (*HTTP, error) {
 		addr:     addr,
 		user:     user,
 		password: pass,
+		users:    users,
 		pretend:  false,
 	}
 

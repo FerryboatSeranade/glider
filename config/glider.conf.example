@@ -35,6 +35,9 @@ verbose=True
 # listen=:8443
 listen=127.0.0.1:8443
 
+# listen on 8443 with multiple users (username:password list).
+# listen=socks5://:8443?users=user1:pass1,user2:pass2
+
 # listen on 8448 as a ss server.
 # listen=ss://AEAD_CHACHA20_POLY1305:pass@:8448
 

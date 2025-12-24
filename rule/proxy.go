@@ -17,6 +17,7 @@ type Proxy struct {
 	domainMap sync.Map
 	ipMap     sync.Map
 	cidrMap   sync.Map
+	userMap   sync.Map
 }
 
 // NewProxy returns a new rule proxy.
@@ -29,6 +30,10 @@ func NewProxy(mainForwarders []string, mainStrategy *Strategy, rules []*Config) 
 
 		for _, domain := range r.Domain {
 			rd.domainMap.Store(strings.ToLower(domain), group)
+		}
+
+		for _, user := range r.User {
+			rd.userMap.Store(user, group)
 		}
 
 		for _, s := range r.IP {
@@ -72,9 +77,19 @@ func (p *Proxy) Dial(network, addr string) (net.Conn, proxy.Dialer, error) {
 	return p.findDialer(addr).Dial(network, addr)
 }
 
+// DialWithUser dials to target addr with a user hint and returns a conn.
+func (p *Proxy) DialWithUser(user, network, addr string) (net.Conn, proxy.Dialer, error) {
+	return p.findDialerWithUser(user, addr).Dial(network, addr)
+}
+
 // DialUDP connects to the given address via the proxy.
 func (p *Proxy) DialUDP(network, addr string) (pc net.PacketConn, dialer proxy.UDPDialer, err error) {
 	return p.findDialer(addr).DialUDP(network, addr)
+}
+
+// DialUDPWithUser connects to the given address via the proxy with a user hint.
+func (p *Proxy) DialUDPWithUser(user, network, addr string) (pc net.PacketConn, dialer proxy.UDPDialer, err error) {
+	return p.findDialerWithUser(user, addr).DialUDP(network, addr)
 }
 
 // findDialer returns a dialer by dstAddr according to rule.
@@ -117,9 +132,24 @@ func (p *Proxy) findDialer(dstAddr string) *FwdrGroup {
 	return p.main
 }
 
+// findDialerWithUser returns a dialer by user then dstAddr.
+func (p *Proxy) findDialerWithUser(user, dstAddr string) *FwdrGroup {
+	if user != "" {
+		if dialer, ok := p.userMap.Load(user); ok {
+			return dialer.(*FwdrGroup)
+		}
+	}
+	return p.findDialer(dstAddr)
+}
+
 // NextDialer returns next dialer according to rule.
 func (p *Proxy) NextDialer(dstAddr string) proxy.Dialer {
 	return p.findDialer(dstAddr).NextDialer(dstAddr)
+}
+
+// NextDialerWithUser returns next dialer according to user then rule.
+func (p *Proxy) NextDialerWithUser(user, dstAddr string) proxy.Dialer {
+	return p.findDialerWithUser(user, dstAddr).NextDialer(dstAddr)
 }
 
 // Record records result while using the dialer from proxy.

@@ -63,7 +63,7 @@ func main() {
 	}
 
 	for _, r := range config.rules {
-		r.IP, r.CIDR, r.Domain = nil, nil, nil
+		r.IP, r.CIDR, r.Domain, r.User = nil, nil, nil, nil
 	}
 
 	// enable checkers

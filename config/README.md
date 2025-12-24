@@ -85,6 +85,9 @@ ipset=glider
 # matches abc.com and *.abc.com
 domain=abc.com
 
+# matches username (auth user)
+user=user1
+
 # matches 1.1.1.1
 ip=1.1.1.1
 

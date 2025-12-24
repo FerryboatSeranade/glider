@@ -60,7 +60,10 @@ func (s *Socks5) Serve(c net.Conn) {
 		c.SetKeepAlive(true)
 	}
 
-	tgt, err := s.handshake(c)
+	tgt, user, err := s.handshake(c)
+	if user != "" {
+		s.storeUserForAddr(c.RemoteAddr().String(), user)
+	}
 	if err != nil {
 		// UDP: keep the connection until disconnect then free the UDP socket
 		if err == socks.Errors[9] {
@@ -81,7 +84,7 @@ func (s *Socks5) Serve(c net.Conn) {
 		return
 	}
 
-	rc, dialer, err := s.proxy.Dial("tcp", tgt.String())
+	rc, dialer, err := s.dialWithUser(user, "tcp", tgt.String())
 	if err != nil {
 		log.F("[socks5] %s <-> %s via %s, error in dial: %v", c.RemoteAddr(), tgt, dialer.Addr(), err)
 		return
@@ -125,12 +128,13 @@ func (s *Socks5) ServePacket(pc net.PacketConn) {
 			continue
 		}
 
+		user := s.userForAddr(srcAddr.String())
 		var session *Session
 		sessionKey := srcAddr.String()
 
 		v, ok := nm.Load(sessionKey)
 		if !ok || v == nil {
-			session = newSession(sessionKey, srcAddr, dstAddr, c)
+			session = newSession(sessionKey, srcAddr, dstAddr, c, user)
 			nm.Store(sessionKey, session)
 			go s.serveSession(session)
 		} else {
@@ -142,7 +146,7 @@ func (s *Socks5) ServePacket(pc net.PacketConn) {
 }
 
 func (s *Socks5) serveSession(session *Session) {
-	dstPC, dialer, err := s.proxy.DialUDP("udp", session.srcPC.target.String())
+	dstPC, dialer, err := s.dialUDPWithUser(session.user, "udp", session.srcPC.target.String())
 	if err != nil {
 		log.F("[socks5u] remote dial error: %v", err)
 		nm.Delete(session.key)
@@ -186,97 +190,149 @@ type Session struct {
 	srcPC *PktConn
 	msgCh chan message
 	finCh chan struct{}
+	user  string
 }
 
-func newSession(key string, src, dst net.Addr, srcPC *PktConn) *Session {
-	return &Session{key, src, dst, srcPC, make(chan message, 32), make(chan struct{})}
+func newSession(key string, src, dst net.Addr, srcPC *PktConn, user string) *Session {
+	return &Session{key, src, dst, srcPC, make(chan message, 32), make(chan struct{}), user}
+}
+
+func (s *Socks5) validUser(user, pass string) bool {
+	if len(s.users) == 0 {
+		return true
+	}
+	if expected, ok := s.users[user]; ok {
+		return expected == pass
+	}
+	return false
+}
+
+func (s *Socks5) dialWithUser(user, network, addr string) (net.Conn, proxy.Dialer, error) {
+	if user != "" {
+		if ud, ok := s.proxy.(proxy.UserDialer); ok {
+			return ud.DialWithUser(user, network, addr)
+		}
+	}
+	return s.proxy.Dial(network, addr)
+}
+
+func (s *Socks5) dialUDPWithUser(user, network, addr string) (net.PacketConn, proxy.UDPDialer, error) {
+	if user != "" {
+		if ud, ok := s.proxy.(proxy.UserDialer); ok {
+			return ud.DialUDPWithUser(user, network, addr)
+		}
+	}
+	return s.proxy.DialUDP(network, addr)
+}
+
+func (s *Socks5) storeUserForAddr(addr, user string) {
+	if user == "" {
+		return
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	s.userByIP.Store(host, user)
+}
+
+func (s *Socks5) userForAddr(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	if v, ok := s.userByIP.Load(host); ok {
+		return v.(string)
+	}
+	return ""
 }
 
 // Handshake fast-tracks SOCKS initialization to get target address to connect.
-func (s *Socks5) handshake(c net.Conn) (socks.Addr, error) {
+func (s *Socks5) handshake(c net.Conn) (socks.Addr, string, error) {
 	// Read RFC 1928 for request and reply structure and sizes
 	buf := pool.GetBuffer(socks.MaxAddrLen)
 	defer pool.PutBuffer(buf)
+	authUser := ""
 
 	// read VER, NMETHODS, METHODS
 	if _, err := io.ReadFull(c, buf[:2]); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	nmethods := buf[1]
 	if _, err := io.ReadFull(c, buf[:nmethods]); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// write VER METHOD
-	if s.user != "" && s.password != "" {
+	if len(s.users) > 0 {
 		_, err := c.Write([]byte{Version, socks.AuthPassword})
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 
 		_, err = io.ReadFull(c, buf[:2])
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 
 		// Get username
 		userLen := int(buf[1])
 		if userLen <= 0 {
 			c.Write([]byte{1, 1})
-			return nil, errors.New("auth failed: wrong username length")
+			return nil, "", errors.New("auth failed: wrong username length")
 		}
 
 		if _, err := io.ReadFull(c, buf[:userLen]); err != nil {
-			return nil, errors.New("auth failed: cannot get username")
+			return nil, "", errors.New("auth failed: cannot get username")
 		}
-		user := string(buf[:userLen])
+		authUser = string(buf[:userLen])
 
 		// Get password
 		_, err = c.Read(buf[:1])
 		if err != nil {
-			return nil, errors.New("auth failed: cannot get password len")
+			return nil, "", errors.New("auth failed: cannot get password len")
 		}
 
 		passLen := int(buf[0])
 		if passLen <= 0 {
 			c.Write([]byte{1, 1})
-			return nil, errors.New("auth failed: wrong password length")
+			return nil, "", errors.New("auth failed: wrong password length")
 		}
 
 		_, err = io.ReadFull(c, buf[:passLen])
 		if err != nil {
-			return nil, errors.New("auth failed: cannot get password")
+			return nil, "", errors.New("auth failed: cannot get password")
 		}
 		pass := string(buf[:passLen])
 
 		// Verify
-		if user != s.user || pass != s.password {
+		if !s.validUser(authUser, pass) {
 			_, err = c.Write([]byte{1, 1})
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
-			return nil, errors.New("auth failed, authinfo: " + user + ":" + pass)
+			return nil, "", errors.New("auth failed, authinfo: " + authUser + ":" + pass)
 		}
 
 		// Response auth state
 		_, err = c.Write([]byte{1, 0})
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 
 	} else if _, err := c.Write([]byte{Version, socks.AuthNone}); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// read VER CMD RSV ATYP DST.ADDR DST.PORT
 	if _, err := io.ReadFull(c, buf[:3]); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	cmd := buf[1]
 	addr, err := socks.ReadAddr(c)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	switch cmd {
 	case socks.CmdConnect:
@@ -288,12 +344,12 @@ func (s *Socks5) handshake(c net.Conn) (socks.Addr, error) {
 		}
 		_, err = c.Write(append([]byte{5, 0, 0}, listenAddr...)) // SOCKS v5, reply succeeded
 		if err != nil {
-			return nil, socks.Errors[7]
+			return nil, "", socks.Errors[7]
 		}
 		err = socks.Errors[9]
 	default:
-		return nil, socks.Errors[7]
+		return nil, "", socks.Errors[7]
 	}
 
-	return addr, err // skip VER, CMD, RSV fields
+	return addr, authUser, err // skip VER, CMD, RSV fields
 }

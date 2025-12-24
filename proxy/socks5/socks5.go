@@ -11,6 +11,7 @@ package socks5
 
 import (
 	"net/url"
+	"sync"
 
 	"github.com/nadoo/glider/pkg/log"
 	"github.com/nadoo/glider/proxy"
@@ -26,6 +27,8 @@ type Socks5 struct {
 	addr     string
 	user     string
 	password string
+	users    map[string]string
+	userByIP sync.Map
 }
 
 // NewSocks5 returns a Proxy that makes SOCKS v5 connections to the given address.
@@ -40,6 +43,13 @@ func NewSocks5(s string, d proxy.Dialer, p proxy.Proxy) (*Socks5, error) {
 	addr := u.Host
 	user := u.User.Username()
 	pass, _ := u.User.Password()
+	users := proxy.ParseUsersParam(u.Query().Get("users"))
+	if user != "" {
+		if users == nil {
+			users = make(map[string]string)
+		}
+		users[user] = pass
+	}
 
 	h := &Socks5{
 		dialer:   d,
@@ -47,6 +57,7 @@ func NewSocks5(s string, d proxy.Dialer, p proxy.Proxy) (*Socks5, error) {
 		addr:     addr,
 		user:     user,
 		password: pass,
+		users:    users,
 	}
 
 	return h, nil

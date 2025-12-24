@@ -66,24 +66,27 @@ func (s *HTTP) Serve(cc net.Conn) {
 
 func (s *HTTP) servRequest(req *request, c *proxy.Conn) {
 	// Auth
-	if s.user != "" && s.password != "" {
-		if user, pass, ok := extractUserPass(req.auth); !ok || user != s.user || pass != s.password {
+	authUser := ""
+	if len(s.users) > 0 || (s.user != "" && s.password != "") {
+		user, pass, ok := s.checkAuth(req.auth)
+		if !ok {
 			io.WriteString(c, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n")
 			log.F("[http] auth failed from %s, auth info: %s:%s", c.RemoteAddr(), user, pass)
 			return
 		}
+		authUser = user
 	}
 
 	if req.method == "CONNECT" {
-		s.servHTTPS(req, c)
+		s.servHTTPS(req, c, authUser)
 		return
 	}
 
-	s.servHTTP(req, c)
+	s.servHTTP(req, c, authUser)
 }
 
-func (s *HTTP) servHTTPS(r *request, c net.Conn) {
-	rc, dialer, err := s.proxy.Dial("tcp", r.uri)
+func (s *HTTP) servHTTPS(r *request, c net.Conn, user string) {
+	rc, dialer, err := s.dialWithUser(user, "tcp", r.uri)
 	if err != nil {
 		io.WriteString(c, r.proto+" 502 ERROR\r\n\r\n")
 		log.F("[http] %s <-> %s [c] via %s, error in dial: %v", c.RemoteAddr(), r.uri, dialer.Addr(), err)
@@ -104,8 +107,8 @@ func (s *HTTP) servHTTPS(r *request, c net.Conn) {
 	}
 }
 
-func (s *HTTP) servHTTP(req *request, c *proxy.Conn) {
-	rc, dialer, err := s.proxy.Dial("tcp", req.target)
+func (s *HTTP) servHTTP(req *request, c *proxy.Conn, user string) {
+	rc, dialer, err := s.dialWithUser(user, "tcp", req.target)
 	if err != nil {
 		fmt.Fprintf(c, "%s 502 ERROR\r\n\r\n", req.proto)
 		log.F("[http] %s <-> %s via %s, error in dial: %v", c.RemoteAddr(), req.target, dialer.Addr(), err)
@@ -163,4 +166,33 @@ func (s *HTTP) servHTTP(req *request, c *proxy.Conn) {
 	c.Write(buf.Bytes())
 
 	proxy.Copy(c, r)
+}
+
+func (s *HTTP) checkAuth(auth string) (string, string, bool) {
+	user, pass, ok := extractUserPass(auth)
+	if !ok {
+		return user, pass, false
+	}
+
+	if len(s.users) > 0 {
+		if expected, ok := s.users[user]; ok && expected == pass {
+			return user, pass, true
+		}
+		return user, pass, false
+	}
+
+	if s.user != "" && s.password != "" {
+		return user, pass, user == s.user && pass == s.password
+	}
+
+	return user, pass, true
+}
+
+func (s *HTTP) dialWithUser(user, network, addr string) (net.Conn, proxy.Dialer, error) {
+	if user != "" {
+		if ud, ok := s.proxy.(proxy.UserDialer); ok {
+			return ud.DialWithUser(user, network, addr)
+		}
+	}
+	return s.proxy.Dial(network, addr)
 }
