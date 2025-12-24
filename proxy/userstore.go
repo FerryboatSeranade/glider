@@ -2,11 +2,19 @@ package proxy
 
 import (
 	"sync/atomic"
+	"time"
 )
+
+// UserEntry is a user auth record with optional expiration.
+type UserEntry struct {
+	Password  string
+	Enabled   bool
+	ExpiresAt *time.Time
+}
 
 // UserStore keeps a thread-safe snapshot of users for auth checks.
 type UserStore struct {
-	v atomic.Value // stores map[string]string
+	v atomic.Value // stores map[string]UserEntry
 }
 
 // NewUserStore returns a new user store.
@@ -17,24 +25,34 @@ func NewUserStore() *UserStore {
 }
 
 // Set replaces the current users map.
-func (s *UserStore) Set(users map[string]string) {
-	cpy := make(map[string]string)
+func (s *UserStore) Set(users map[string]UserEntry) {
+	cpy := make(map[string]UserEntry)
 	for k, v := range users {
-		cpy[k] = v
+		entry := v
+		if entry.ExpiresAt != nil {
+			t := *entry.ExpiresAt
+			entry.ExpiresAt = &t
+		}
+		cpy[k] = entry
 	}
 	s.v.Store(cpy)
 }
 
 // Users returns a copy of current users.
-func (s *UserStore) Users() map[string]string {
+func (s *UserStore) Users() map[string]UserEntry {
 	v := s.v.Load()
 	if v == nil {
 		return nil
 	}
-	current := v.(map[string]string)
-	out := make(map[string]string, len(current))
+	current := v.(map[string]UserEntry)
+	out := make(map[string]UserEntry, len(current))
 	for k, val := range current {
-		out[k] = val
+		entry := val
+		if entry.ExpiresAt != nil {
+			t := *entry.ExpiresAt
+			entry.ExpiresAt = &t
+		}
+		out[k] = entry
 	}
 	return out
 }
@@ -45,21 +63,27 @@ func (s *UserStore) HasUsers() bool {
 	if v == nil {
 		return false
 	}
-	return len(v.(map[string]string)) > 0
+	return len(v.(map[string]UserEntry)) > 0
 }
 
-// Validate returns true when the provided user/password matches.
+// Validate returns true when the provided user/password matches and is active.
 func (s *UserStore) Validate(user, pass string) bool {
 	v := s.v.Load()
 	if v == nil {
 		return false
 	}
-	current := v.(map[string]string)
-	expected, ok := current[user]
+	current := v.(map[string]UserEntry)
+	entry, ok := current[user]
 	if !ok {
 		return false
 	}
-	return expected == pass
+	if !entry.Enabled {
+		return false
+	}
+	if entry.ExpiresAt != nil && !entry.ExpiresAt.IsZero() && time.Now().After(*entry.ExpiresAt) {
+		return false
+	}
+	return entry.Password == pass
 }
 
 // DefaultUserStore is the shared store for dynamic auth.

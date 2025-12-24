@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,8 +21,9 @@ import (
 )
 
 const (
-	mongoURLEnv = "GLIDER_MONGO_URI"
-	mongoDBEnv  = "GLIDER_MONGO_DB"
+	mongoURLEnv   = "GLIDER_MONGO_URI"
+	mongoDBEnv    = "GLIDER_MONGO_DB"
+	adminTokenEnv = "GLIDER_ADMIN_TOKEN"
 )
 
 type adminServer struct {
@@ -30,6 +32,7 @@ type adminServer struct {
 	rulesDir string
 	conf     *Config
 	pxySw    *proxy.Switcher
+	token    string
 
 	reloadMu   sync.Mutex
 	lastReload time.Time
@@ -48,6 +51,10 @@ func startAdminServer(conf *Config, pxySw *proxy.Switcher) {
 	dbName := strings.TrimSpace(os.Getenv(mongoDBEnv))
 	if dbName == "" {
 		dbName = "glider"
+	}
+	token := strings.TrimSpace(os.Getenv(adminTokenEnv))
+	if token == "" {
+		log.F("[admin] %s not set, admin auth disabled", adminTokenEnv)
 	}
 
 	if conf.RulesDir == "" {
@@ -69,6 +76,7 @@ func startAdminServer(conf *Config, pxySw *proxy.Switcher) {
 		rulesDir: conf.RulesDir,
 		conf:     conf,
 		pxySw:    pxySw,
+		token:    token,
 	}
 	ctxInit, cancelInit := withTimeout(context.Background())
 	defer cancelInit()
@@ -98,6 +106,30 @@ func startAdminServer(conf *Config, pxySw *proxy.Switcher) {
 	}()
 }
 
+func (s *adminServer) requireToken(w http.ResponseWriter, r *http.Request) bool {
+	if s.token == "" {
+		return true
+	}
+	token := tokenFromRequest(r)
+	if token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.token)) == 1 {
+		return true
+	}
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	writeError(w, http.StatusUnauthorized, fmt.Errorf("unauthorized"))
+	return false
+}
+
+func tokenFromRequest(r *http.Request) string {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(auth) >= 7 && strings.EqualFold(auth[:7], "bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	if token := strings.TrimSpace(r.Header.Get("X-Admin-Token")); token != "" {
+		return token
+	}
+	return ""
+}
+
 func (s *adminServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -109,6 +141,9 @@ func (s *adminServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *adminServer) handleUsers(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w, r) {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		ctx, cancel := withTimeout(r.Context())
@@ -142,6 +177,9 @@ func (s *adminServer) handleUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *adminServer) handleUser(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w, r) {
+		return
+	}
 	username, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/users/"))
 	if err != nil || username == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid username"))
@@ -177,6 +215,9 @@ func (s *adminServer) handleUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *adminServer) handleRules(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w, r) {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		ctx, cancel := withTimeout(r.Context())
@@ -214,6 +255,9 @@ func (s *adminServer) handleRules(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *adminServer) handleRule(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w, r) {
+		return
+	}
 	name, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/rules/"))
 	if err != nil || name == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid rule name"))
@@ -271,6 +315,9 @@ func (s *adminServer) handleReload(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.requireToken(w, r) {
+		return
+	}
 	ctx, cancel := withTimeout(r.Context())
 	defer cancel()
 	if err := s.reload(ctx); err != nil {
@@ -319,19 +366,47 @@ func (s *adminServer) reload(ctx context.Context) error {
 	return nil
 }
 
-func buildUserMaps(users []dbUser) (map[string]string, map[string][]string) {
-	userMap := make(map[string]string)
+func buildUserMaps(users []dbUser) (map[string]proxy.UserEntry, map[string][]string) {
+	userMap := make(map[string]proxy.UserEntry)
 	ruleUsers := make(map[string][]string)
+	now := time.Now()
 	for _, u := range users {
 		if u.Username == "" {
 			continue
 		}
-		userMap[u.Username] = u.Password
-		if u.Rule != "" {
+		enabled := true
+		if u.Enabled != nil {
+			enabled = *u.Enabled
+		}
+		entry := proxy.UserEntry{
+			Password:  u.Password,
+			Enabled:   enabled,
+			ExpiresAt: normalizeExpiry(u.ExpiresAt),
+		}
+		userMap[u.Username] = entry
+		if u.Rule != "" && userActive(entry, now) {
 			ruleUsers[u.Rule] = append(ruleUsers[u.Rule], u.Username)
 		}
 	}
 	return userMap, ruleUsers
+}
+
+func userActive(entry proxy.UserEntry, now time.Time) bool {
+	if !entry.Enabled {
+		return false
+	}
+	if entry.ExpiresAt == nil || entry.ExpiresAt.IsZero() {
+		return true
+	}
+	return now.Before(*entry.ExpiresAt)
+}
+
+func normalizeExpiry(t *time.Time) *time.Time {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	tt := *t
+	return &tt
 }
 
 func applyRuleUsers(rules []*rule.Config, ruleUsers map[string][]string) []string {
@@ -426,6 +501,11 @@ const adminHTML = `<!doctype html>
 </head>
 <body>
   <h1>Glider Admin</h1>
+  <div class="row">
+    <input id="adminToken" type="password" placeholder="admin token">
+    <button onclick="saveToken()">Set Token</button>
+    <span id="authStatus"></span>
+  </div>
   <button onclick="reloadConfig()">Reload</button>
   <span id="reloadStatus"></span>
 
@@ -433,6 +513,8 @@ const adminHTML = `<!doctype html>
   <div class="row">
     <input id="userName" placeholder="username">
     <input id="userPass" placeholder="password">
+    <label><input id="userEnabled" type="checkbox" checked> enabled</label>
+    <input id="userExpires" type="datetime-local" placeholder="expires at">
     <select id="userRule"></select>
     <button onclick="saveUser()">Save User</button>
     <button onclick="deleteUser()">Delete User</button>
@@ -449,43 +531,96 @@ const adminHTML = `<!doctype html>
   <div id="rulesList" class="list"></div>
 
 <script>
+let adminToken = localStorage.getItem('gliderAdminToken') || '';
+
+function setStatus(message) {
+  const el = document.getElementById('authStatus');
+  if (el) el.textContent = message || '';
+}
+
+function withAuthHeaders(headers) {
+  const out = Object.assign({}, headers || {});
+  if (adminToken) out['X-Admin-Token'] = adminToken;
+  return out;
+}
+
+function isoToLocalInput(iso) {
+  if (!iso) return '';
+  const date = new Date(iso);
+  if (isNaN(date.getTime())) return '';
+  const tzOffset = date.getTimezoneOffset() * 60000;
+  const local = new Date(date.getTime() - tzOffset);
+  return local.toISOString().slice(0, 16);
+}
+
+function localInputToISO(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (isNaN(date.getTime())) return '';
+  return date.toISOString();
+}
+
+function userStatus(u) {
+  if (u.enabled === false) return 'disabled';
+  if (u.expires_at) {
+    const date = new Date(u.expires_at);
+    if (!isNaN(date.getTime())) {
+      if (date.getTime() <= Date.now()) return 'expired';
+      return 'expires ' + date.toLocaleString();
+    }
+  }
+  return 'active';
+}
+
 async function fetchJSON(url, options) {
-  const res = await fetch(url, options || {});
+  const opts = options || {};
+  opts.headers = withAuthHeaders(opts.headers);
+  const res = await fetch(url, opts);
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;
 }
 
 async function loadRules() {
-  const rules = await fetchJSON('/api/rules');
-  const list = document.getElementById('rulesList');
-  list.innerHTML = '';
-  const sel = document.getElementById('userRule');
-  sel.innerHTML = '<option value="">(default)</option>';
-  rules.forEach(r => {
-    const item = document.createElement('div');
-    item.className = 'item';
-    item.textContent = r.name;
-    item.onclick = () => selectRule(r.name);
-    list.appendChild(item);
-    const opt = document.createElement('option');
-    opt.value = r.name;
-    opt.textContent = r.name;
-    sel.appendChild(opt);
-  });
+  try {
+    const rules = await fetchJSON('/api/rules');
+    const list = document.getElementById('rulesList');
+    list.innerHTML = '';
+    const sel = document.getElementById('userRule');
+    sel.innerHTML = '<option value="">(default)</option>';
+    rules.forEach(r => {
+      const item = document.createElement('div');
+      item.className = 'item';
+      item.textContent = r.name;
+      item.onclick = () => selectRule(r.name);
+      list.appendChild(item);
+      const opt = document.createElement('option');
+      opt.value = r.name;
+      opt.textContent = r.name;
+      sel.appendChild(opt);
+    });
+    setStatus('');
+  } catch (e) {
+    setStatus(e.message);
+  }
 }
 
 async function loadUsers() {
-  const users = await fetchJSON('/api/users');
-  const list = document.getElementById('usersList');
-  list.innerHTML = '';
-  users.forEach(u => {
-    const item = document.createElement('div');
-    item.className = 'item';
-    item.textContent = u.username + ' -> ' + (u.rule || '(default)');
-    item.onclick = () => selectUser(u);
-    list.appendChild(item);
-  });
+  try {
+    const users = await fetchJSON('/api/users');
+    const list = document.getElementById('usersList');
+    list.innerHTML = '';
+    users.forEach(u => {
+      const item = document.createElement('div');
+      item.className = 'item';
+      item.textContent = u.username + ' -> ' + (u.rule || '(default)') + ' (' + userStatus(u) + ')';
+      item.onclick = () => selectUser(u);
+      list.appendChild(item);
+    });
+    setStatus('');
+  } catch (e) {
+    setStatus(e.message);
+  }
 }
 
 async function selectRule(name) {
@@ -498,6 +633,14 @@ function selectUser(u) {
   document.getElementById('userName').value = u.username;
   document.getElementById('userPass').value = u.password || '';
   document.getElementById('userRule').value = u.rule || '';
+  document.getElementById('userEnabled').checked = u.enabled !== false;
+  document.getElementById('userExpires').value = isoToLocalInput(u.expires_at);
+}
+
+function saveToken() {
+  adminToken = document.getElementById('adminToken').value.trim();
+  localStorage.setItem('gliderAdminToken', adminToken);
+  setStatus(adminToken ? 'token set' : 'token cleared');
 }
 
 async function saveRule() {
@@ -520,7 +663,12 @@ async function saveUser() {
   const username = document.getElementById('userName').value.trim();
   const password = document.getElementById('userPass').value;
   const rule = document.getElementById('userRule').value;
-  await fetchJSON('/api/users', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ username, password, rule }) });
+  const enabled = document.getElementById('userEnabled').checked;
+  const expiresRaw = document.getElementById('userExpires').value;
+  const expiresAt = localInputToISO(expiresRaw);
+  const payload = { username, password, rule, enabled };
+  if (expiresAt) payload.expires_at = expiresAt;
+  await fetchJSON('/api/users', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   await loadUsers();
 }
 
@@ -530,6 +678,9 @@ async function deleteUser() {
   await fetchJSON('/api/users/' + encodeURIComponent(username), { method: 'DELETE' });
   document.getElementById('userName').value = '';
   document.getElementById('userPass').value = '';
+  document.getElementById('userRule').value = '';
+  document.getElementById('userEnabled').checked = true;
+  document.getElementById('userExpires').value = '';
   await loadUsers();
 }
 
@@ -546,6 +697,7 @@ async function reloadConfig() {
 
 loadRules();
 loadUsers();
+document.getElementById('adminToken').value = adminToken;
 </script>
 </body>
 </html>`

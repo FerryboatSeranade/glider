@@ -46,9 +46,9 @@ func NewSocks5(s string, d proxy.Dialer, p proxy.Proxy) (*Socks5, error) {
 	users := proxy.ParseUsersParam(u.Query().Get("users"))
 	if user != "" {
 		if users == nil {
-			users = make(map[string]string)
+			users = make(map[string]proxy.UserEntry)
 		}
-		users[user] = pass
+		users[user] = proxy.UserEntry{Password: pass, Enabled: true}
 	}
 	auth := proxy.DefaultUserStore
 	if len(users) > 0 {

@@ -16,10 +16,12 @@ const (
 )
 
 type dbUser struct {
-	Username  string    `bson:"username" json:"username"`
-	Password  string    `bson:"password" json:"password"`
-	Rule      string    `bson:"rule" json:"rule"`
-	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+	Username  string     `bson:"username" json:"username"`
+	Password  string     `bson:"password" json:"password"`
+	Rule      string     `bson:"rule" json:"rule"`
+	Enabled   *bool      `bson:"enabled,omitempty" json:"enabled,omitempty"`
+	ExpiresAt *time.Time `bson:"expires_at,omitempty" json:"expires_at,omitempty"`
+	UpdatedAt time.Time  `bson:"updated_at" json:"updated_at"`
 }
 
 type dbRule struct {
@@ -95,13 +97,23 @@ func (s *mongoStore) Users(ctx context.Context) ([]dbUser, error) {
 
 func (s *mongoStore) UpsertUser(ctx context.Context, u dbUser) error {
 	u.UpdatedAt = time.Now()
+	enabled := true
+	if u.Enabled != nil {
+		enabled = *u.Enabled
+	}
 	update := bson.M{
 		"$set": bson.M{
 			"username":   u.Username,
 			"password":   u.Password,
 			"rule":       u.Rule,
+			"enabled":    enabled,
 			"updated_at": u.UpdatedAt,
 		},
+	}
+	if u.ExpiresAt != nil && !u.ExpiresAt.IsZero() {
+		update["$set"].(bson.M)["expires_at"] = *u.ExpiresAt
+	} else {
+		update["$unset"] = bson.M{"expires_at": ""}
 	}
 	_, err := s.db.Collection(usersCollection).UpdateOne(ctx, bson.M{"username": u.Username}, update, options.Update().SetUpsert(true))
 	return err
