@@ -163,6 +163,24 @@ OPTION:
         do not change it if you do not know what it is, ref: https://pkg.go.dev/log#pkg-constants (default 19)
   -maxfailures int
         max failures to change forwarder status to disabled (default 3)
+  -mode string
+        run mode: admin or node; combined is kept as a deprecated compatibility alias
+  -node-id string
+        unique node id for node mode
+  -central-url string
+        central control plane base URL
+  -node-token string
+        node sync bearer token
+  -sync-interval string
+        node config sync interval (default "30s")
+  -cache-dir string
+        node local config cache directory (default "/var/lib/glider/cache")
+  -cert-dir string
+        node certificate cache directory (default "/etc/glider-certs")
+  -traffic-interface string
+        interface used for node traffic counters (default "eth0")
+  -public-ip string
+        public IP reported in node heartbeat
   -relaytimeout int
         relay timeout(seconds)
   -rulefile value
@@ -318,9 +336,11 @@ Proxy over tls client:
   
 TLS server scheme:
   tls://host:port?cert=PATH&key=PATH[&alpn=proto1][&alpn=proto2]
+  tls://host:port?certDir=DIR[&cert=FALLBACK_CERT&key=FALLBACK_KEY][&alpn=proto1][&alpn=proto2]
   
 Proxy over tls server:
   tls://host:port?cert=PATH&key=PATH,scheme://
+  tls://host:port?certDir=DIR,scheme://
   tls://host:port?cert=PATH&key=PATH,http://
   tls://host:port?cert=PATH&key=PATH,socks5://
   tls://host:port?cert=PATH&key=PATH,ss://method:pass@
@@ -432,6 +452,280 @@ glider -config CONFIG_PATH
 - [Examples](config/examples)
   - [transparent proxy with dnsmasq](config/examples/8.transparent_proxy_with_dnsmasq)
   - [transparent proxy without dnsmasq](config/examples/9.transparent_proxy_without_dnsmasq)
+
+## Central Control Plane And Data Nodes
+
+Glider can run as a centralized control plane plus many lightweight data-plane nodes.
+
+Modes:
+
+- `admin`: runs the Web Admin/API, connects to MongoDB, manages users/rules/nodes/config versions, and exposes `/api/node/config` plus `/api/node/heartbeat`. If `listen`, `dns`, or `service` is configured, admin also starts a local proxy runtime for panel connectivity checks.
+- `node`: runs proxy listeners only, does not start the Admin UI, reads cached config first, then pulls config from the central API and hot-reloads only when `config_version` changes.
+- `combined`: deprecated compatibility alias for old single-host configs. New deployments should use `admin` or `node`.
+
+Recommended central deployment shape:
+
+```text
+/root/data/docker_data/glider-admin/
+  compose.yml
+  .env
+  glider.conf
+  rules.d/
+```
+
+Recommended node deployment shape:
+
+```text
+/root/data/docker_data/glider/
+  compose.yml
+  .env
+  glider.conf
+  rules.d/
+  cache/
+```
+
+Keep source code in GitHub and publish versioned images such as `ghcr.io/ferryboatseranade/glider:<version>`. VPS nodes should use fixed image tags instead of `build: ../glider`.
+
+The GitHub Actions build workflow publishes `ghcr.io/<owner>/glider` with branch, tag, semver, and `sha-*` tags. When you create a tag such as `v2026.06.08-control56`, the workflow also publishes the same GHCR tag, so compose files can pin that exact version.
+
+Central `.env`:
+
+```dotenv
+GLIDER_MODE=admin
+GLIDER_MONGO_URI=mongodb://...
+GLIDER_MONGO_DB=glider
+GLIDER_ADMIN_TOKEN=...
+GLIDER_NODE_TOKEN=...
+GLIDER_ADMIN_ADDR=:8444
+# Optional. Comma/space separated IPs or CIDRs allowed to access Web Admin/API.
+# GLIDER_ADMIN_ALLOWED_CIDRS=203.0.113.10/32,2001:db8::/48
+GLIDER_ADMIN_TRUST_PROXY_HEADERS=false
+GLIDER_SETTINGS_KEY=change-this-32-byte-settings-key
+# Optional fallback if Cloudflare is not configured in the Admin UI:
+# GLIDER_CLOUDFLARE_API_TOKEN=...
+# GLIDER_CLOUDFLARE_ACCOUNT_ID=...
+# GLIDER_ACME_EMAIL=admin@example.com
+GLIDER_DOMAIN_RECONCILE_INTERVAL=60s
+GLIDER_CERT_RENEW_INTERVAL=12h
+GLIDER_RULES_HEALTH_INTERVAL=5m
+GLIDER_RULES_HEALTH_TARGET=https://ipinfo.io/json
+GLIDER_RULES_HEALTH_TIMEOUT=8s
+GLIDER_ACME_DNS_PROPAGATION_TIMEOUT=2m
+GLIDER_ACME_DNS_POLL_INTERVAL=5s
+```
+
+Central `glider.conf` with panel connectivity checks enabled:
+
+```ini
+mode=admin
+admin=:8444
+listen=127.0.0.1:18080
+rules-dir=/etc/rules.d
+```
+
+Do not publish the local `18080` listener from Docker. It exists only so the Admin panel can run route checks through a local proxy runtime.
+
+Node `.env`:
+
+```dotenv
+GLIDER_MODE=node
+GLIDER_NODE_ID=dmit-01
+GLIDER_CENTRAL_URL=https://central.example.com
+GLIDER_NODE_TOKEN=...
+GLIDER_SYNC_INTERVAL=30s
+GLIDER_CACHE_DIR=/etc/glider-cache
+GLIDER_CERT_DIR=/etc/glider-certs
+GLIDER_TRAFFIC_INTERFACE=eth0
+# Optional override. If empty, admin infers it from node heartbeat requests.
+# GLIDER_PUBLIC_IP=203.0.113.10
+```
+
+Node `compose.yml` should publish only proxy ports:
+
+```yaml
+services:
+  glider-node:
+    image: ghcr.io/ferryboatseranade/glider:<version>
+    container_name: glider
+    user: "0:0"
+    ports:
+      - "443:443"
+      - "8443:8443"
+    env_file:
+      - .env
+    volumes:
+      - ./glider.conf:/etc/glider.conf:ro
+      - ./rules.d:/etc/rules.d
+      - ./cache:/etc/glider-cache
+      - ./certs:/etc/glider-certs
+    command: -config /etc/glider.conf
+    restart: unless-stopped
+```
+
+Templates are provided in [deploy](deploy):
+
+- [admin.compose.yml](deploy/admin.compose.yml)
+- [node.compose.yml](deploy/node.compose.yml)
+- [CONTROL_PLANE_STATUS.md](deploy/CONTROL_PLANE_STATUS.md) records the current migration/runtime checklist.
+
+If a tag is temporarily loaded with `docker save | docker load` before it is pushed to GHCR, set `pull_policy: never` in that host's compose file. Remove it after the tag is available from the registry.
+
+Node sync API:
+
+- `GET /api/node/config?node_id=<id>` with `Authorization: Bearer <GLIDER_NODE_TOKEN>` returns `config_version`, `users`, `rules`, and `updated_at`.
+- Config sync supports `ETag` / `If-None-Match` using `config_version`. After a node has a current local version, unchanged central config returns `304 Not Modified` so users, passwords, and rules are not repeatedly transferred.
+- `POST /api/node/heartbeat` reports node id, hostname, public IP, glider version, config version, certificate version, uptime, total RX/TX bytes, last config/node error, and separate `cert_error` when certificate sync fails.
+- `GET /api/config/status` with the admin token returns the central `config_version`, `updated_at`, user count, and rule count. The Admin overview and Nodes table compare this central version with each node heartbeat to show synced/stale state.
+- `GLIDER_NODE_TOKEN` is the shared bootstrap token. Admin can also set a dedicated token for a node from the Nodes view or `PUT /api/nodes/<node_id>/token` with the admin token. Dedicated tokens are stored as SHA-256 hashes, never as plaintext.
+- If a node has a dedicated token, the node API accepts only that token for its `node_id`. Nodes without a dedicated token continue to use the shared `GLIDER_NODE_TOKEN`, so existing deployments stay compatible while you rotate nodes one by one.
+- Admin stores the last successful heartbeat auth mode as `auth_mode=shared` or `auth_mode=dedicated`. The Nodes view shows both configured token state and last auth mode, which helps confirm a node actually switched tokens.
+
+Admin connectivity checks:
+
+- The Admin panel includes a Connectivity view for default, rule, and user route checks.
+- `POST /api/check` with the admin token accepts `type`, `name`, `target`, `network`, `timeout`, and `probe`.
+- Use `probe=ipinfo` with `target=https://ipinfo.io/json` to see the real exit IP, ASN/org, city, region, country, and timezone for a default, rule, or user route.
+- `type=rule` checks the named rule's forward chain directly. `type=user` checks the route bound to that user first, then falls back to target rules.
+- `GET` or `POST /api/rules/health` checks every rule against the probe target and returns per-rule status and exit IP information. `POST` saves the result as the latest health snapshot; `GET /api/rules/health?latest=1` returns the most recent saved snapshot without running a new check.
+- The admin worker runs rule health checks every `GLIDER_RULES_HEALTH_INTERVAL` and stores the latest snapshot in MongoDB. Set the interval to `0` to disable it. Defaults use `GLIDER_RULES_HEALTH_TARGET=https://ipinfo.io/json` and `GLIDER_RULES_HEALTH_TIMEOUT=8s`.
+- Checks run through the local proxy runtime. In `admin` mode, configure a local-only `listen=127.0.0.1:18080` plus `rules-dir` to enable checks. A pure control plane without a local proxy returns a clear unavailable error.
+
+Nodes view:
+
+- `GET /api/nodes` returns nodes that have posted heartbeat records, sorted by last heartbeat time.
+- `DELETE /api/nodes/<node_id>` removes a stale node record from the Admin database. It does not stop the node process; a running node will reappear on its next heartbeat.
+- `PUT /api/nodes/<node_id>/token` sets a dedicated token for that node. `DELETE /api/nodes/<node_id>/token` clears it and restores shared-token fallback.
+- The panel marks nodes as online, stale, offline, or error from the latest heartbeat, node error field, and heartbeat age.
+- Nodes report config version, certificate version, uptime, total RX/TX counters, public IP, hostname, last successful auth mode, last config/node error, and separate certificate sync error.
+- If a node does not set `GLIDER_PUBLIC_IP`, Admin infers the public IP from the heartbeat request source. If Admin is behind your own trusted reverse proxy, set `GLIDER_ADMIN_TRUST_PROXY_HEADERS=true` to allow headers such as `CF-Connecting-IP`, `X-Real-IP`, and `X-Forwarded-For`. Leave it false when Admin is directly exposed or behind an untrusted proxy.
+
+Domains and certificates:
+
+- The Admin panel includes a Domains tab backed by MongoDB. It stores domain name, assigned node IDs, active node, Cloudflare zone/record metadata, DNS sync status, certificate bundle, certificate version, expiry, and renew-before days.
+- Admin exposes `GET /api/domains`, `POST /api/domains`, `GET|PUT|DELETE /api/domains/<domain>`, `POST /api/domains/<domain>/dns-plan`, `POST /api/domains/<domain>/sync-dns`, `POST /api/domains/<domain>/cert-plan`, `POST /api/domains/<domain>/issue-cert`, and `POST /api/domains/<domain>/import-cert`.
+- `GET /api/domains` and `GET /api/domains/<domain>` include a read-only `runtime` object with DNS status, certificate status, renewal status, days remaining, renewal window, and assigned-node certificate sync details.
+- `POST /api/domains/<domain>/dns-plan` builds a read-only Cloudflare DNS plan for the selected node. It shows the zone, record name/type, target node public IP, TTL/proxied flag, existing record content when found, and whether the sync would create, update, or leave the record unchanged.
+- `POST /api/domains/<domain>/sync-dns` updates the Cloudflare DNS record to the active node's `public_ip`. It supports A and AAAA records, with TTL `1` meaning Cloudflare automatic TTL. Leave record type as `Auto` to choose A for IPv4 node IPs and AAAA for IPv6 node IPs.
+- If a DNS sync attempt fails, Admin records the error but preserves the previous Cloudflare zone, record ID, record name, and last successful sync timestamp so a transient Cloudflare outage does not erase the last known working DNS state.
+- `POST /api/domains/<domain>/cert-plan` builds a read-only certificate plan. It verifies the Cloudflare zone lookup and shows the ACME email/directory, `_acme-challenge` record name, current certificate version/expiry, renewal window, assigned nodes, and whether issuance would be an initial issue, renewal, or currently not due.
+- `POST /api/domains/<domain>/issue-cert` uses ACME DNS-01 through Cloudflare DNS to issue a Let's Encrypt certificate, stores the fullchain and private key in MongoDB, and creates a new certificate version.
+- ACME issuance waits for `_acme-challenge` TXT propagation before asking Let's Encrypt to validate. Tune this with `GLIDER_ACME_DNS_PROPAGATION_TIMEOUT` and `GLIDER_ACME_DNS_POLL_INTERVAL` on the central admin container.
+- `POST /api/domains/<domain>/import-cert` stores an existing fullchain/private-key pair, validates that the key matches the certificate, reads the leaf certificate expiry, and creates a new certificate version. This is useful for testing node certificate sync before Cloudflare DNS-01 is configured.
+- Domain list/detail API responses redact certificate PEM and private-key material. Full certificate material is only returned by the node certificate sync API.
+- Nodes call `GET /api/node/certs?node_id=<id>` with the node bearer token. The response contains only certificates for domains assigned to that node.
+- Certificate sync supports `ETag` / `If-None-Match` using `cert_version`. Nodes only send conditional requests after confirming the local certificate snapshot and files are complete. If a local certificate file is missing or differs from the snapshot, the node skips the conditional request and pulls the full certificate snapshot to repair itself.
+- Nodes write certificates to `GLIDER_CERT_DIR/<domain>/fullchain.pem` and `GLIDER_CERT_DIR/<domain>/privkey.pem`, cache the certificate snapshot under `GLIDER_CACHE_DIR`, and report `cert_version` plus per-domain certificate state in heartbeats.
+- Nodes skip certificate file/cache writes when the central `cert_version` is unchanged and the local certificate snapshot plus certificate files already match that version. If a certificate file is missing or differs from the snapshot, the next sync restores it from central state. This also avoids repeatedly rewriting an intentionally empty certificate snapshot.
+- The Domains view compares each domain's certificate version with assigned nodes' `cert_domains` heartbeat data and shows `cert synced <n>/<total>` so you can confirm certificate delivery per node.
+- The Domains view also shows certificate days remaining and renewal state such as `renew due`, `renew expired`, or `renew in <n>d`, using the same `renew_before_days` window as the automatic renewal worker.
+- TLS listeners reload certificate files automatically on new handshakes when the files change, so renewed certificates do not require restarting the container.
+- A TLS server listener can use `certDir=/etc/glider-certs` to choose certificates by SNI. It looks for `GLIDER_CERT_DIR/<server_name>/fullchain.pem` and `privkey.pem`, with wildcard fallback such as `*.example.com` for `www.example.com`.
+- For a node that should accept domain-based TLS proxy traffic for one or more assigned domains, use a listener like:
+
+```ini
+listen=tls://:443?certDir=/etc/glider-certs,http://
+listen=:8443
+rules-dir=/etc/rules.d
+```
+
+  The container must publish `443:443` for this SNI entry point. After importing or issuing a test certificate, you can verify the path without changing public DNS by resolving the test name locally:
+
+```bash
+curl --proxy-insecure \
+  --proxy https://user1:pass1@proxy.example.com:443 \
+  --resolve proxy.example.com:443:<node-ip> \
+  https://ipinfo.io/json
+```
+
+  A successful response proves the node accepted TLS on `443`, selected the synced certificate by SNI, authenticated the proxy user, and routed traffic through the user's assigned rule.
+
+- The older fixed-certificate form remains supported for single-domain or manually managed deployments:
+
+```ini
+listen=tls://:443?cert=/etc/glider-certs/proxy.example.com/fullchain.pem&key=/etc/glider-certs/proxy.example.com/privkey.pem,http://
+```
+
+Cloudflare token:
+
+- Use a Cloudflare API Token, not the legacy Global API Key. The Global API Key is account-wide; an API Token can be restricted by permission and zone.
+- A Cloudflare Account API Token is still an API Token. It is owned by the Cloudflare account instead of a single user, which makes it a good fit for long-running admin services. If you use an account-owned token, enter the Cloudflare account ID in the Admin panel so token verification uses the account token endpoint.
+- A user-owned API Token also works. For a user-owned token, leave account ID empty so verification uses the user token endpoint.
+- Scope the token to the specific zone whenever possible.
+- Required permissions: `Zone:Read` and `DNS:Edit` for the selected zone. `Zone:Read` lets the admin find the zone when `zone_id` is not entered manually. `DNS:Edit` lets the admin create/update A, AAAA, and `_acme-challenge` TXT records for DNS-01 validation.
+- Configure the token from the Admin panel in `Domains -> Cloudflare Settings`. The panel stores it in MongoDB, returns only a masked value to the browser, and uses it for DNS sync, failover, and certificate issuance/renewal.
+- Use `Verify Token` in that panel before DNS or certificate work. Enter a `Zone test domain` to verify the token can read the matching zone; enable `DNS edit test` when you also want the admin to create and immediately delete a temporary `_glider-check-*` TXT record to prove `DNS:Edit`.
+- Set `GLIDER_SETTINGS_KEY` on the central admin container to encrypt stored settings before writing them to MongoDB. Keep the same key across admin redeploys, or previously encrypted settings cannot be decrypted.
+- `GLIDER_CLOUDFLARE_API_TOKEN`, `GLIDER_CLOUDFLARE_ACCOUNT_ID`, and `GLIDER_ACME_EMAIL` are still supported as central `.env` fallbacks. Never put Cloudflare credentials in node `.env` or commit them.
+
+Real-domain onboarding check:
+
+- After saving Cloudflare settings in Admin and confirming that the node heartbeat is online, run the helper below from a trusted machine. By default it verifies Admin auth, node heartbeat, Cloudflare token zone access, saves the domain/node assignment, and builds DNS/certificate preview plans. It does not update DNS or issue a certificate unless you pass the explicit write flags.
+
+```bash
+python3 deploy/scripts/domain_onboarding_check.py \
+  --admin-url http://<admin-ip>:8444 \
+  --admin-token "$GLIDER_ADMIN_TOKEN" \
+  --domain proxy.example.com \
+  --node-id zgo \
+  --acme-email admin@example.com
+```
+
+- Add `--issue-cert` to request or renew the Let's Encrypt certificate with ACME DNS-01. Add `--sync-dns` after the certificate is issued and the node heartbeat reports the matching domain certificate version. DNS sync refuses to point a TLS domain at a node that is stale, unassigned, missing a public IP, or missing the current certificate version.
+
+Failover behavior:
+
+- When `failover_enabled` is true, the admin worker checks assigned node heartbeats every `GLIDER_DOMAIN_RECONCILE_INTERVAL` and switches DNS to the first online assigned node if the active node is unhealthy.
+- A node is considered online for failover when its latest heartbeat is within 90 seconds and has no error.
+- The certificate worker checks managed domains every `GLIDER_CERT_RENEW_INTERVAL`. If a certificate is missing or within `renew_before_days`, it renews with ACME DNS-01 and increments the certificate version.
+- Automatic renewal requires a Cloudflare token and ACME email configured either in the Admin panel or through the central `.env` fallback.
+- Cloudflare Load Balancing can also be used if you want Cloudflare-managed health checks instead of DNS-record switching inside Glider.
+
+Traffic notes:
+
+- Node total traffic is read from `/sys/class/net/<interface>/statistics/*_bytes` by default. You can still use `vnstat` operationally for host-level auditing.
+- TCP user-level, rule-level, and dialer/line-level traffic is counted inside glider's proxy path and included in node heartbeats under `traffic.users`, `traffic.rules`, and `traffic.dialers`.
+- UDP traffic is still reported only in the node total counters. `vnstat` cannot split traffic by glider user.
+
+Migration from `glider + glider2` to one node deploy directory:
+
+1. Build and publish an image, for example `ghcr.io/ferryboatseranade/glider:v2026.06.06`.
+2. Stop the old `glider2` container.
+3. Create `/root/data/docker_data/glider` as the only deploy directory.
+4. Move the runtime files from `glider2` into it: `compose.yml`, `.env`, `glider.conf`, `rules.d/`, and optionally create `cache/`.
+5. Replace `build: ../glider` with the fixed `image:` tag and remove the source checkout from the node after verification.
+6. For ordinary nodes, remove the `8444:8444` port mapping and set `GLIDER_MODE=node`.
+7. Start with `docker compose up -d` and verify that only `443` and `8443` are published on nodes.
+
+Central migration on a host that already has `/root/data/docker_data/glider`:
+
+1. Create `/root/data/docker_data/glider-admin`.
+2. Copy [deploy/admin.compose.yml](deploy/admin.compose.yml), [deploy/admin.env.example](deploy/admin.env.example), and [deploy/admin.glider.conf.example](deploy/admin.glider.conf.example) into it as `compose.yml`, `.env`, and `glider.conf`.
+3. Create `rules.d/`.
+4. Fill in `.env` secrets and the fixed image tag.
+5. Start with `docker compose up -d` and expose only `8444`.
+
+Security:
+
+- Open Admin only on the central host, ideally behind VPN, Cloudflare Access, or authenticated reverse proxy.
+- Use `GLIDER_ADMIN_ALLOWED_CIDRS` to add a process-level source IP/CIDR allowlist for Web Admin and Admin APIs. It accepts comma, space, or newline separated IPs/CIDRs. Node sync APIs still authenticate with node tokens and are not blocked by this Admin allowlist.
+- Set `GLIDER_ADMIN_TRUST_PROXY_HEADERS=true` only when requests reach Admin through your own trusted reverse proxy; otherwise client-supplied forwarding headers are ignored for Admin allowlist checks and heartbeat public-IP inference.
+- Put `GLIDER_ADMIN_TOKEN`, `GLIDER_NODE_TOKEN`, `GLIDER_SETTINGS_KEY`, and MongoDB URI in `.env`; do not commit live `.env` files or deploy directories.
+- Use `GLIDER_NODE_TOKEN` as a bootstrap secret, then prefer dedicated per-node tokens for long-lived VPS nodes. Rotate or clear a node token if that node is decommissioned or suspected compromised.
+- MongoDB stores certificate private keys for managed domains. Keep MongoDB access restricted and back it up like other secret-bearing infrastructure.
+- Node cache may contain user passwords and certificate private keys. Keep `cache/` and `certs/` private; snapshots and certificate files are written with `0600` permissions.
+
+Test plan:
+
+- `go test ./...` covers config apply, version stability, local cache boot, central sync, central unavailable behavior, and reload failure preserving old config.
+- Reload failure tests assert both memory and disk safety: failed config apply keeps the previous `rules.d` files, and node sync does not overwrite `cache/config_snapshot.json` with a config that failed to apply.
+- Admin mode smoke test: run `GLIDER_MODE=admin GLIDER_MONGO_URI=... GLIDER_ADMIN_TOKEN=... GLIDER_NODE_TOKEN=... glider -admin :8444` and verify `/api/users` requires the admin token.
+- Node mode smoke test: run with `GLIDER_MODE=node` and a proxy listener, verify no `8444` process or Docker port is exposed.
+- Cache boot test: start a node with `cache/config_snapshot.json` present and central URL unavailable; proxy should still start from cached config.
+- Version-change test: update a rule/user in Mongo, fetch `/api/node/config`, and verify the node reloads only when `config_version` changes.
+- Failure test: publish a config referencing a missing rule; node should report the error in heartbeat, keep the previous working version, keep the old `rules.d` contents, and leave the old cached snapshot in place.
+- Certificate sync test: assign a domain to a node, issue/import a cert, fetch `/api/node/certs`, and verify files appear under `GLIDER_CERT_DIR/<domain>/`.
+- DNS sync test: use a Cloudflare API token scoped to a test zone, sync DNS to a selected node, and verify the A/AAAA record points at the node heartbeat `public_ip`.
+- DNS failure test: simulate Cloudflare returning an error and verify Admin keeps the previous record metadata while surfacing the new error status.
 
 ## Service
 

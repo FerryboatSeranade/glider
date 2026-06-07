@@ -2,15 +2,21 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,31 +27,54 @@ import (
 )
 
 const (
-	mongoURLEnv   = "GLIDER_MONGO_URI"
-	mongoDBEnv    = "GLIDER_MONGO_DB"
-	adminTokenEnv = "GLIDER_ADMIN_TOKEN"
+	mongoURLEnv                  = "GLIDER_MONGO_URI"
+	mongoDBEnv                   = "GLIDER_MONGO_DB"
+	adminTokenEnv                = "GLIDER_ADMIN_TOKEN"
+	adminAllowedCIDRsEnv         = "GLIDER_ADMIN_ALLOWED_CIDRS"
+	adminTrustProxyHeadersEnv    = "GLIDER_ADMIN_TRUST_PROXY_HEADERS"
+	nodeTokenEnv                 = "GLIDER_NODE_TOKEN"
+	acmeEmailEnv                 = "GLIDER_ACME_EMAIL"
+	acmeDirectoryURLEnv          = "GLIDER_ACME_DIRECTORY_URL"
+	cloudflareAccountIDEnv       = "GLIDER_CLOUDFLARE_ACCOUNT_ID"
+	domainReconcileIntervalEnv   = "GLIDER_DOMAIN_RECONCILE_INTERVAL"
+	certificateRenewIntervalEnv  = "GLIDER_CERT_RENEW_INTERVAL"
+	rulesHealthIntervalEnv       = "GLIDER_RULES_HEALTH_INTERVAL"
+	rulesHealthTargetEnv         = "GLIDER_RULES_HEALTH_TARGET"
+	rulesHealthTimeoutEnv        = "GLIDER_RULES_HEALTH_TIMEOUT"
+	defaultDomainReconcilePeriod = 60 * time.Second
+	defaultCertRenewPeriod       = 12 * time.Hour
+	defaultRulesHealthPeriod     = 5 * time.Minute
+	defaultRulesHealthTarget     = "https://ipinfo.io/json"
+	defaultRulesHealthTimeout    = "8s"
+	nodeAuthModeShared           = "shared"
+	nodeAuthModeDedicated        = "dedicated"
 )
 
 type adminServer struct {
-	addr     string
-	store    *mongoStore
-	rulesDir string
-	conf     *Config
-	pxySw    *proxy.Switcher
-	token    string
+	addr              string
+	store             *mongoStore
+	rulesDir          string
+	conf              *Config
+	pxySw             *proxy.Switcher
+	applier           *ConfigApplier
+	token             string
+	nodeToken         string
+	adminNets         []netip.Prefix
+	trustProxyHeaders bool
 
 	reloadMu   sync.Mutex
 	lastReload time.Time
+	healthMu   sync.Mutex
 }
 
-func startAdminServer(conf *Config, pxySw *proxy.Switcher) {
+func startAdminServer(conf *Config, pxySw *proxy.Switcher, applier *ConfigApplier) {
 	if conf.Admin == "" {
 		return
 	}
 
 	uri := strings.TrimSpace(os.Getenv(mongoURLEnv))
 	if uri == "" {
-		log.F("[admin] %s not set, admin disabled", mongoURLEnv)
+		log.Printf("[admin] %s not set, admin disabled", mongoURLEnv)
 		return
 	}
 	dbName := strings.TrimSpace(os.Getenv(mongoDBEnv))
@@ -54,11 +83,24 @@ func startAdminServer(conf *Config, pxySw *proxy.Switcher) {
 	}
 	token := strings.TrimSpace(os.Getenv(adminTokenEnv))
 	if token == "" {
-		log.F("[admin] %s not set, admin auth disabled", adminTokenEnv)
+		log.Printf("[admin] %s not set, admin auth disabled", adminTokenEnv)
 	}
+	nodeToken := strings.TrimSpace(os.Getenv(nodeTokenEnv))
+	if nodeToken == "" {
+		nodeToken = strings.TrimSpace(conf.NodeToken)
+	}
+	if nodeToken == "" {
+		log.Printf("[admin] %s not set, node config API disabled", nodeTokenEnv)
+	}
+	adminNets, err := parseCIDRList(os.Getenv(adminAllowedCIDRsEnv))
+	if err != nil {
+		log.Printf("[admin] invalid %s: %v", adminAllowedCIDRsEnv, err)
+		return
+	}
+	trustProxyHeaders := parseBool(os.Getenv(adminTrustProxyHeadersEnv))
 
-	if conf.RulesDir == "" {
-		log.F("[admin] rules-dir is empty, admin disabled")
+	if pxySw != nil && conf.RulesDir == "" {
+		log.Printf("[admin] rules-dir is empty, admin disabled")
 		return
 	}
 
@@ -66,22 +108,28 @@ func startAdminServer(conf *Config, pxySw *proxy.Switcher) {
 	defer cancel()
 	store, err := newMongoStore(ctx, uri, dbName)
 	if err != nil {
-		log.F("[admin] mongo connect error: %v", err)
+		log.Printf("[admin] mongo connect error: %v", err)
 		return
 	}
 
 	srv := &adminServer{
-		addr:     conf.Admin,
-		store:    store,
-		rulesDir: conf.RulesDir,
-		conf:     conf,
-		pxySw:    pxySw,
-		token:    token,
+		addr:              conf.Admin,
+		store:             store,
+		rulesDir:          conf.RulesDir,
+		conf:              conf,
+		pxySw:             pxySw,
+		applier:           applier,
+		token:             token,
+		nodeToken:         nodeToken,
+		adminNets:         adminNets,
+		trustProxyHeaders: trustProxyHeaders,
 	}
-	ctxInit, cancelInit := withTimeout(context.Background())
-	defer cancelInit()
-	if err := srv.reload(ctxInit); err != nil {
-		log.F("[admin] initial reload failed: %v", err)
+	if srv.applier != nil {
+		ctxInit, cancelInit := withTimeout(context.Background())
+		defer cancelInit()
+		if err := srv.reload(ctxInit); err != nil {
+			log.Printf("[admin] initial reload failed: %v", err)
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -91,6 +139,18 @@ func startAdminServer(conf *Config, pxySw *proxy.Switcher) {
 	mux.HandleFunc("/api/rules", srv.handleRules)
 	mux.HandleFunc("/api/rules/", srv.handleRule)
 	mux.HandleFunc("/api/reload", srv.handleReload)
+	mux.HandleFunc("/api/config/status", srv.handleConfigStatus)
+	mux.HandleFunc("/api/check", srv.handleCheck)
+	mux.HandleFunc("/api/rules/health", srv.handleRulesHealth)
+	mux.HandleFunc("/api/nodes", srv.handleNodes)
+	mux.HandleFunc("/api/nodes/", srv.handleNodeAction)
+	mux.HandleFunc("/api/domains", srv.handleDomains)
+	mux.HandleFunc("/api/domains/", srv.handleDomainAction)
+	mux.HandleFunc("/api/settings/cloudflare", srv.handleCloudflareSettings)
+	mux.HandleFunc("/api/settings/cloudflare/verify", srv.handleCloudflareVerify)
+	mux.HandleFunc("/api/node/config", srv.handleNodeConfig)
+	mux.HandleFunc("/api/node/certs", srv.handleNodeCerts)
+	mux.HandleFunc("/api/node/heartbeat", srv.handleNodeHeartbeat)
 
 	server := &http.Server{
 		Addr:              srv.addr,
@@ -99,14 +159,20 @@ func startAdminServer(conf *Config, pxySw *proxy.Switcher) {
 	}
 
 	go func() {
-		log.F("[admin] listening on %s", srv.addr)
+		log.Printf("[admin] listening on %s", srv.addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.F("[admin] server error: %v", err)
+			log.Printf("[admin] server error: %v", err)
 		}
 	}()
+
+	srv.startAdminWorkers(context.Background())
 }
 
 func (s *adminServer) requireToken(w http.ResponseWriter, r *http.Request) bool {
+	if !s.adminSourceAllowed(r) {
+		writeError(w, http.StatusForbidden, fmt.Errorf("forbidden"))
+		return false
+	}
 	if s.token == "" {
 		return true
 	}
@@ -117,6 +183,68 @@ func (s *adminServer) requireToken(w http.ResponseWriter, r *http.Request) bool 
 	w.Header().Set("WWW-Authenticate", "Bearer")
 	writeError(w, http.StatusUnauthorized, fmt.Errorf("unauthorized"))
 	return false
+}
+
+func (s *adminServer) adminSourceAllowed(r *http.Request) bool {
+	if len(s.adminNets) == 0 {
+		return true
+	}
+	ip, ok := requestIP(r, s.trustProxyHeaders)
+	if !ok {
+		return false
+	}
+	for _, prefix := range s.adminNets {
+		if prefix.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *adminServer) requireNodeToken(w http.ResponseWriter, r *http.Request, nodeID string) bool {
+	_, ok := s.authorizeNodeToken(r.Context(), strings.TrimSpace(nodeID), tokenFromRequest(r))
+	if ok {
+		return true
+	}
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	writeError(w, http.StatusUnauthorized, fmt.Errorf("unauthorized"))
+	return false
+}
+
+func (s *adminServer) authorizeNodeToken(ctx context.Context, nodeID, token string) (string, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", false
+	}
+	if nodeID != "" && s.store != nil {
+		cctx, cancel := withTimeout(ctx)
+		defer cancel()
+		node, err := s.store.GetNode(cctx, nodeID)
+		if err == nil && strings.TrimSpace(node.TokenHash) != "" {
+			if constantTimeEqual(node.TokenHash, hashNodeToken(token)) {
+				return nodeAuthModeDedicated, true
+			}
+			return "", false
+		}
+	}
+	if s.nodeToken == "" {
+		return "", false
+	}
+	if constantTimeEqual(token, s.nodeToken) {
+		return nodeAuthModeShared, true
+	}
+	return "", false
+}
+
+func hashNodeToken(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return hex.EncodeToString(sum[:])
+}
+
+func constantTimeEqual(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	return a != "" && b != "" && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 func tokenFromRequest(r *http.Request) string {
@@ -244,11 +372,1227 @@ func (s *adminServer) handleRules(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		if err := writeRuleFile(s.rulesDir, payload); err != nil {
+		if s.applier != nil && s.rulesDir != "" {
+			if err := writeRuleFile(s.rulesDir, payload); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *adminServer) handleNodeConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
+	if nodeID == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("node_id required"))
+		return
+	}
+	if !s.requireNodeToken(w, r, nodeID) {
+		return
+	}
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	snap, err := LoadSnapshotFromStore(ctx, s.store)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if etag := versionETag(snap.ConfigVersion); etag != "" {
+		w.Header().Set("ETag", etag)
+		if versionNotModified(r, snap.ConfigVersion) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
+func (s *adminServer) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireToken(w, r) {
+		return
+	}
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	snap, err := LoadSnapshotFromStore(ctx, s.store)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"config_version": snap.ConfigVersion,
+		"updated_at":     snap.UpdatedAt,
+		"users_count":    len(snap.Users),
+		"rules_count":    len(snap.Rules),
+	})
+}
+
+func (s *adminServer) handleNodeCerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
+	if nodeID == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("node_id required"))
+		return
+	}
+	if !s.requireNodeToken(w, r, nodeID) {
+		return
+	}
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	snap, err := LoadCertificateSnapshotFromStore(ctx, s.store, nodeID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	etag := certSnapshotETag(snap.CertVersion)
+	if etag != "" {
+		w.Header().Set("ETag", etag)
+		if certSnapshotNotModified(r, snap.CertVersion) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
+func (s *adminServer) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var payload NodeHeartbeat
+	if err := decodeJSON(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(payload.NodeID) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("node_id required"))
+		return
+	}
+	payload.NodeID = strings.TrimSpace(payload.NodeID)
+	authMode, ok := s.authorizeNodeToken(r.Context(), payload.NodeID, tokenFromRequest(r))
+	if !ok {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, http.StatusUnauthorized, fmt.Errorf("unauthorized"))
+		return
+	}
+	payload.AuthMode = authMode
+	if strings.TrimSpace(payload.PublicIP) == "" {
+		payload.PublicIP = inferRequestPublicIPWithTrust(r, s.trustProxyHeaders)
+	}
+	payload.UpdatedAt = time.Now().UTC()
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	if err := s.store.UpsertNodeHeartbeat(ctx, payload); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func inferRequestPublicIP(r *http.Request) string {
+	return inferRequestPublicIPWithTrust(r, parseBool(os.Getenv(adminTrustProxyHeadersEnv)))
+}
+
+func inferRequestPublicIPWithTrust(r *http.Request, trustProxyHeaders bool) string {
+	if trustProxyHeaders {
+		for _, header := range []string{"CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"} {
+			for _, value := range strings.Split(r.Header.Get(header), ",") {
+				if ip := publicIPString(value); ip != "" {
+					return ip
+				}
+			}
+		}
+	}
+	ip, ok := requestIP(r, false)
+	if !ok {
+		return ""
+	}
+	return publicIPString(ip.String())
+}
+
+func requestIP(r *http.Request, trustProxyHeaders bool) (netip.Addr, bool) {
+	if trustProxyHeaders {
+		if ip, ok := requestProxyHeaderIP(r); ok {
+			return ip, true
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(host))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	return addr, true
+}
+
+func requestProxyHeaderIP(r *http.Request) (netip.Addr, bool) {
+	for _, header := range []string{"CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"} {
+		for _, value := range strings.Split(r.Header.Get(header), ",") {
+			addr, err := netip.ParseAddr(strings.TrimSpace(value))
+			if err == nil {
+				if addr.Is4In6() {
+					addr = addr.Unmap()
+				}
+				return addr, true
+			}
+		}
+	}
+	return netip.Addr{}, false
+}
+
+func publicIPString(value string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(value))
+	if err != nil {
+		return ""
+	}
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsMulticast() || addr.IsUnspecified() {
+		return ""
+	}
+	for _, prefix := range nonPublicIPPrefixes {
+		if prefix.Contains(addr) {
+			return ""
+		}
+	}
+	return addr.String()
+}
+
+func parseCIDRList(value string) ([]netip.Prefix, error) {
+	fields := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
+	})
+	out := make([]netip.Prefix, 0, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		if strings.Contains(field, "/") {
+			prefix, err := netip.ParsePrefix(field)
+			if err != nil {
+				return nil, fmt.Errorf("%q: %w", field, err)
+			}
+			out = append(out, prefix.Masked())
+			continue
+		}
+		addr, err := netip.ParseAddr(field)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", field, err)
+		}
+		if addr.Is4In6() {
+			addr = addr.Unmap()
+		}
+		bits := 128
+		if addr.Is4() {
+			bits = 32
+		}
+		out = append(out, netip.PrefixFrom(addr, bits))
+	}
+	return out, nil
+}
+
+var nonPublicIPPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("2001:db8::/32"),
+}
+
+func (s *adminServer) handleDomains(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		domains, err := s.store.Domains(ctx)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		nodes, err := s.store.Nodes(ctx)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		nodeMap := nodeMapByID(nodes)
+		out := make([]domainResponse, 0, len(domains))
+		now := time.Now().UTC()
+		for _, d := range domains {
+			out = append(out, newDomainResponse(d, nodeMap, now))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"domains": out,
+			"now":     now,
+		})
+	case http.MethodPost:
+		var payload dbDomain
+		if err := decodeJSON(r, &payload); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		if err := s.store.UpsertDomain(ctx, payload); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+type cloudflareSettingsResponse struct {
+	Configured       bool      `json:"configured"`
+	Source           string    `json:"source,omitempty"`
+	MaskedToken      string    `json:"masked_token,omitempty"`
+	AccountID        string    `json:"account_id,omitempty"`
+	ACMEEmail        string    `json:"acme_email,omitempty"`
+	ACMEDirectoryURL string    `json:"acme_directory_url,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at,omitempty"`
+}
+
+func (s *adminServer) handleCloudflareSettings(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		settings, err := s.effectiveCloudflareSettings(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, cloudflareSettingsToResponse(settings))
+	case http.MethodPost:
+		var payload struct {
+			APIToken         *string `json:"api_token"`
+			ClearToken       bool    `json:"clear_token"`
+			AccountID        string  `json:"account_id"`
+			ACMEEmail        string  `json:"acme_email"`
+			ACMEDirectoryURL string  `json:"acme_directory_url"`
+		}
+		if err := decodeJSON(r, &payload); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		settings := cloudflareSettings{
+			AccountID:        payload.AccountID,
+			ACMEEmail:        payload.ACMEEmail,
+			ACMEDirectoryURL: payload.ACMEDirectoryURL,
+		}
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		if err := s.store.UpdateCloudflareSettings(ctx, settings, payload.APIToken, payload.ClearToken); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		updated, err := s.effectiveCloudflareSettings(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, cloudflareSettingsToResponse(updated))
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func cloudflareSettingsToResponse(settings cloudflareSettings) cloudflareSettingsResponse {
+	source := settings.Source
+	token := strings.TrimSpace(settings.APIToken)
+	if token == "" {
+		source = ""
+	} else if source == "" {
+		source = "database"
+	}
+	return cloudflareSettingsResponse{
+		Configured:       token != "",
+		Source:           source,
+		MaskedToken:      maskSecret(token),
+		AccountID:        settings.AccountID,
+		ACMEEmail:        settings.ACMEEmail,
+		ACMEDirectoryURL: settings.ACMEDirectoryURL,
+		UpdatedAt:        settings.UpdatedAt,
+	}
+}
+
+type cloudflareVerifyResponse struct {
+	Status    string               `json:"status,omitempty"`
+	ID        string               `json:"id,omitempty"`
+	Scope     string               `json:"scope,omitempty"`
+	NotBefore *time.Time           `json:"not_before,omitempty"`
+	ExpiresOn *time.Time           `json:"expires_on,omitempty"`
+	Zone      *cloudflareZoneCheck `json:"zone,omitempty"`
+}
+
+func (s *adminServer) handleCloudflareVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireToken(w, r) {
+		return
+	}
+	var payload struct {
+		Domain      string `json:"domain"`
+		DNSEditTest bool   `json:"dns_edit_test"`
+	}
+	if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	settings, err := s.effectiveCloudflareSettings(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	cf, err := newCloudflareClient(settings.APIToken)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	result, err := cf.verifyToken(ctx, settings.AccountID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	var zoneCheck *cloudflareZoneCheck
+	if strings.TrimSpace(payload.Domain) != "" {
+		check, err := cf.checkZone(ctx, payload.Domain, payload.DNSEditTest)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		zoneCheck = &check
+	}
+	scope := "user"
+	if strings.TrimSpace(settings.AccountID) != "" {
+		scope = "account"
+	}
+	writeJSON(w, http.StatusOK, cloudflareVerifyResponse{
+		Status:    result.Status,
+		ID:        result.ID,
+		Scope:     scope,
+		NotBefore: result.NotBefore,
+		ExpiresOn: result.ExpiresOn,
+		Zone:      zoneCheck,
+	})
+}
+
+func maskSecret(secret string) string {
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return ""
+	}
+	if len(secret) <= 8 {
+		return strings.Repeat("*", len(secret))
+	}
+	return secret[:4] + strings.Repeat("*", 8) + secret[len(secret)-4:]
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func parseBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *adminServer) effectiveCloudflareSettings(ctx context.Context) (cloudflareSettings, error) {
+	cctx, cancel := withTimeout(ctx)
+	defer cancel()
+	settings, err := s.store.CloudflareSettings(cctx)
+	if err != nil {
+		return cloudflareSettings{}, err
+	}
+	if strings.TrimSpace(settings.APIToken) != "" {
+		settings.Source = "database"
+	} else if envToken := strings.TrimSpace(os.Getenv(cloudflareAPITokenEnv)); envToken != "" {
+		settings.APIToken = envToken
+		settings.Source = "env"
+	}
+	if strings.TrimSpace(settings.ACMEEmail) == "" {
+		settings.ACMEEmail = strings.TrimSpace(os.Getenv(acmeEmailEnv))
+	}
+	if strings.TrimSpace(settings.ACMEDirectoryURL) == "" {
+		settings.ACMEDirectoryURL = strings.TrimSpace(os.Getenv(acmeDirectoryURLEnv))
+	}
+	if strings.TrimSpace(settings.AccountID) == "" {
+		settings.AccountID = strings.TrimSpace(os.Getenv(cloudflareAccountIDEnv))
+	}
+	return settings, nil
+}
+
+func (s *adminServer) handleDomainAction(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w, r) {
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/domains/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("domain required"))
+		return
+	}
+	domain, err := url.PathUnescape(parts[0])
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid domain"))
+		return
+	}
+	domain, err = normalizeDomainName(domain)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	action := ""
+	if len(parts) > 1 {
+		action = parts[1]
+	}
+
+	switch {
+	case action == "" && r.Method == http.MethodGet:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		d, err := s.store.GetDomain(ctx, domain)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		nodes, err := s.store.Nodes(ctx)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, newDomainResponse(*d, nodeMapByID(nodes), time.Now().UTC()))
+	case action == "" && r.Method == http.MethodPut:
+		var payload dbDomain
+		if err := decodeJSON(r, &payload); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		payload.Domain = domain
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		if err := s.store.UpsertDomain(ctx, payload); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	case action == "" && r.Method == http.MethodDelete:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		if err := s.store.DeleteDomain(ctx, domain); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	case action == "sync-dns" && r.Method == http.MethodPost:
+		s.handleDomainSyncDNS(w, r, domain)
+	case action == "dns-plan" && r.Method == http.MethodPost:
+		s.handleDomainDNSPlan(w, r, domain)
+	case action == "issue-cert" && r.Method == http.MethodPost:
+		s.handleDomainIssueCert(w, r, domain)
+	case action == "cert-plan" && r.Method == http.MethodPost:
+		s.handleDomainCertPlan(w, r, domain)
+	case action == "import-cert" && r.Method == http.MethodPost:
+		s.handleDomainImportCert(w, r, domain)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func redactDomainSecrets(domains []dbDomain) []dbDomain {
+	out := make([]dbDomain, len(domains))
+	for i, d := range domains {
+		out[i] = redactDomainSecret(d)
+	}
+	return out
+}
+
+func redactDomainSecret(d dbDomain) dbDomain {
+	d.Certificate.FullchainPEM = ""
+	d.Certificate.PrivateKeyPEM = ""
+	return d
+}
+
+type domainResponse struct {
+	Domain          string                 `json:"domain"`
+	Enabled         bool                   `json:"enabled"`
+	NodeIDs         []string               `json:"node_ids,omitempty"`
+	ActiveNodeID    string                 `json:"active_node_id,omitempty"`
+	FailoverEnabled bool                   `json:"failover_enabled,omitempty"`
+	RenewBeforeDays int                    `json:"renew_before_days,omitempty"`
+	DNSProvider     string                 `json:"dns_provider,omitempty"`
+	Cloudflare      cloudflareDomainConfig `json:"cloudflare,omitempty"`
+	Certificate     domainCertificate      `json:"certificate,omitempty"`
+	UpdatedAt       time.Time              `json:"updated_at"`
+	Runtime         domainRuntimeStatus    `json:"runtime"`
+}
+
+type domainRuntimeStatus struct {
+	Status                string               `json:"status"`
+	DNSStatus             string               `json:"dns_status"`
+	CertStatus            string               `json:"cert_status"`
+	CertRenewStatus       string               `json:"cert_renew_status"`
+	CertDaysRemaining     int                  `json:"cert_days_remaining"`
+	CertRenewInDays       int                  `json:"cert_renew_in_days"`
+	CertSyncStatus        string               `json:"cert_sync_status"`
+	CertSyncedNodes       int                  `json:"cert_synced_nodes"`
+	CertAssignedNodes     int                  `json:"cert_assigned_nodes"`
+	FailoverStatus        string               `json:"failover_status"`
+	FailoverReadyNodes    int                  `json:"failover_ready_nodes"`
+	FailoverBlockedReason string               `json:"failover_blocked_reason,omitempty"`
+	AssignedNodeStatus    []domainNodeCertSync `json:"assigned_node_status,omitempty"`
+}
+
+type domainNodeCertSync struct {
+	NodeID        string     `json:"node_id"`
+	Online        bool       `json:"online"`
+	PublicIP      string     `json:"public_ip,omitempty"`
+	CertSynced    bool       `json:"cert_synced"`
+	FailoverReady bool       `json:"failover_ready"`
+	CertVersion   string     `json:"cert_version,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	LastSeenAt    *time.Time `json:"last_seen_at,omitempty"`
+	Error         string     `json:"error,omitempty"`
+	CertError     string     `json:"cert_error,omitempty"`
+}
+
+func newDomainResponse(d dbDomain, nodes map[string]NodeHeartbeat, now time.Time) domainResponse {
+	redacted := redactDomainSecret(d)
+	return domainResponse{
+		Domain:          redacted.Domain,
+		Enabled:         redacted.Enabled,
+		NodeIDs:         redacted.NodeIDs,
+		ActiveNodeID:    redacted.ActiveNodeID,
+		FailoverEnabled: redacted.FailoverEnabled,
+		RenewBeforeDays: redacted.RenewBeforeDays,
+		DNSProvider:     redacted.DNSProvider,
+		Cloudflare:      redacted.Cloudflare,
+		Certificate:     redacted.Certificate,
+		UpdatedAt:       redacted.UpdatedAt,
+		Runtime:         domainRuntime(d, nodes, now),
+	}
+}
+
+func domainRuntime(d dbDomain, nodes map[string]NodeHeartbeat, now time.Time) domainRuntimeStatus {
+	certSynced := 0
+	failoverReady := 0
+	nodeStates := make([]domainNodeCertSync, 0, len(d.NodeIDs))
+	for _, nodeID := range d.NodeIDs {
+		node := nodes[nodeID]
+		state := domainNodeCertState(d, nodeID, node, now)
+		if state.CertSynced {
+			certSynced++
+		}
+		if state.FailoverReady && nodeID != d.ActiveNodeID {
+			failoverReady++
+		}
+		nodeStates = append(nodeStates, state)
+	}
+	return domainRuntimeStatus{
+		Status:                domainRuntimeStatusValue(d),
+		DNSStatus:             domainDNSStatus(d),
+		CertStatus:            domainCertificateStatus(d, now),
+		CertRenewStatus:       certificateRenewStatus(d, now),
+		CertDaysRemaining:     certificateDaysRemaining(d, now),
+		CertRenewInDays:       certificateRenewInDays(d, now),
+		CertSyncStatus:        domainCertSyncStatusValue(d, certSynced),
+		CertSyncedNodes:       certSynced,
+		CertAssignedNodes:     len(d.NodeIDs),
+		FailoverStatus:        domainFailoverStatusValue(d, failoverReady),
+		FailoverReadyNodes:    failoverReady,
+		FailoverBlockedReason: domainFailoverBlockedReason(d, failoverReady),
+		AssignedNodeStatus:    nodeStates,
+	}
+}
+
+func domainRuntimeStatusValue(d dbDomain) string {
+	if !d.Enabled {
+		return "disabled"
+	}
+	if strings.TrimSpace(d.Certificate.LastError) != "" || strings.TrimSpace(d.Cloudflare.LastError) != "" {
+		return "error"
+	}
+	return "active"
+}
+
+func domainDNSStatus(d dbDomain) string {
+	if strings.TrimSpace(d.Cloudflare.LastError) != "" {
+		return "dns error"
+	}
+	if d.Cloudflare.LastSyncedAt != nil {
+		return "dns synced"
+	}
+	return "dns pending"
+}
+
+func domainCertificateStatus(d dbDomain, now time.Time) string {
+	if strings.TrimSpace(d.Certificate.LastError) != "" {
+		return "cert error"
+	}
+	if strings.TrimSpace(d.Certificate.Version) == "" {
+		return "cert missing"
+	}
+	if d.Certificate.ExpiresAt != nil && !d.Certificate.ExpiresAt.After(now) {
+		return "cert expired"
+	}
+	return "cert issued"
+}
+
+func domainCertSyncStatusValue(d dbDomain, synced int) string {
+	if len(d.NodeIDs) == 0 {
+		return "cert nodes none"
+	}
+	if strings.TrimSpace(d.Certificate.Version) == "" {
+		return "cert not issued"
+	}
+	return fmt.Sprintf("cert synced %d/%d", synced, len(d.NodeIDs))
+}
+
+func domainFailoverStatusValue(d dbDomain, ready int) string {
+	if !d.Enabled {
+		return "failover disabled"
+	}
+	if !d.FailoverEnabled {
+		return "failover disabled"
+	}
+	if len(d.NodeIDs) < 2 {
+		return "failover needs nodes"
+	}
+	if ready == 0 {
+		return "failover blocked"
+	}
+	return fmt.Sprintf("failover ready %d/%d", ready, len(d.NodeIDs))
+}
+
+func domainFailoverBlockedReason(d dbDomain, ready int) string {
+	if !d.Enabled || !d.FailoverEnabled || len(d.NodeIDs) < 2 || ready > 0 {
+		return ""
+	}
+	if strings.TrimSpace(d.Certificate.Version) != "" {
+		return "no assigned healthy node has the current certificate version"
+	}
+	return "no assigned healthy node is online"
+}
+
+func domainNodeCertState(d dbDomain, nodeID string, node NodeHeartbeat, now time.Time) domainNodeCertSync {
+	state := domainNodeCertSync{
+		NodeID:    nodeID,
+		Online:    isNodeHealthy(node),
+		PublicIP:  node.PublicIP,
+		Error:     node.Error,
+		CertError: node.CertError,
+	}
+	if state.NodeID == "" {
+		state.NodeID = node.NodeID
+	}
+	if !node.UpdatedAt.IsZero() {
+		seen := node.UpdatedAt
+		state.LastSeenAt = &seen
+	}
+	targetDomain := strings.TrimSuffix(strings.ToLower(d.Domain), ".")
+	targetVersion := strings.TrimSpace(d.Certificate.Version)
+	for _, cert := range node.CertDomains {
+		certDomain := strings.TrimSuffix(strings.ToLower(cert.Domain), ".")
+		if certDomain != targetDomain {
+			continue
+		}
+		state.CertVersion = cert.Version
+		state.ExpiresAt = cert.ExpiresAt
+		state.CertSynced = targetVersion != "" && cert.Version == targetVersion && nodeCertStateValidAt(cert, now)
+		break
+	}
+	state.FailoverReady = state.Online && nodeReadyForDomainAt(node, d, now)
+	return state
+}
+
+func nodeMapByID(nodes []NodeHeartbeat) map[string]NodeHeartbeat {
+	out := make(map[string]NodeHeartbeat, len(nodes))
+	for _, node := range nodes {
+		out[node.NodeID] = node
+	}
+	return out
+}
+
+func (s *adminServer) handleDomainSyncDNS(w http.ResponseWriter, r *http.Request, domain string) {
+	var payload struct {
+		NodeID string `json:"node_id"`
+	}
+	if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	d, err := s.store.GetDomain(ctx, domain)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	nodeID := strings.TrimSpace(payload.NodeID)
+	if nodeID == "" {
+		nodeID = d.ActiveNodeID
+	}
+	if nodeID == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("active node required"))
+		return
+	}
+	node, err := s.store.GetNode(ctx, nodeID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateDomainDNSTarget(*d, *node, time.Now().UTC()); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	settings, err := s.effectiveCloudflareSettings(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	cf, err := newCloudflareClient(settings.APIToken)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	plan, err := planCloudflareDNSWithClient(ctx, *d, *node, cf, true)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	cfConfig, err := syncCloudflareDNSWithToken(ctx, *d, *node, settings.APIToken)
+	if updateErr := s.store.UpdateDomainCloudflare(context.Background(), domain, cfConfig); updateErr != nil && err == nil {
+		err = updateErr
+	}
+	if err == nil && nodeID != d.ActiveNodeID {
+		if updateErr := s.store.UpdateDomainActiveNode(context.Background(), domain, nodeID); updateErr != nil {
+			err = updateErr
+		}
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "ok",
+		"cloudflare":  cfConfig,
+		"active_node": nodeID,
+		"plan":        plan,
+	})
+}
+
+func (s *adminServer) handleDomainDNSPlan(w http.ResponseWriter, r *http.Request, domain string) {
+	var payload struct {
+		NodeID string `json:"node_id"`
+	}
+	if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	d, err := s.store.GetDomain(ctx, domain)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	nodeID := strings.TrimSpace(payload.NodeID)
+	if nodeID == "" {
+		nodeID = d.ActiveNodeID
+	}
+	plan, err := s.domainDNSPlan(ctx, *d, nodeID, true)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
+		"plan":   plan,
+	})
+}
+
+func (s *adminServer) domainDNSPlan(ctx context.Context, d dbDomain, nodeID string, lookupExisting bool) (cloudflareDNSPlan, error) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return cloudflareDNSPlan{}, fmt.Errorf("active node required")
+	}
+	node, err := s.store.GetNode(ctx, nodeID)
+	if err != nil {
+		return cloudflareDNSPlan{}, err
+	}
+	if err := validateDomainDNSTarget(d, *node, time.Now().UTC()); err != nil {
+		return cloudflareDNSPlan{}, err
+	}
+	settings, err := s.effectiveCloudflareSettings(ctx)
+	if err != nil {
+		return cloudflareDNSPlan{}, err
+	}
+	cf, err := newCloudflareClient(settings.APIToken)
+	if err != nil {
+		return cloudflareDNSPlan{}, err
+	}
+	return planCloudflareDNSWithClient(ctx, d, *node, cf, lookupExisting)
+}
+
+func validateDomainDNSTarget(d dbDomain, node NodeHeartbeat, now time.Time) error {
+	if !d.Enabled {
+		return fmt.Errorf("domain %s is disabled", d.Domain)
+	}
+	if !domainAssignedToNode(d, node.NodeID) {
+		return fmt.Errorf("node %s is not assigned to domain %s", node.NodeID, d.Domain)
+	}
+	if !nodeHealthyAt(node, now) {
+		if node.NodeID == "" {
+			return fmt.Errorf("node heartbeat is missing")
+		}
+		if node.Error != "" {
+			return fmt.Errorf("node %s is unhealthy: %s", node.NodeID, node.Error)
+		}
+		return fmt.Errorf("node %s heartbeat is stale", node.NodeID)
+	}
+	if publicIPString(node.PublicIP) == "" {
+		return fmt.Errorf("node %s public_ip is not a public IP address", node.NodeID)
+	}
+	if !nodeReadyForDomain(node, d) {
+		return fmt.Errorf("node %s has not synced certificate for %s", node.NodeID, d.Domain)
+	}
+	return nil
+}
+
+type certificatePlan struct {
+	Domain            string     `json:"domain,omitempty"`
+	ZoneID            string     `json:"zone_id,omitempty"`
+	ZoneName          string     `json:"zone_name,omitempty"`
+	Email             string     `json:"email,omitempty"`
+	DirectoryURL      string     `json:"directory_url,omitempty"`
+	CurrentVersion    string     `json:"current_version,omitempty"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
+	DaysRemaining     int        `json:"days_remaining"`
+	RenewBeforeDays   int        `json:"renew_before_days"`
+	RenewInDays       int        `json:"renew_in_days"`
+	RenewStatus       string     `json:"renew_status"`
+	Action            string     `json:"action"`
+	ChallengeRecord   string     `json:"challenge_record,omitempty"`
+	NodeIDs           []string   `json:"node_ids,omitempty"`
+	AssignedNodeCount int        `json:"assigned_node_count"`
+}
+
+func (s *adminServer) handleDomainCertPlan(w http.ResponseWriter, r *http.Request, domain string) {
+	var payload struct {
+		Email        string `json:"email"`
+		DirectoryURL string `json:"directory_url"`
+	}
+	if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	d, err := s.store.GetDomain(ctx, domain)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	plan, err := s.domainCertificatePlan(ctx, *d, payload.Email, payload.DirectoryURL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
+		"plan":   plan,
+	})
+}
+
+func (s *adminServer) domainCertificatePlan(ctx context.Context, d dbDomain, email, directoryURL string) (certificatePlan, error) {
+	settings, err := s.effectiveCloudflareSettings(ctx)
+	if err != nil {
+		return certificatePlan{}, err
+	}
+	return certificatePlanWithSettings(ctx, d, email, directoryURL, settings)
+}
+
+func certificatePlanWithSettings(ctx context.Context, d dbDomain, email, directoryURL string, settings cloudflareSettings) (certificatePlan, error) {
+	email = firstNonEmpty(email, settings.ACMEEmail)
+	if strings.TrimSpace(email) == "" {
+		return certificatePlan{}, fmt.Errorf("ACME email required")
+	}
+	directoryURL = firstNonEmpty(directoryURL, settings.ACMEDirectoryURL, defaultACMEDirectoryURL)
+	cf, err := newCloudflareClient(settings.APIToken)
+	if err != nil {
+		return certificatePlan{}, err
+	}
+	zoneID := strings.TrimSpace(d.Cloudflare.ZoneID)
+	zoneName := strings.TrimSpace(d.Cloudflare.ZoneName)
+	if zoneID == "" || zoneName == "" {
+		zone, err := cf.findZone(ctx, d.Domain)
+		if err != nil {
+			return certificatePlan{}, err
+		}
+		if zoneID == "" {
+			zoneID = zone.ID
+		}
+		if zoneName == "" {
+			zoneName = zone.Name
+		}
+	}
+	now := time.Now().UTC()
+	return buildCertificatePlan(d, email, directoryURL, zoneID, zoneName, now)
+}
+
+func buildCertificatePlan(d dbDomain, email, directoryURL, zoneID, zoneName string, now time.Time) (certificatePlan, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	challengeRecord, err := dns01RecordName(d.Domain)
+	if err != nil {
+		return certificatePlan{}, err
+	}
+	renewStatus := certificateRenewStatus(d, now)
+	action := "issue"
+	if strings.TrimSpace(d.Certificate.Version) != "" {
+		action = "renew"
+		if renewStatus == "valid" {
+			action = "not_due"
+		}
+	}
+	return certificatePlan{
+		Domain:            d.Domain,
+		ZoneID:            zoneID,
+		ZoneName:          zoneName,
+		Email:             email,
+		DirectoryURL:      directoryURL,
+		CurrentVersion:    d.Certificate.Version,
+		ExpiresAt:         d.Certificate.ExpiresAt,
+		DaysRemaining:     certificateDaysRemaining(d, now),
+		RenewBeforeDays:   renewBeforeDays(d),
+		RenewInDays:       certificateRenewInDays(d, now),
+		RenewStatus:       renewStatus,
+		Action:            action,
+		ChallengeRecord:   challengeRecord,
+		NodeIDs:           append([]string(nil), d.NodeIDs...),
+		AssignedNodeCount: len(d.NodeIDs),
+	}, nil
+}
+
+func (s *adminServer) handleDomainIssueCert(w http.ResponseWriter, r *http.Request, domain string) {
+	var payload struct {
+		Email        string `json:"email"`
+		DirectoryURL string `json:"directory_url"`
+	}
+	if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	defer cancel()
+	d, err := s.store.GetDomain(ctx, domain)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	settings, err := s.effectiveCloudflareSettings(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	email := firstNonEmpty(payload.Email, settings.ACMEEmail)
+	directoryURL := firstNonEmpty(payload.DirectoryURL, settings.ACMEDirectoryURL)
+	plan, planErr := s.domainCertificatePlan(ctx, *d, email, directoryURL)
+	if planErr != nil {
+		writeError(w, http.StatusBadRequest, planErr)
+		return
+	}
+	cert, err := issueCertificateWithCloudflareTokenZone(ctx, *d, email, directoryURL, settings.APIToken, plan.ZoneID)
+	if err != nil {
+		failed := certificateFailure(d.Certificate, err)
+		_ = s.store.UpdateDomainCertificate(context.Background(), domain, failed)
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.store.UpdateDomainCertificate(context.Background(), domain, cert); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":       "ok",
+		"cert_version": cert.Version,
+		"expires_at":   cert.ExpiresAt,
+		"plan":         plan,
+	})
+}
+
+func (s *adminServer) handleDomainImportCert(w http.ResponseWriter, r *http.Request, domain string) {
+	var payload struct {
+		FullchainPEM  string `json:"fullchain_pem"`
+		PrivateKeyPEM string `json:"private_key_pem"`
+	}
+	if err := decodeJSON(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	d, err := s.store.GetDomain(ctx, domain)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	cert, err := importedDomainCertificate(d.Domain, payload.FullchainPEM, payload.PrivateKeyPEM)
+	if err != nil {
+		failed := certificateFailure(d.Certificate, err)
+		_ = s.store.UpdateDomainCertificate(context.Background(), domain, failed)
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.store.UpdateDomainCertificate(context.Background(), domain, cert); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":       "ok",
+		"cert_version": cert.Version,
+		"expires_at":   cert.ExpiresAt,
+	})
+}
+
+func (s *adminServer) handleNodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireToken(w, r) {
+		return
+	}
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	nodes, err := s.store.Nodes(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"nodes": nodes,
+		"now":   time.Now().UTC(),
+	})
+}
+
+func (s *adminServer) handleNodeAction(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w, r) {
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/nodes/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid node id"))
+		return
+	}
+	nodeID, err := url.PathUnescape(parts[0])
+	if err != nil || strings.TrimSpace(nodeID) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid node id"))
+		return
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	if len(parts) == 2 && parts[1] == "token" {
+		s.handleNodeTokenAction(w, r, nodeID)
+		return
+	}
+	if len(parts) != 1 {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	switch r.Method {
+	case http.MethodDelete:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		if err := s.store.DeleteNode(ctx, nodeID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *adminServer) handleNodeTokenAction(w http.ResponseWriter, r *http.Request, nodeID string) {
+	switch r.Method {
+	case http.MethodPut:
+		var payload struct {
+			Token string `json:"token"`
+		}
+		if err := decodeJSON(r, &payload); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		token := strings.TrimSpace(payload.Token)
+		if token == "" {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("token required"))
+			return
+		}
+		if len(token) < 16 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("node token must be at least 16 characters"))
+			return
+		}
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		if err := s.store.SetNodeTokenHash(ctx, nodeID, hashNodeToken(token)); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "node_id": nodeID, "has_token": true})
+	case http.MethodDelete:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		if err := s.store.ClearNodeTokenHash(ctx, nodeID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "node_id": nodeID, "has_token": false})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -291,9 +1635,11 @@ func (s *adminServer) handleRule(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		if err := writeRuleFile(s.rulesDir, payload); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+		if s.applier != nil && s.rulesDir != "" {
+			if err := writeRuleFile(s.rulesDir, payload); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case http.MethodDelete:
@@ -303,11 +1649,457 @@ func (s *adminServer) handleRule(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		_ = os.Remove(filepath.Join(s.rulesDir, name+".rule"))
+		if s.applier != nil && s.rulesDir != "" {
+			_ = os.Remove(filepath.Join(s.rulesDir, name+".rule"))
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *adminServer) startAdminWorkers(ctx context.Context) {
+	reconcileInterval := envDuration(domainReconcileIntervalEnv, defaultDomainReconcilePeriod)
+	certInterval := envDuration(certificateRenewIntervalEnv, defaultCertRenewPeriod)
+	rulesHealthInterval := envDuration(rulesHealthIntervalEnv, defaultRulesHealthPeriod)
+	if reconcileInterval > 0 {
+		go s.domainReconcileLoop(ctx, reconcileInterval)
+	}
+	if certInterval > 0 {
+		go s.certificateRenewLoop(ctx, certInterval)
+	}
+	if rulesHealthInterval > 0 {
+		go s.rulesHealthLoop(ctx, rulesHealthInterval)
+	}
+}
+
+func (s *adminServer) domainReconcileLoop(ctx context.Context, interval time.Duration) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			if err := s.reconcileDomainFailover(ctx); err != nil {
+				log.Printf("[admin] domain failover reconcile failed: %v", err)
+			}
+			timer.Reset(interval)
+		}
+	}
+}
+
+func (s *adminServer) rulesHealthLoop(ctx context.Context, interval time.Duration) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			target := firstNonEmpty(os.Getenv(rulesHealthTargetEnv), defaultRulesHealthTarget)
+			timeoutValue := firstNonEmpty(os.Getenv(rulesHealthTimeoutEnv), defaultRulesHealthTimeout)
+			if _, err := s.checkAndSaveRulesHealth(ctx, target, timeoutValue); err != nil {
+				log.Printf("[admin] rules health check failed: %v", err)
+			}
+			timer.Reset(interval)
+		}
+	}
+}
+
+func (s *adminServer) certificateRenewLoop(ctx context.Context, interval time.Duration) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			if err := s.renewDueCertificates(ctx); err != nil {
+				log.Printf("[admin] certificate renew reconcile failed: %v", err)
+			}
+			timer.Reset(interval)
+		}
+	}
+}
+
+func (s *adminServer) reconcileDomainFailover(ctx context.Context) error {
+	cctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	settings, err := s.effectiveCloudflareSettings(cctx)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(settings.APIToken) == "" {
+		return nil
+	}
+	domains, err := s.store.Domains(cctx)
+	if err != nil {
+		return err
+	}
+	nodes, err := s.store.Nodes(cctx)
+	if err != nil {
+		return err
+	}
+	nodeMap := make(map[string]NodeHeartbeat, len(nodes))
+	for _, node := range nodes {
+		nodeMap[node.NodeID] = node
+	}
+	for _, d := range domains {
+		if !d.Enabled || !d.FailoverEnabled || len(d.NodeIDs) == 0 {
+			continue
+		}
+		next, ok := failoverTarget(d, nodeMap)
+		if !ok {
+			continue
+		}
+		d.ActiveNodeID = next.NodeID
+		cfConfig, err := syncCloudflareDNSWithToken(cctx, d, next, settings.APIToken)
+		if updateErr := s.store.UpdateDomainCloudflare(context.Background(), d.Domain, cfConfig); updateErr != nil && err == nil {
+			err = updateErr
+		}
+		if err == nil {
+			err = s.store.UpdateDomainActiveNode(context.Background(), d.Domain, next.NodeID)
+		}
+		if err != nil {
+			log.Printf("[admin] failover %s to %s failed: %v", d.Domain, next.NodeID, err)
+			continue
+		}
+		log.Printf("[admin] failed over %s to node %s", d.Domain, next.NodeID)
+	}
+	return nil
+}
+
+func (s *adminServer) renewDueCertificates(ctx context.Context) error {
+	cctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer cancel()
+	settings, err := s.effectiveCloudflareSettings(cctx)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(settings.APIToken) == "" || strings.TrimSpace(settings.ACMEEmail) == "" {
+		return nil
+	}
+	domains, err := s.store.Domains(cctx)
+	if err != nil {
+		return err
+	}
+	for _, d := range domains {
+		if !d.Enabled || !certificateRenewDue(d) {
+			continue
+		}
+		plan, err := certificatePlanWithSettings(cctx, d, settings.ACMEEmail, settings.ACMEDirectoryURL, settings)
+		if err != nil {
+			failed := certificateFailure(d.Certificate, err)
+			_ = s.store.UpdateDomainCertificate(context.Background(), d.Domain, failed)
+			log.Printf("[admin] plan cert renewal for %s failed: %v", d.Domain, err)
+			continue
+		}
+		cert, err := issueCertificateWithCloudflareTokenZone(cctx, d, plan.Email, plan.DirectoryURL, settings.APIToken, plan.ZoneID)
+		if err != nil {
+			failed := certificateFailure(d.Certificate, err)
+			_ = s.store.UpdateDomainCertificate(context.Background(), d.Domain, failed)
+			log.Printf("[admin] renew cert for %s failed: %v", d.Domain, err)
+			continue
+		}
+		if err := s.store.UpdateDomainCertificate(context.Background(), d.Domain, cert); err != nil {
+			log.Printf("[admin] save renewed cert for %s failed: %v", d.Domain, err)
+			continue
+		}
+		log.Printf("[admin] renewed cert for %s version %s", d.Domain, cert.Version)
+	}
+	return nil
+}
+
+func isNodeHealthy(node NodeHeartbeat) bool {
+	return nodeHealthyAt(node, time.Now())
+}
+
+func nodeHealthyAt(node NodeHeartbeat, now time.Time) bool {
+	if node.NodeID == "" || node.Error != "" {
+		return false
+	}
+	if node.UpdatedAt.IsZero() {
+		return false
+	}
+	return now.Sub(node.UpdatedAt) <= 90*time.Second
+}
+
+func failoverTarget(d dbDomain, nodes map[string]NodeHeartbeat) (NodeHeartbeat, bool) {
+	if !d.Enabled || !d.FailoverEnabled || len(d.NodeIDs) == 0 {
+		return NodeHeartbeat{}, false
+	}
+	active := nodes[d.ActiveNodeID]
+	if isNodeHealthy(active) {
+		return NodeHeartbeat{}, false
+	}
+	next, ok := firstHealthyAssignedNode(d, nodes)
+	if !ok || next.NodeID == d.ActiveNodeID {
+		return NodeHeartbeat{}, false
+	}
+	return next, true
+}
+
+func firstHealthyAssignedNode(d dbDomain, nodes map[string]NodeHeartbeat) (NodeHeartbeat, bool) {
+	for _, nodeID := range d.NodeIDs {
+		node := nodes[nodeID]
+		if isNodeHealthy(node) && nodeReadyForDomain(node, d) {
+			return node, true
+		}
+	}
+	return NodeHeartbeat{}, false
+}
+
+func nodeReadyForDomain(node NodeHeartbeat, d dbDomain) bool {
+	return nodeReadyForDomainAt(node, d, time.Now().UTC())
+}
+
+func nodeReadyForDomainAt(node NodeHeartbeat, d dbDomain, now time.Time) bool {
+	version := strings.TrimSpace(d.Certificate.Version)
+	if version == "" {
+		return true
+	}
+	return nodeHasDomainCertificateVersionAt(node, d.Domain, version, now)
+}
+
+func nodeHasDomainCertificateVersion(node NodeHeartbeat, domain, version string) bool {
+	return nodeHasDomainCertificateVersionAt(node, domain, version, time.Now().UTC())
+}
+
+func nodeHasDomainCertificateVersionAt(node NodeHeartbeat, domain, version string, now time.Time) bool {
+	domain, err := normalizeDomainName(domain)
+	if err != nil {
+		return false
+	}
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return false
+	}
+	for _, cert := range node.CertDomains {
+		certDomain, err := normalizeDomainName(cert.Domain)
+		if err != nil {
+			continue
+		}
+		if certDomain == domain && strings.TrimSpace(cert.Version) == version && nodeCertStateValidAt(cert, now) {
+			return true
+		}
+	}
+	return false
+}
+
+func nodeCertStateValidAt(cert NodeCertState, now time.Time) bool {
+	if cert.ExpiresAt == nil {
+		return false
+	}
+	return cert.ExpiresAt.After(now)
+}
+
+func certificateRenewDue(d dbDomain) bool {
+	now := time.Now().UTC()
+	if d.Certificate.ExpiresAt == nil || d.Certificate.FullchainPEM == "" || d.Certificate.PrivateKeyPEM == "" {
+		return true
+	}
+	if !d.Certificate.ExpiresAt.After(now) {
+		return true
+	}
+	days := renewBeforeDays(d)
+	return d.Certificate.ExpiresAt.Sub(now) <= time.Duration(days)*24*time.Hour
+}
+
+func certificateRenewStatus(d dbDomain, now time.Time) string {
+	if strings.TrimSpace(d.Certificate.LastError) != "" {
+		return "error"
+	}
+	if d.Certificate.ExpiresAt == nil || d.Certificate.FullchainPEM == "" || d.Certificate.PrivateKeyPEM == "" {
+		return "missing"
+	}
+	if !d.Certificate.ExpiresAt.After(now) {
+		return "expired"
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	days := renewBeforeDays(d)
+	if d.Certificate.ExpiresAt.Sub(now) <= time.Duration(days)*24*time.Hour {
+		return "due"
+	}
+	return "valid"
+}
+
+func certificateRenewInDays(d dbDomain, now time.Time) int {
+	if d.Certificate.ExpiresAt == nil {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	days := renewBeforeDays(d)
+	renewAt := d.Certificate.ExpiresAt.Add(-time.Duration(days) * 24 * time.Hour)
+	hours := renewAt.Sub(now).Hours()
+	if hours <= 0 {
+		return 0
+	}
+	return int(math.Ceil(hours / 24))
+}
+
+func renewBeforeDays(d dbDomain) int {
+	if d.RenewBeforeDays > 0 {
+		return d.RenewBeforeDays
+	}
+	return 30
+}
+
+func certificateDaysRemaining(d dbDomain, now time.Time) int {
+	if d.Certificate.ExpiresAt == nil {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	hours := d.Certificate.ExpiresAt.Sub(now).Hours()
+	if hours <= 0 {
+		return 0
+	}
+	return int(math.Ceil(hours / 24))
+}
+
+type rulesHealthResponse struct {
+	CheckedAt time.Time       `json:"checked_at"`
+	Target    string          `json:"target"`
+	Timeout   string          `json:"timeout,omitempty"`
+	Results   []checkResponse `json:"results"`
+}
+
+func (s *adminServer) handleRulesHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireToken(w, r) {
+		return
+	}
+
+	if r.Method == http.MethodGet && parseBool(r.URL.Query().Get("latest")) {
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		health, err := s.store.LatestRulesHealth(ctx)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if health == nil {
+			writeJSON(w, http.StatusOK, rulesHealthResponse{
+				CheckedAt: time.Time{},
+				Target:    firstNonEmpty(os.Getenv(rulesHealthTargetEnv), defaultRulesHealthTarget),
+				Timeout:   firstNonEmpty(os.Getenv(rulesHealthTimeoutEnv), defaultRulesHealthTimeout),
+				Results:   []checkResponse{},
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, health)
+		return
+	}
+
+	target := strings.TrimSpace(r.URL.Query().Get("target"))
+	timeoutValue := strings.TrimSpace(r.URL.Query().Get("timeout"))
+	if r.Method == http.MethodPost {
+		var payload struct {
+			Target  string `json:"target"`
+			Timeout string `json:"timeout"`
+		}
+		if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if payload.Target != "" {
+			target = payload.Target
+		}
+		if payload.Timeout != "" {
+			timeoutValue = payload.Timeout
+		}
+	}
+	if target == "" {
+		target = firstNonEmpty(os.Getenv(rulesHealthTargetEnv), defaultRulesHealthTarget)
+	}
+	if timeoutValue == "" {
+		timeoutValue = firstNonEmpty(os.Getenv(rulesHealthTimeoutEnv), defaultRulesHealthTimeout)
+	}
+
+	health, err := s.checkAndSaveRulesHealth(r.Context(), target, timeoutValue)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, health)
+}
+
+func (s *adminServer) checkAndSaveRulesHealth(ctx context.Context, target, timeoutValue string) (rulesHealthResponse, error) {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+
+	health, err := s.checkRulesHealth(ctx, target, timeoutValue)
+	if err != nil {
+		return health, err
+	}
+	saveCtx, cancel := withTimeout(context.Background())
+	defer cancel()
+	if err := s.store.SaveRulesHealth(saveCtx, health); err != nil {
+		return health, err
+	}
+	return health, nil
+}
+
+func (s *adminServer) checkRulesHealth(ctx context.Context, target, timeoutValue string) (rulesHealthResponse, error) {
+	target = firstNonEmpty(target, os.Getenv(rulesHealthTargetEnv), defaultRulesHealthTarget)
+	timeoutValue = firstNonEmpty(timeoutValue, os.Getenv(rulesHealthTimeoutEnv), defaultRulesHealthTimeout)
+	perRuleTimeout := 8 * time.Second
+	if parsed, err := time.ParseDuration(timeoutValue); err == nil && parsed > 0 {
+		perRuleTimeout = parsed
+	}
+
+	storeCtx, cancelStore := withTimeout(ctx)
+	defer cancelStore()
+	rules, err := s.store.Rules(storeCtx)
+	if err != nil {
+		return rulesHealthResponse{}, err
+	}
+	sort.Slice(rules, func(i, j int) bool { return rules[i].Name < rules[j].Name })
+
+	results := make([]checkResponse, 0, len(rules))
+	checkBudget := time.Duration(len(rules)+1) * (perRuleTimeout + time.Second)
+	checkCtx, cancelChecks := context.WithTimeout(ctx, checkBudget)
+	defer cancelChecks()
+	for _, ruleDoc := range rules {
+		if strings.TrimSpace(ruleDoc.Name) == "" {
+			continue
+		}
+		result, err := s.runCheck(checkCtx, checkRequest{
+			Type:    "rule",
+			Name:    ruleDoc.Name,
+			Target:  target,
+			Timeout: timeoutValue,
+			Probe:   "ipinfo",
+		})
+		if err != nil {
+			result = checkResponse{
+				Status:  "error",
+				Type:    "rule",
+				Name:    ruleDoc.Name,
+				Target:  target,
+				Network: "tcp",
+				Probe:   "ipinfo",
+				Error:   err.Error(),
+			}
+		}
+		results = append(results, result)
+	}
+
+	return rulesHealthResponse{
+		CheckedAt: time.Now().UTC(),
+		Target:    target,
+		Timeout:   timeoutValue,
+		Results:   results,
+	}, nil
 }
 
 func (s *adminServer) handleReload(w http.ResponseWriter, r *http.Request) {
@@ -320,6 +2112,10 @@ func (s *adminServer) handleReload(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := withTimeout(r.Context())
 	defer cancel()
+	if s.applier == nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("proxy reload unavailable in admin mode"))
+		return
+	}
 	if err := s.reload(ctx); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -327,142 +2123,353 @@ func (s *adminServer) handleReload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+type checkRequest struct {
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Target  string `json:"target"`
+	Network string `json:"network"`
+	Timeout string `json:"timeout"`
+	Probe   string `json:"probe"`
+}
+
+type checkResponse struct {
+	Status     string         `json:"status"`
+	Type       string         `json:"type"`
+	Name       string         `json:"name,omitempty"`
+	Target     string         `json:"target"`
+	Network    string         `json:"network"`
+	Probe      string         `json:"probe,omitempty"`
+	URL        string         `json:"url,omitempty"`
+	HTTPStatus int            `json:"http_status,omitempty"`
+	Dialer     string         `json:"dialer,omitempty"`
+	DurationMS int64          `json:"duration_ms"`
+	IPInfo     *ipInfoPayload `json:"ip_info,omitempty"`
+	Error      string         `json:"error,omitempty"`
+}
+
+func (s *adminServer) handleCheck(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w, r) {
+		return
+	}
+	var req checkRequest
+	switch r.Method {
+	case http.MethodGet:
+		req = checkRequest{
+			Type:    r.URL.Query().Get("type"),
+			Name:    r.URL.Query().Get("name"),
+			Target:  r.URL.Query().Get("target"),
+			Network: r.URL.Query().Get("network"),
+			Timeout: r.URL.Query().Get("timeout"),
+			Probe:   r.URL.Query().Get("probe"),
+		}
+	case http.MethodPost:
+		if err := decodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	resp, err := s.runCheck(r.Context(), req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *adminServer) runCheck(ctx context.Context, req checkRequest) (checkResponse, error) {
+	if s.pxySw == nil || s.pxySw.Current() == nil {
+		return checkResponse{}, fmt.Errorf("connectivity check requires a running proxy; unavailable in admin-only mode")
+	}
+	if strings.EqualFold(strings.TrimSpace(req.Probe), "ipinfo") || looksLikeHTTPURL(req.Target) {
+		return s.runHTTPProbe(ctx, req)
+	}
+	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
+	if req.Type == "" {
+		req.Type = "default"
+	}
+	req.Network = strings.ToLower(strings.TrimSpace(req.Network))
+	if req.Network == "" {
+		req.Network = "tcp"
+	}
+	if req.Network != "tcp" {
+		return checkResponse{}, fmt.Errorf("unsupported network %q", req.Network)
+	}
+	req.Target = normalizeCheckTarget(req.Target)
+	if req.Target == "" {
+		return checkResponse{}, fmt.Errorf("target required")
+	}
+	if _, _, err := net.SplitHostPort(req.Target); err != nil {
+		return checkResponse{}, fmt.Errorf("invalid target %q: %w", req.Target, err)
+	}
+	timeout := 5 * time.Second
+	if req.Timeout != "" {
+		parsed, err := time.ParseDuration(req.Timeout)
+		if err != nil || parsed <= 0 {
+			return checkResponse{}, fmt.Errorf("invalid timeout %q", req.Timeout)
+		}
+		timeout = parsed
+	}
+
+	var (
+		conn   net.Conn
+		dialer proxy.Dialer
+		err    error
+	)
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, dialer, err = s.dialForCheck(req, req.Network, req.Target)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return checkResponse{}, ctx.Err()
+	case <-time.After(timeout):
+		return checkResponse{
+			Status:     "error",
+			Type:       req.Type,
+			Name:       req.Name,
+			Target:     req.Target,
+			Network:    req.Network,
+			DurationMS: time.Since(start).Milliseconds(),
+			Error:      "timeout",
+		}, nil
+	case <-done:
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+	resp := checkResponse{
+		Status:     "ok",
+		Type:       req.Type,
+		Name:       req.Name,
+		Target:     req.Target,
+		Network:    req.Network,
+		DurationMS: time.Since(start).Milliseconds(),
+	}
+	if dialer != nil {
+		resp.Dialer = dialer.Addr()
+	}
+	if err != nil {
+		resp.Status = "error"
+		resp.Error = err.Error()
+	}
+	return resp, nil
+}
+
+type ipInfoPayload struct {
+	IP       string `json:"ip,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+	City     string `json:"city,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Loc      string `json:"loc,omitempty"`
+	Org      string `json:"org,omitempty"`
+	Postal   string `json:"postal,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
+	Readme   string `json:"readme,omitempty"`
+}
+
+func (s *adminServer) runHTTPProbe(ctx context.Context, req checkRequest) (checkResponse, error) {
+	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
+	if req.Type == "" {
+		req.Type = "default"
+	}
+	req.Network = "tcp"
+	req.Probe = strings.ToLower(strings.TrimSpace(req.Probe))
+	if req.Probe == "" {
+		req.Probe = "ipinfo"
+	}
+
+	targetURL := strings.TrimSpace(req.Target)
+	if targetURL == "" && req.Probe == "ipinfo" {
+		targetURL = "https://ipinfo.io/json"
+	}
+	if targetURL == "" {
+		return checkResponse{}, fmt.Errorf("target required")
+	}
+	if !looksLikeHTTPURL(targetURL) {
+		targetURL = "https://" + targetURL
+	}
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return checkResponse{}, fmt.Errorf("invalid probe url %q", targetURL)
+	}
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return checkResponse{}, fmt.Errorf("unsupported probe scheme %q", parsedURL.Scheme)
+	}
+
+	timeout := 8 * time.Second
+	if req.Timeout != "" {
+		parsed, err := time.ParseDuration(req.Timeout)
+		if err != nil || parsed <= 0 {
+			return checkResponse{}, fmt.Errorf("invalid timeout %q", req.Timeout)
+		}
+		timeout = parsed
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var usedDialer proxy.Dialer
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, dialer, err := s.dialForCheck(req, network, addr)
+			if err == nil {
+				usedDialer = dialer
+			}
+			return conn, err
+		},
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          1,
+		IdleConnTimeout:       timeout,
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+	}
+	defer transport.CloseIdleConnections()
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
+	httpReq, err := http.NewRequestWithContext(probeCtx, http.MethodGet, parsedURL.String(), nil)
+	if err != nil {
+		return checkResponse{}, err
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("User-Agent", "glider-admin-check/"+version)
+
+	start := time.Now()
+	resp, err := client.Do(httpReq)
+	result := checkResponse{
+		Status:     "ok",
+		Type:       req.Type,
+		Name:       req.Name,
+		Target:     parsedURL.Host,
+		Network:    "tcp",
+		Probe:      req.Probe,
+		URL:        parsedURL.String(),
+		DurationMS: time.Since(start).Milliseconds(),
+	}
+	if usedDialer != nil {
+		result.Dialer = usedDialer.Addr()
+	}
+	if err != nil {
+		result.Status = "error"
+		result.Error = err.Error()
+		return result, nil
+	}
+	defer resp.Body.Close()
+	result.HTTPStatus = resp.StatusCode
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		result.Status = "error"
+		result.Error = resp.Status
+		return result, nil
+	}
+	var info ipInfoPayload
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&info); err != nil {
+		result.Status = "error"
+		result.Error = err.Error()
+		return result, nil
+	}
+	result.IPInfo = &info
+	return result, nil
+}
+
+func (s *adminServer) dialForCheck(req checkRequest, network, target string) (net.Conn, proxy.Dialer, error) {
+	switch req.Type {
+	case "default":
+		return s.pxySw.Dial(network, target)
+	case "rule":
+		if strings.TrimSpace(req.Name) == "" {
+			return nil, nil, fmt.Errorf("name required for rule check")
+		}
+		return s.dialRuleByName(req.Name, network, target)
+	case "user":
+		if strings.TrimSpace(req.Name) == "" {
+			return nil, nil, fmt.Errorf("name required for user check")
+		}
+		return s.pxySw.DialWithUser(req.Name, network, target)
+	default:
+		return nil, nil, fmt.Errorf("unsupported check type %q", req.Type)
+	}
+}
+
+func (s *adminServer) dialRuleByName(name, network, target string) (net.Conn, proxy.Dialer, error) {
+	ruleConf := s.findLoadedRule(name)
+	if ruleConf == nil {
+		return nil, nil, fmt.Errorf("rule %q is not loaded", name)
+	}
+	strategy := ruleConf.Strategy
+	group := rule.NewFwdrGroup(ruleConf.RulePath, ruleConf.Forward, &strategy)
+	return group.Dial(network, target)
+}
+
+func (s *adminServer) findLoadedRule(name string) *rule.Config {
+	if s.conf == nil {
+		return nil
+	}
+	for _, ruleConf := range s.conf.rules {
+		if strings.TrimSuffix(filepath.Base(ruleConf.RulePath), filepath.Ext(ruleConf.RulePath)) == name {
+			return ruleConf
+		}
+	}
+	return nil
+}
+
+func looksLikeHTTPURL(target string) bool {
+	target = strings.ToLower(strings.TrimSpace(target))
+	return strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://")
+}
+
+func normalizeCheckTarget(target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return ""
+	}
+	if strings.Contains(target, "://") {
+		if u, err := url.Parse(target); err == nil {
+			if u.Host != "" {
+				return u.Host
+			}
+			return u.Path
+		}
+	}
+	return target
+}
+
 func (s *adminServer) reload(ctx context.Context) error {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
 
-	rules, err := s.store.Rules(ctx)
+	snap, err := LoadSnapshotFromStore(ctx, s.store)
 	if err != nil {
 		return err
 	}
-	if err := writeRuleFiles(s.rulesDir, rules); err != nil {
+	if err := s.applier.Apply(ctx, snap); err != nil {
 		return err
 	}
-
-	users, err := s.store.Users(ctx)
-	if err != nil {
-		return err
-	}
-	userMap, ruleUsers := buildUserMaps(users)
-
-	newConf := *s.conf
-	newConf.rules = nil
-	if err := loadRules(&newConf); err != nil {
-		return err
-	}
-
-	missing := applyRuleUsers(newConf.rules, ruleUsers)
-	if len(missing) > 0 {
-		return fmt.Errorf("missing rule(s): %s", strings.Join(missing, ", "))
-	}
-
-	newProxy := rule.NewProxy(newConf.Forwards, &newConf.Strategy, newConf.rules)
-	newProxy.Check()
-
-	s.pxySw.Set(newProxy)
-	proxy.DefaultUserStore.Set(userMap)
-	s.conf.rules = newConf.rules
 	s.lastReload = time.Now()
-	return nil
-}
-
-func buildUserMaps(users []dbUser) (map[string]proxy.UserEntry, map[string][]string) {
-	userMap := make(map[string]proxy.UserEntry)
-	ruleUsers := make(map[string][]string)
-	now := time.Now()
-	for _, u := range users {
-		if u.Username == "" {
-			continue
-		}
-		enabled := true
-		if u.Enabled != nil {
-			enabled = *u.Enabled
-		}
-		entry := proxy.UserEntry{
-			Password:  u.Password,
-			Enabled:   enabled,
-			ExpiresAt: normalizeExpiry(u.ExpiresAt),
-		}
-		userMap[u.Username] = entry
-		if u.Rule != "" && userActive(entry, now) {
-			ruleUsers[u.Rule] = append(ruleUsers[u.Rule], u.Username)
-		}
-	}
-	return userMap, ruleUsers
-}
-
-func userActive(entry proxy.UserEntry, now time.Time) bool {
-	if !entry.Enabled {
-		return false
-	}
-	if entry.ExpiresAt == nil || entry.ExpiresAt.IsZero() {
-		return true
-	}
-	return now.Before(*entry.ExpiresAt)
-}
-
-func normalizeExpiry(t *time.Time) *time.Time {
-	if t == nil || t.IsZero() {
-		return nil
-	}
-	tt := *t
-	return &tt
-}
-
-func applyRuleUsers(rules []*rule.Config, ruleUsers map[string][]string) []string {
-	nameToRule := make(map[string]*rule.Config)
-	for _, r := range rules {
-		r.User = nil
-		name := strings.TrimSuffix(filepath.Base(r.RulePath), filepath.Ext(r.RulePath))
-		nameToRule[name] = r
-	}
-
-	var missing []string
-	for name, users := range ruleUsers {
-		ruleConf, ok := nameToRule[name]
-		if !ok {
-			missing = append(missing, name)
-			continue
-		}
-		ruleConf.User = append(ruleConf.User, users...)
-	}
-	return missing
-}
-
-func writeRuleFiles(dir string, rules []dbRule) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	for _, r := range rules {
-		if err := writeRuleFile(dir, r); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func writeRuleFile(dir string, ruleDoc dbRule) error {
-	if err := validateRuleName(ruleDoc.Name); err != nil {
-		return err
-	}
-	path := filepath.Join(dir, ruleDoc.Name+".rule")
-	return os.WriteFile(path, []byte(ruleDoc.Content), 0o644)
-}
-
-var ruleNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-
-func validateRuleName(name string) error {
-	if name == "" {
-		return fmt.Errorf("rule name required")
-	}
-	if !ruleNameRe.MatchString(name) {
-		return fmt.Errorf("invalid rule name")
-	}
 	return nil
 }
 
 func withTimeout(parent context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parent, 5*time.Second)
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func decodeJSON(r *http.Request, v any) error {
@@ -487,55 +2494,403 @@ const adminHTML = `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Glider Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Glider Control Plane</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    h2 { margin-top: 24px; }
-    input, select, textarea { width: 100%; max-width: 520px; margin: 4px 0; }
-    textarea { height: 180px; }
-    button { margin: 6px 4px 6px 0; }
-    .row { margin-bottom: 12px; }
-    .list { margin-top: 8px; }
-    .item { border-bottom: 1px solid #ddd; padding: 6px 0; }
+    :root {
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --panel-2: #f9fafb;
+      --text: #17202a;
+      --muted: #657282;
+      --line: #dfe5ec;
+      --accent: #1f7a8c;
+      --accent-2: #0f766e;
+      --danger: #b42318;
+      --warn: #b45309;
+      --ok: #15803d;
+      --shadow: 0 10px 28px rgba(15, 23, 42, .08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+    }
+    button, input, select, textarea { font: inherit; }
+    button {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      min-height: 34px;
+      padding: 0 12px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover { border-color: #b8c2cc; background: #f8fafc; }
+    button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+    button.primary:hover { background: #166678; }
+    button.danger { color: var(--danger); border-color: #f0b8b3; }
+    button.ghost { background: transparent; }
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      padding: 8px 10px;
+      outline: none;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(31, 122, 140, .12); }
+    textarea { min-height: 230px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; line-height: 1.45; }
+    label { color: var(--muted); font-size: 12px; }
+    .app { min-height: 100vh; display: grid; grid-template-columns: 250px 1fr; }
+    .sidebar { background: #18212c; color: #dce6f2; padding: 22px 18px; }
+    .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 26px; }
+    .brand-mark { width: 34px; height: 34px; border-radius: 8px; background: #2dd4bf; display: grid; place-items: center; color: #102026; font-weight: 800; }
+    .brand-title { font-size: 17px; font-weight: 700; }
+    .brand-sub { font-size: 12px; color: #9fb0c3; margin-top: 2px; }
+    .nav button { width: 100%; justify-content: flex-start; text-align: left; background: transparent; color: #cbd5e1; border-color: transparent; margin-bottom: 6px; }
+    .nav button.active { background: rgba(45, 212, 191, .16); color: #fff; border-color: rgba(45, 212, 191, .24); }
+    .side-card { margin-top: 22px; border: 1px solid rgba(203, 213, 225, .14); border-radius: 8px; padding: 12px; background: rgba(255, 255, 255, .04); }
+    .side-card input { margin-top: 8px; background: #111827; color: #fff; border-color: #334155; }
+    .side-actions { display: flex; gap: 8px; margin-top: 10px; }
+    .side-actions button { color: #e2e8f0; background: #243142; border-color: #334155; }
+    .main { min-width: 0; }
+    header { height: 78px; display: flex; align-items: center; justify-content: space-between; padding: 0 28px; border-bottom: 1px solid var(--line); background: rgba(255, 255, 255, .82); backdrop-filter: blur(10px); position: sticky; top: 0; z-index: 2; }
+    h1 { font-size: 22px; margin: 0; letter-spacing: 0; }
+    .header-meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .toolbar { display: flex; align-items: center; gap: 10px; }
+    .content { padding: 24px 28px 34px; }
+    .stats { display: grid; grid-template-columns: repeat(7, minmax(120px, 1fr)); gap: 14px; margin-bottom: 18px; }
+    .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; box-shadow: var(--shadow); }
+    .stat-label { color: var(--muted); font-size: 12px; }
+    .stat-value { font-size: 24px; font-weight: 750; margin-top: 4px; }
+    .grid { display: grid; grid-template-columns: minmax(280px, 380px) minmax(420px, 1fr); gap: 18px; align-items: start; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); min-width: 0; }
+    .panel + .panel { margin-top: 18px; }
+    .panel-head { padding: 14px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .panel-title { font-size: 15px; font-weight: 740; }
+    .panel-body { padding: 16px; }
+    .list { max-height: 560px; overflow: auto; }
+    .item { width: 100%; border-bottom: 1px solid var(--line); padding: 12px 14px; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; }
+    .item:last-child { border-bottom: 0; }
+    .item:hover { background: var(--panel-2); }
+    .item-main { min-width: 0; cursor: pointer; }
+    .item-title { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .item-sub { color: var(--muted); font-size: 12px; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .item-actions { display: flex; gap: 6px; align-items: center; }
+    .item-actions button { min-height: 30px; padding: 0 9px; font-size: 12px; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .form-grid .wide { grid-column: 1 / -1; }
+    .checkbox-row { display: flex; align-items: center; gap: 8px; height: 36px; }
+    .checkbox-row input { width: auto; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; align-items: center; }
+    .pill { display: inline-flex; align-items: center; min-height: 22px; padding: 0 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); color: var(--muted); background: #fff; white-space: nowrap; }
+    .pill.ok { color: var(--ok); border-color: #bbf7d0; background: #f0fdf4; }
+    .pill.err { color: var(--danger); border-color: #fecaca; background: #fff1f2; }
+    .pill.warn { color: var(--warn); border-color: #fed7aa; background: #fff7ed; }
+    .tabs { display: none; }
+    .tabs.active { display: block; }
+    .check-grid { display: grid; grid-template-columns: 160px 1fr 1fr 120px; gap: 12px; align-items: end; }
+    .result { margin-top: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); padding: 12px; min-height: 58px; color: var(--muted); white-space: pre-wrap; }
+    .toast { min-width: 220px; color: var(--muted); font-size: 13px; }
+    .empty { padding: 20px; color: var(--muted); }
+    .search-row { padding: 12px 14px; border-bottom: 1px solid var(--line); background: var(--panel-2); }
+    .table-wrap { overflow: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; font-weight: 650; background: var(--panel-2); }
+    td { font-size: 13px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .muted { color: var(--muted); }
+    .compact { font-size: 12px; color: var(--muted); }
+    .inline-check { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
+    .inline-check input { width: auto; }
+    .node-select { border: 1px solid var(--line); border-radius: 6px; background: #fff; padding: 8px 10px; min-height: 98px; max-height: 170px; overflow: auto; }
+    .node-select label { display: flex; gap: 8px; align-items: center; color: var(--text); font-size: 13px; padding: 3px 0; }
+    .node-select input { width: auto; }
+    @media (max-width: 980px) {
+      .app { grid-template-columns: 1fr; }
+      .sidebar { position: static; }
+      header { height: auto; padding: 18px; align-items: flex-start; gap: 14px; flex-direction: column; }
+      .content { padding: 18px; }
+      .stats, .grid, .check-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <h1>Glider Admin</h1>
-  <div class="row">
-    <input id="adminToken" type="password" placeholder="admin token">
-    <button onclick="saveToken()">Set Token</button>
-    <span id="authStatus"></span>
-  </div>
-  <button onclick="reloadConfig()">Reload</button>
-  <span id="reloadStatus"></span>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">G</div>
+        <div>
+          <div class="brand-title">Glider</div>
+          <div class="brand-sub">Control Plane</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button id="tabBtnOverview" class="active" onclick="showTab('overview')">Overview</button>
+        <button id="tabBtnUsers" onclick="showTab('users')">Users</button>
+        <button id="tabBtnRules" onclick="showTab('rules')">Rules</button>
+        <button id="tabBtnChecks" onclick="showTab('checks')">Connectivity</button>
+        <button id="tabBtnNodes" onclick="showTab('nodes')">Nodes</button>
+        <button id="tabBtnCerts" onclick="showTab('certs')">Domains</button>
+      </nav>
+      <div class="side-card">
+        <label for="adminToken">Admin token</label>
+        <input id="adminToken" type="password" autocomplete="current-password" placeholder="Bearer token">
+        <div class="side-actions">
+          <button onclick="saveToken()">Save</button>
+          <button onclick="clearToken()">Clear</button>
+        </div>
+      </div>
+    </aside>
 
-  <h2>Users</h2>
-  <div class="row">
-    <input id="userName" placeholder="username">
-    <input id="userPass" placeholder="password">
-    <label><input id="userEnabled" type="checkbox" checked> enabled</label>
-    <input id="userExpires" type="datetime-local" placeholder="expires at">
-    <select id="userRule"></select>
-    <button onclick="saveUser()">Save User</button>
-    <button onclick="deleteUser()">Delete User</button>
-  </div>
-  <div id="usersList" class="list"></div>
+    <main class="main">
+      <header>
+        <div>
+          <h1 id="pageTitle">Overview</h1>
+          <div class="header-meta" id="pageSubtitle">Centralized users, routing rules, nodes, and live checks.</div>
+        </div>
+        <div class="toolbar">
+          <span id="authStatus" class="toast"></span>
+          <button onclick="refreshAll()">Refresh</button>
+          <button class="primary" onclick="reloadConfig()">Reload</button>
+          <span id="reloadStatus" class="pill">idle</span>
+        </div>
+      </header>
 
-  <h2>Rules</h2>
-  <div class="row">
-    <input id="ruleName" placeholder="rule name (no .rule)">
-    <textarea id="ruleContent" placeholder="rule content"></textarea>
-    <button onclick="saveRule()">Save Rule</button>
-    <button onclick="deleteRule()">Delete Rule</button>
+      <div class="content">
+        <section id="tabOverview" class="tabs active">
+          <div class="stats">
+            <div class="stat"><div class="stat-label">Users</div><div class="stat-value" id="statUsers">0</div></div>
+            <div class="stat"><div class="stat-label">Active users</div><div class="stat-value" id="statActiveUsers">0</div></div>
+            <div class="stat"><div class="stat-label">Rules</div><div class="stat-value" id="statRules">0</div></div>
+            <div class="stat"><div class="stat-label">Healthy rules</div><div class="stat-value" id="statHealthyRules">-</div></div>
+            <div class="stat"><div class="stat-label">Nodes online</div><div class="stat-value" id="statNodesOnline">0</div></div>
+            <div class="stat"><div class="stat-label">Config version</div><div class="stat-value mono" id="statConfigVersion">-</div></div>
+            <div class="stat"><div class="stat-label">Nodes synced</div><div class="stat-value" id="statNodesSynced">-</div></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><div class="panel-title">Quick IP Info Check</div><span class="pill">ipinfo.io</span></div>
+            <div class="panel-body">
+              <div class="check-grid">
+                <div><label>Route type</label><select id="quickCheckType"><option value="default">Default route</option><option value="rule">Rule route</option><option value="user">User route</option></select></div>
+                <div><label>Name</label><input id="quickCheckName" placeholder="rule or username"></div>
+                <div><label>Target URL</label><input id="quickCheckTarget" value="https://ipinfo.io/json"></div>
+                <div><label>Timeout</label><input id="quickCheckTimeout" value="8s"></div>
+              </div>
+              <div class="actions"><button class="primary" onclick="runQuickCheck()">Run Check</button></div>
+              <div id="quickCheckResult" class="result">No check has run yet.</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tabUsers" class="tabs">
+          <div class="grid">
+            <div class="panel">
+              <div class="panel-head"><div class="panel-title">Users</div><span id="usersCount" class="pill">0</span></div>
+              <div class="search-row"><input id="userSearch" placeholder="Search users, rules, status" oninput="renderUsers()"></div>
+              <div id="usersList" class="list"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head"><div class="panel-title">User Editor</div><span id="selectedUserStatus" class="pill">new</span></div>
+              <div class="panel-body">
+                <div class="form-grid">
+                  <div><label>Username</label><input id="userName" placeholder="username"></div>
+                  <div><label>Password</label><input id="userPass" placeholder="password"></div>
+                  <div><label>Rule</label><select id="userRule"></select></div>
+                  <div><label>Expires at</label><input id="userExpires" type="datetime-local"></div>
+                  <div class="checkbox-row"><input id="userEnabled" type="checkbox" checked><label for="userEnabled">Enabled</label></div>
+                </div>
+                <div class="actions">
+                  <button class="primary" onclick="saveUser()">Save User</button>
+                  <button class="danger" onclick="deleteUser()">Delete User</button>
+                  <button onclick="checkSelectedUser()">Check IP Info</button>
+                </div>
+                <div id="userCheckResult" class="result">Select or save a user, then run a route check.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tabRules" class="tabs">
+          <div class="grid">
+            <div class="panel">
+              <div class="panel-head"><div class="panel-title">Rules</div><span id="rulesCount" class="pill">0</span></div>
+              <div class="search-row"><input id="ruleSearch" placeholder="Search rules or forward content" oninput="renderRules()"></div>
+              <div id="rulesList" class="list"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head"><div class="panel-title">Rule Editor</div><span id="selectedRuleStatus" class="pill">new</span></div>
+              <div class="panel-body">
+                <div class="form-grid">
+                  <div class="wide"><label>Rule name</label><input id="ruleName" placeholder="rule name without .rule"></div>
+                  <div class="wide"><label>Rule content</label><textarea id="ruleContent" placeholder="forward=direct://&#10;domain=example.com"></textarea></div>
+                </div>
+                <div class="actions">
+                  <button class="primary" onclick="saveRule()">Save Rule</button>
+                  <button class="danger" onclick="deleteRule()">Delete Rule</button>
+                  <button onclick="checkSelectedRule()">Check IP Info</button>
+                </div>
+                <div id="ruleCheckResult" class="result">Select or save a rule, then run a route check.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tabChecks" class="tabs">
+          <div class="panel">
+            <div class="panel-head"><div class="panel-title">Connectivity Lab</div><span class="pill">route exit IP</span></div>
+            <div class="panel-body">
+              <div class="check-grid">
+                <div><label>Type</label><select id="checkType"><option value="default">Default</option><option value="rule">Rule</option><option value="user">User</option></select></div>
+                <div><label>Name</label><input id="checkName" placeholder="rule name or username"></div>
+                <div><label>Target URL</label><input id="checkTarget" value="https://ipinfo.io/json"></div>
+                <div><label>Timeout</label><input id="checkTimeout" value="8s"></div>
+              </div>
+              <div class="actions"><button class="primary" onclick="runCheckFromForm()">Run Check</button></div>
+              <div id="checkResult" class="result">Checks run through the currently loaded local proxy runtime.</div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><div class="panel-title">Rules Health</div><span id="rulesHealthStatus" class="pill">idle</span></div>
+            <div class="panel-body">
+              <div class="check-grid">
+                <div><label>Target URL</label><input id="healthTarget" value="https://ipinfo.io/json"></div>
+                <div><label>Timeout</label><input id="healthTimeout" value="8s"></div>
+                <div><label>Interval seconds</label><input id="healthInterval" type="number" min="15" value="60"></div>
+                <div><label>&nbsp;</label><span class="inline-check"><input id="healthAuto" type="checkbox" onchange="toggleHealthAuto()"> auto</span></div>
+              </div>
+              <div class="actions"><button class="primary" onclick="runRulesHealth()">Check All Rules</button></div>
+              <div id="rulesHealthTable" class="table-wrap result">No health check has run yet.</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tabNodes" class="tabs">
+          <div class="panel">
+            <div class="panel-head"><div class="panel-title">Nodes</div><span id="nodesCount" class="pill">0</span></div>
+            <div class="panel-body">
+              <div id="nodesTable" class="table-wrap">No nodes have reported yet.</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tabCerts" class="tabs">
+          <div class="panel">
+            <div class="panel-head"><div class="panel-title">Cloudflare Settings</div><span id="cfTokenStatus" class="pill">not configured</span></div>
+            <div class="panel-body">
+              <div class="form-grid">
+                <div><label>API token</label><input id="cfAPIToken" type="password" autocomplete="new-password" placeholder="new API token or leave blank"></div>
+                <div><label>Account ID</label><input id="cfAccountID" placeholder="account token only"></div>
+                <div><label>ACME email</label><input id="cfACMEEmail" placeholder="admin@example.com"></div>
+                <div class="wide"><label>ACME directory</label><input id="cfACMEDirectory" placeholder="Let's Encrypt production"></div>
+                <div><label>Zone test domain</label><input id="cfVerifyDomain" placeholder="proxy.example.com"></div>
+                <div class="checkbox-row"><input id="cfDNSEditTest" type="checkbox"><label for="cfDNSEditTest">DNS edit test</label></div>
+              </div>
+              <div class="actions">
+                <button class="primary" onclick="saveCloudflareSettings()">Save Settings</button>
+                <button onclick="verifyCloudflareToken()">Verify Token</button>
+                <button class="danger" onclick="clearCloudflareToken()">Clear Token</button>
+              </div>
+              <div id="cfSettingsResult" class="result">Cloudflare token is required for DNS sync, failover, and ACME DNS-01.</div>
+            </div>
+          </div>
+          <div class="grid">
+            <div class="panel">
+              <div class="panel-head"><div class="panel-title">Domains</div><span id="domainsCount" class="pill">0</span></div>
+              <div class="search-row"><input id="domainSearch" placeholder="Search domains, nodes, DNS status" oninput="renderDomains()"></div>
+              <div id="domainsList" class="list"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head"><div class="panel-title">Domain Editor</div><span id="selectedDomainStatus" class="pill">new</span></div>
+              <div class="panel-body">
+                <div class="form-grid">
+                  <div><label>Domain</label><input id="domainName" placeholder="proxy.example.com"></div>
+                  <div><label>Active node</label><select id="domainActiveNode"></select></div>
+                  <div class="wide"><label>Assigned nodes</label><div id="domainNodeList" class="node-select"></div></div>
+                  <div><label>Cloudflare zone ID</label><input id="domainZoneID" placeholder="optional"></div>
+                  <div><label>Record name</label><input id="domainRecordName" placeholder="proxy.example.com"></div>
+                  <div><label>Record type</label><select id="domainRecordType"><option value="">Auto</option><option value="A">A</option><option value="AAAA">AAAA</option></select></div>
+                  <div><label>TTL</label><input id="domainTTL" type="number" min="1" value="1"></div>
+                  <div><label>Renew before days</label><input id="domainRenewBefore" type="number" min="1" value="30"></div>
+                  <div class="checkbox-row"><input id="domainEnabled" type="checkbox" checked><label for="domainEnabled">Enabled</label></div>
+                  <div class="checkbox-row"><input id="domainProxied" type="checkbox"><label for="domainProxied">Cloudflare proxied</label></div>
+	                  <div class="checkbox-row"><input id="domainFailover" type="checkbox"><label for="domainFailover">Heartbeat failover</label></div>
+	                  <div><label>ACME email</label><input id="domainACMEEmail" placeholder="admin@example.com"></div>
+	                  <div><label>ACME directory</label><input id="domainACMEDirectory" placeholder="Let's Encrypt production"></div>
+	                  <div class="wide"><label>Import fullchain PEM</label><textarea id="domainImportFullchain" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+	                  <div class="wide"><label>Import private key PEM</label><textarea id="domainImportKey" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
+	                </div>
+	                <div class="actions">
+	                  <button class="primary" onclick="saveDomain()">Save Domain</button>
+	                  <button onclick="previewDomainDNS()">Preview DNS</button>
+	                  <button onclick="syncDomainDNS()">Sync DNS</button>
+	                  <button onclick="previewDomainCert()">Preview Cert</button>
+	                  <button onclick="issueDomainCert()">Issue Cert</button>
+	                  <button onclick="importDomainCert()">Import Cert</button>
+	                  <button class="danger" onclick="deleteDomain()">Delete</button>
+	                </div>
+                <div id="domainResult" class="result">Select or save a domain. Cloudflare and ACME credentials stay on the admin server.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
   </div>
-  <div id="rulesList" class="list"></div>
 
 <script>
 let adminToken = localStorage.getItem('gliderAdminToken') || '';
+let usersCache = [];
+let rulesCache = [];
+let nodesCache = [];
+let domainsCache = [];
+let configStatus = {};
+let cloudflareSettings = null;
+let rulesHealthCache = null;
+let lastCheck = null;
+let healthTimer = null;
 
-function setStatus(message) {
-  const el = document.getElementById('authStatus');
-  if (el) el.textContent = message || '';
+const titles = {
+  overview: ['Overview', 'Centralized users, routing rules, nodes, and live checks.'],
+  users: ['Users', 'Manage dynamic credentials and user-bound routes.'],
+  rules: ['Rules', 'Edit forwarding rules stored in MongoDB.'],
+  checks: ['Connectivity', 'Probe route exit IPs and rule health.'],
+  nodes: ['Nodes', 'Heartbeat, config version, traffic, and node errors.'],
+  certs: ['Domains', 'Cloudflare DNS, node assignment, and certificate bundles.']
+};
+
+function $(id) { return document.getElementById(id); }
+
+function showTab(name) {
+  ['overview','users','rules','checks','nodes','certs'].forEach(tab => {
+    $('tab' + cap(tab)).classList.toggle('active', tab === name);
+    $('tabBtn' + cap(tab)).classList.toggle('active', tab === name);
+  });
+  $('pageTitle').textContent = titles[name][0];
+  $('pageSubtitle').textContent = titles[name][1];
+  if (name === 'nodes') {
+    loadConfigStatus();
+    loadNodes();
+  }
+  if (name === 'certs') {
+    loadCloudflareSettings();
+    loadDomains();
+  }
+}
+
+function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+function setStatus(message, tone) {
+  const el = $('authStatus');
+  el.textContent = message || '';
+  el.style.color = tone === 'err' ? 'var(--danger)' : 'var(--muted)';
 }
 
 function withAuthHeaders(headers) {
@@ -544,13 +2899,22 @@ function withAuthHeaders(headers) {
   return out;
 }
 
+async function fetchJSON(url, options) {
+  const opts = options || {};
+  opts.headers = withAuthHeaders(opts.headers);
+  const res = await fetch(url, opts);
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
 function isoToLocalInput(iso) {
   if (!iso) return '';
   const date = new Date(iso);
   if (isNaN(date.getTime())) return '';
   const tzOffset = date.getTimezoneOffset() * 60000;
-  const local = new Date(date.getTime() - tzOffset);
-  return local.toISOString().slice(0, 16);
+  return new Date(date.getTime() - tzOffset).toISOString().slice(0, 16);
 }
 
 function localInputToISO(value) {
@@ -572,132 +2936,936 @@ function userStatus(u) {
   return 'active';
 }
 
-async function fetchJSON(url, options) {
-  const opts = options || {};
-  opts.headers = withAuthHeaders(opts.headers);
-  const res = await fetch(url, opts);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || res.statusText);
-  return data;
+function statusPill(status) {
+  const cls = status === 'active' || status === 'ok' || status === 'online' || status === 'synced' ? 'ok' : status === 'disabled' || status === 'stale' || status === 'unknown' ? 'warn' : status === 'expired' || status === 'error' || status === 'offline' ? 'err' : '';
+  return '<span class="pill ' + cls + '">' + escapeHTML(status) + '</span>';
+}
+
+function escapeHTML(value) {
+  return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function escapeJS(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+}
+
+function saveToken() {
+  adminToken = $('adminToken').value.trim();
+  localStorage.setItem('gliderAdminToken', adminToken);
+  setStatus(adminToken ? 'Token saved' : 'Token cleared');
+  refreshAll();
+}
+
+function clearToken() {
+  adminToken = '';
+  $('adminToken').value = '';
+  localStorage.removeItem('gliderAdminToken');
+  setStatus('Token cleared');
+}
+
+async function refreshAll() {
+  await Promise.all([loadConfigStatus(), loadRules(), loadUsers(), loadNodes(), loadDomains(), loadCloudflareSettings(), loadLatestRulesHealth()]);
+  renderStats();
+}
+
+async function loadConfigStatus() {
+  try {
+    configStatus = await fetchJSON('/api/config/status');
+    renderStats();
+    setStatus('');
+  } catch (e) {
+    setStatus(e.message, 'err');
+  }
 }
 
 async function loadRules() {
   try {
-    const rules = await fetchJSON('/api/rules');
-    const list = document.getElementById('rulesList');
-    list.innerHTML = '';
-    const sel = document.getElementById('userRule');
-    sel.innerHTML = '<option value="">(default)</option>';
-    rules.forEach(r => {
-      const item = document.createElement('div');
-      item.className = 'item';
-      item.textContent = r.name;
-      item.onclick = () => selectRule(r.name);
-      list.appendChild(item);
-      const opt = document.createElement('option');
-      opt.value = r.name;
-      opt.textContent = r.name;
-      sel.appendChild(opt);
-    });
+    rulesCache = await fetchJSON('/api/rules');
+    renderRules();
     setStatus('');
   } catch (e) {
-    setStatus(e.message);
+    setStatus(e.message, 'err');
   }
 }
 
 async function loadUsers() {
   try {
-    const users = await fetchJSON('/api/users');
-    const list = document.getElementById('usersList');
-    list.innerHTML = '';
-    users.forEach(u => {
-      const item = document.createElement('div');
-      item.className = 'item';
-      item.textContent = u.username + ' -> ' + (u.rule || '(default)') + ' (' + userStatus(u) + ')';
-      item.onclick = () => selectUser(u);
-      list.appendChild(item);
-    });
+    usersCache = await fetchJSON('/api/users');
+    renderUsers();
     setStatus('');
   } catch (e) {
-    setStatus(e.message);
+    setStatus(e.message, 'err');
   }
+}
+
+async function loadNodes() {
+  try {
+    const data = await fetchJSON('/api/nodes');
+    nodesCache = data.nodes || [];
+    renderNodes(data.now);
+    setStatus('');
+  } catch (e) {
+    setStatus(e.message, 'err');
+  }
+}
+
+async function loadDomains() {
+  try {
+    const data = await fetchJSON('/api/domains');
+    domainsCache = data.domains || [];
+    renderDomains();
+    renderDomainNodeControls();
+    setStatus('');
+  } catch (e) {
+    setStatus(e.message, 'err');
+  }
+}
+
+async function loadCloudflareSettings() {
+  try {
+    cloudflareSettings = await fetchJSON('/api/settings/cloudflare');
+    renderCloudflareSettings();
+    setStatus('');
+  } catch (e) {
+    setStatus(e.message, 'err');
+  }
+}
+
+function renderCloudflareSettings() {
+  const s = cloudflareSettings || {};
+  if (!$('cfTokenStatus')) return;
+  $('cfTokenStatus').textContent = s.configured ? 'configured' : 'not configured';
+  $('cfTokenStatus').className = 'pill ' + (s.configured ? 'ok' : 'warn');
+  $('cfAccountID').value = s.account_id || '';
+  $('cfACMEEmail').value = s.acme_email || '';
+  $('cfACMEDirectory').value = s.acme_directory_url || '';
+  $('cfAPIToken').value = '';
+  const lines = [
+    'token: ' + (s.configured ? escapeHTML(s.masked_token || 'configured') : 'not configured'),
+    'source: ' + escapeHTML(s.source || '-'),
+    'token owner: ' + (s.account_id ? 'account token' : 'user token'),
+    'account id: ' + escapeHTML(s.account_id || '-'),
+    'acme email: ' + escapeHTML(s.acme_email || '-'),
+    'acme directory: ' + escapeHTML(s.acme_directory_url || "Let's Encrypt production"),
+    'updated: ' + escapeHTML(formatDate(s.updated_at))
+  ];
+  $('cfSettingsResult').innerHTML = lines.join('\n');
+}
+
+function renderStats() {
+  const active = usersCache.filter(u => userStatus(u) === 'active').length;
+  const online = nodesCache.filter(n => nodeStatus(n) === 'online').length;
+  const healthy = rulesHealthCache ? rulesHealthCache.results.filter(r => r.status === 'ok').length + '/' + rulesHealthCache.results.length : '-';
+  const centralVersion = configStatus.config_version || '';
+  const synced = centralVersion ? nodesCache.filter(n => n.config_version === centralVersion).length + '/' + nodesCache.length : '-';
+  $('statUsers').textContent = usersCache.length;
+  $('statActiveUsers').textContent = active;
+  $('statRules').textContent = rulesCache.length;
+  $('statHealthyRules').textContent = healthy;
+  $('statNodesOnline').textContent = online;
+  $('statConfigVersion').textContent = shortHash(centralVersion);
+  $('statNodesSynced').textContent = synced;
+  $('usersCount').textContent = visibleUsers().length + '/' + usersCache.length;
+  $('rulesCount').textContent = visibleRules().length + '/' + rulesCache.length;
+  $('nodesCount').textContent = nodesCache.length;
+  if ($('domainsCount')) $('domainsCount').textContent = visibleDomains().length + '/' + domainsCache.length;
+}
+
+function visibleRules() {
+  const q = (($('ruleSearch') && $('ruleSearch').value) || '').toLowerCase().trim();
+  if (!q) return rulesCache;
+  return rulesCache.filter(r => [r.name, r.content].join(' ').toLowerCase().includes(q));
+}
+
+function visibleUsers() {
+  const q = (($('userSearch') && $('userSearch').value) || '').toLowerCase().trim();
+  if (!q) return usersCache;
+  return usersCache.filter(u => [u.username, u.rule, userStatus(u)].join(' ').toLowerCase().includes(q));
+}
+
+function visibleDomains() {
+  const q = (($('domainSearch') && $('domainSearch').value) || '').toLowerCase().trim();
+  if (!q) return domainsCache;
+  return domainsCache.filter(d => [d.domain, d.active_node_id, (d.node_ids || []).join(' '), domainStatus(d), dnsStatus(d), certStatus(d), certRenewStatus(d), domainCertSyncStatus(d), domainFailoverStatus(d)].join(' ').toLowerCase().includes(q));
+}
+
+function renderRules() {
+  const list = $('rulesList');
+  const sel = $('userRule');
+  const visible = visibleRules();
+  list.innerHTML = '';
+  sel.innerHTML = '<option value="">(default)</option>';
+  if (!visible.length) list.innerHTML = '<div class="empty">No matching rules.</div>';
+  visible.forEach(r => {
+    const item = document.createElement('div');
+    item.className = 'item';
+    item.innerHTML = '<div class="item-main"><div class="item-title">' + escapeHTML(r.name) + '</div><div class="item-sub">updated ' + formatDate(r.updated_at) + '</div></div><div class="item-actions"><button>IP Info</button></div>';
+    item.querySelector('.item-main').onclick = () => selectRule(r.name);
+    item.querySelector('button').onclick = () => runCheck({ type: 'rule', name: r.name, target: ipInfoTarget(), timeout: $('checkTimeout').value || '8s', resultId: 'ruleCheckResult', probe: 'ipinfo' });
+    list.appendChild(item);
+  });
+  rulesCache.forEach(r => {
+    const opt = document.createElement('option');
+    opt.value = r.name;
+    opt.textContent = r.name;
+    sel.appendChild(opt);
+  });
+  renderStats();
+}
+
+function renderUsers() {
+  const list = $('usersList');
+  const visible = visibleUsers();
+  list.innerHTML = '';
+  if (!visible.length) list.innerHTML = '<div class="empty">No matching users.</div>';
+  visible.forEach(u => {
+    const status = userStatus(u);
+    const item = document.createElement('div');
+    item.className = 'item';
+    item.innerHTML = '<div class="item-main"><div class="item-title">' + escapeHTML(u.username) + '</div><div class="item-sub">' + escapeHTML(u.rule || '(default)') + ' · ' + escapeHTML(status) + '</div></div><div class="item-actions">' + statusPill(status) + '<button>IP Info</button></div>';
+    item.querySelector('.item-main').onclick = () => selectUser(u);
+    item.querySelector('button').onclick = () => runCheck({ type: 'user', name: u.username, target: ipInfoTarget(), timeout: $('checkTimeout').value || '8s', resultId: 'userCheckResult', probe: 'ipinfo' });
+    list.appendChild(item);
+  });
+  renderStats();
+}
+
+function renderNodes(nowValue) {
+  const wrap = $('nodesTable');
+  if (!nodesCache.length) {
+    wrap.innerHTML = '<div class="empty">No nodes have reported yet.</div>';
+    renderStats();
+    return;
+  }
+  wrap.innerHTML = '<table><thead><tr><th>Node</th><th>Status</th><th>Public IP</th><th>Token</th><th>Versions</th><th>Traffic</th><th>Top Users</th><th>Top Rules</th><th>Top Dialers</th><th>Uptime</th><th>Last heartbeat</th><th>Error</th><th>Actions</th></tr></thead><tbody>' + nodesCache.map(n => {
+    const status = nodeStatus(n);
+    const configSync = configSyncStatus(n);
+    return '<tr>' +
+      '<td><strong>' + escapeHTML(n.node_id) + '</strong><div class="compact">' + escapeHTML(n.hostname || '-') + '</div></td>' +
+      '<td>' + statusPill(status) + '</td>' +
+      '<td class="mono">' + escapeHTML(n.public_ip || '-') + '</td>' +
+      '<td>' + statusPill(n.has_token ? 'dedicated' : 'shared') + '<div class="compact">last auth ' + escapeHTML(n.auth_mode || '-') + '</div>' + (n.token_set_at ? '<div class="compact">' + escapeHTML(formatDate(n.token_set_at)) + '</div>' : '') + '</td>' +
+      '<td class="mono">config ' + escapeHTML(shortHash(n.config_version)) + ' ' + statusPill(configSync) + '<div class="compact mono">central ' + escapeHTML(shortHash(configStatus.config_version)) + '</div><div class="compact mono">cert ' + escapeHTML(shortHash(n.cert_version)) + '</div></td>' +
+      '<td>' + escapeHTML(formatBytes((n.rx_bytes || 0) + (n.tx_bytes || 0))) + '<div class="compact">rx ' + escapeHTML(formatBytes(n.rx_bytes || 0)) + ' / tx ' + escapeHTML(formatBytes(n.tx_bytes || 0)) + '</div></td>' +
+      '<td>' + trafficSummary((n.traffic || {}).users) + '</td>' +
+      '<td>' + trafficSummary((n.traffic || {}).rules) + '</td>' +
+      '<td>' + trafficSummary((n.traffic || {}).dialers) + '</td>' +
+      '<td>' + escapeHTML(formatDuration(n.uptime || 0)) + '</td>' +
+      '<td>' + escapeHTML(formatDate(n.updated_at)) + '</td>' +
+      '<td>' + escapeHTML(n.error || '-') + (n.cert_error ? '<div class="compact">cert ' + escapeHTML(n.cert_error) + '</div>' : '') + '</td>' +
+      '<td><button onclick="setNodeToken(\\'' + escapeJS(n.node_id) + '\\')">Set Token</button><button onclick="clearNodeToken(\\'' + escapeJS(n.node_id) + '\\')">Clear Token</button><button class="danger" onclick="deleteNode(\\'' + escapeJS(n.node_id) + '\\')">Delete</button></td>' +
+      '</tr>';
+  }).join('') + '</tbody></table>';
+  renderStats();
+}
+
+function configSyncStatus(n) {
+  const central = configStatus.config_version || '';
+  if (!central || !n.config_version) return 'unknown';
+  return n.config_version === central ? 'synced' : 'stale';
+}
+
+function trafficSummary(items) {
+  items = (items || []).slice().sort((a, b) => ((b.rx_bytes || 0) + (b.tx_bytes || 0)) - ((a.rx_bytes || 0) + (a.tx_bytes || 0))).slice(0, 3);
+  if (!items.length) return '<span class="compact">-</span>';
+  return items.map(i => '<div class="compact"><span class="mono">' + escapeHTML(i.name || '-') + '</span> ' + escapeHTML(formatBytes((i.rx_bytes || 0) + (i.tx_bytes || 0))) + '</div>').join('');
+}
+
+async function deleteNode(nodeID) {
+  if (!nodeID) return;
+  if (!confirm('Delete node ' + nodeID + '? It will reappear on the next heartbeat if still running.')) return;
+  await fetchJSON('/api/nodes/' + encodeURIComponent(nodeID), { method: 'DELETE' });
+  await loadNodes();
+  renderDomainNodeControls();
+}
+
+async function setNodeToken(nodeID) {
+  if (!nodeID) return;
+  const token = prompt('New token for node ' + nodeID + ' (at least 16 characters)');
+  if (token === null) return;
+  const trimmed = token.trim();
+  if (!trimmed) return;
+  await fetchJSON('/api/nodes/' + encodeURIComponent(nodeID) + '/token', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ token: trimmed }) });
+  await loadNodes();
+}
+
+async function clearNodeToken(nodeID) {
+  if (!nodeID) return;
+  if (!confirm('Clear dedicated token for node ' + nodeID + '? It will fall back to the shared node token.')) return;
+  await fetchJSON('/api/nodes/' + encodeURIComponent(nodeID) + '/token', { method: 'DELETE' });
+  await loadNodes();
+}
+
+function renderDomains() {
+  const list = $('domainsList');
+  if (!list) return;
+  const visible = visibleDomains();
+  list.innerHTML = '';
+  if (!visible.length) list.innerHTML = '<div class="empty">No matching domains.</div>';
+  visible.forEach(d => {
+    const item = document.createElement('div');
+    item.className = 'item';
+    item.innerHTML = '<div class="item-main"><div class="item-title">' + escapeHTML(d.domain) + '</div><div class="item-sub">' + escapeHTML(d.active_node_id || '-') + ' · ' + escapeHTML(dnsStatus(d)) + ' · ' + escapeHTML(certStatus(d)) + ' · ' + escapeHTML(certRenewStatus(d)) + ' · ' + escapeHTML(domainCertSyncStatus(d)) + ' · ' + escapeHTML(domainFailoverStatus(d)) + '</div></div><div class="item-actions">' + statusPill(domainStatus(d)) + '<button>DNS</button></div>';
+    item.querySelector('.item-main').onclick = () => selectDomain(d.domain);
+    item.querySelector('button').onclick = () => {
+      selectDomainIntoForm(d);
+      syncDomainDNS();
+    };
+    list.appendChild(item);
+  });
+  renderStats();
+}
+
+function renderDomainNodeControls() {
+  const active = $('domainActiveNode');
+  const list = $('domainNodeList');
+  if (!active || !list) return;
+  const selectedActive = active.value;
+  const selectedNodes = selectedDomainNodes();
+  active.innerHTML = '<option value="">Select node</option>';
+  list.innerHTML = '';
+  nodesCache.forEach(n => {
+    const opt = document.createElement('option');
+    opt.value = n.node_id;
+    opt.textContent = n.node_id + (n.public_ip ? ' · ' + n.public_ip : '');
+    active.appendChild(opt);
+
+    const label = document.createElement('label');
+    label.innerHTML = '<input type="checkbox" value="' + escapeHTML(n.node_id) + '"> <span>' + escapeHTML(n.node_id) + ' <span class="compact">' + escapeHTML(n.public_ip || '') + '</span></span>';
+    const input = label.querySelector('input');
+    input.checked = selectedNodes.includes(n.node_id);
+    list.appendChild(label);
+  });
+  if (selectedActive) active.value = selectedActive;
+}
+
+function selectedDomainNodes() {
+  const list = $('domainNodeList');
+  if (!list) return [];
+  return Array.from(list.querySelectorAll('input[type=checkbox]:checked')).map(i => i.value);
+}
+
+function domainStatus(d) {
+  if (d.runtime && d.runtime.status) return d.runtime.status;
+  if (!d.enabled) return 'disabled';
+  if (d.certificate && d.certificate.last_error) return 'error';
+  if (d.cloudflare && d.cloudflare.last_error) return 'error';
+  return 'active';
+}
+
+function dnsStatus(d) {
+  if (d.runtime && d.runtime.dns_status) return d.runtime.dns_status;
+  const cf = d.cloudflare || {};
+  if (cf.last_error) return 'dns error';
+  if (cf.last_synced_at) return 'dns synced';
+  return 'dns pending';
+}
+
+function certStatus(d) {
+  if (d.runtime && d.runtime.cert_status) return d.runtime.cert_status;
+  const cert = d.certificate || {};
+  if (cert.last_error) return 'cert error';
+  if (!cert.version) return 'cert missing';
+  if (cert.expires_at) {
+    const exp = new Date(cert.expires_at).getTime();
+    if (!isNaN(exp) && exp <= Date.now()) return 'cert expired';
+  }
+  return 'cert issued';
+}
+
+function certRenewStatus(d) {
+  if (d.runtime && d.runtime.cert_renew_status) {
+    if (d.runtime.cert_renew_status === 'valid' && d.runtime.cert_renew_in_days > 0) return 'renew in ' + d.runtime.cert_renew_in_days + 'd';
+    if (d.runtime.cert_renew_status === 'due') return 'renew due';
+    if (d.runtime.cert_renew_status === 'expired') return 'renew expired';
+    if (d.runtime.cert_renew_status === 'missing') return 'renew due';
+    if (d.runtime.cert_renew_status === 'error') return 'renew blocked';
+    return 'renew ' + d.runtime.cert_renew_status;
+  }
+  const cert = d.certificate || {};
+  if (cert.last_error) return 'renew blocked';
+  if (!cert.version || !cert.expires_at) return 'renew due';
+  const exp = new Date(cert.expires_at).getTime();
+  if (isNaN(exp)) return 'renew unknown';
+  const now = Date.now();
+  if (exp <= now) return 'renew expired';
+  const renewBeforeDays = Number(d.renew_before_days || 30);
+  const renewAt = exp - renewBeforeDays * 24 * 60 * 60 * 1000;
+  if (renewAt <= now) return 'renew due';
+  return 'renew in ' + Math.ceil((renewAt - now) / (24 * 60 * 60 * 1000)) + 'd';
+}
+
+function certDaysRemaining(d) {
+  if (d.runtime && typeof d.runtime.cert_days_remaining === 'number') return String(d.runtime.cert_days_remaining);
+  const cert = (d && d.certificate) || {};
+  if (!cert.expires_at) return '-';
+  const exp = new Date(cert.expires_at).getTime();
+  if (isNaN(exp)) return '-';
+  const days = Math.ceil((exp - Date.now()) / (24 * 60 * 60 * 1000));
+  return String(Math.max(0, days));
+}
+
+function domainCertSyncStatus(d) {
+  if (d.runtime && d.runtime.cert_sync_status) return d.runtime.cert_sync_status;
+  const nodes = d.node_ids || [];
+  if (!nodes.length) return 'cert nodes none';
+  const cert = d.certificate || {};
+  if (!cert.version) return 'cert not issued';
+  const synced = nodes.filter(nodeID => nodeHasDomainCert(findNode(nodeID), d.domain, cert.version)).length;
+  return 'cert synced ' + synced + '/' + nodes.length;
+}
+
+function domainFailoverStatus(d) {
+  if (d.runtime && d.runtime.failover_status) return d.runtime.failover_status;
+  if (!d.enabled || !d.failover_enabled) return 'failover disabled';
+  const nodes = d.node_ids || [];
+  if (nodes.length < 2) return 'failover needs nodes';
+  return 'failover unknown';
+}
+
+function nodeHasDomainCert(node, domain, version) {
+  if (!node || !domain || !version) return false;
+  const target = String(domain).toLowerCase().replace(/\.$/, '');
+  const targetVersion = String(version);
+  return (node.cert_domains || []).some(cert => {
+    const certDomain = String(cert.domain || '').toLowerCase().replace(/\.$/, '');
+    return certDomain === target && cert.version === targetVersion;
+  });
+}
+
+async function selectDomain(domain) {
+  const d = await fetchJSON('/api/domains/' + encodeURIComponent(domain));
+  selectDomainIntoForm(d);
+  showTab('certs');
+}
+
+function selectDomainIntoForm(d) {
+  d = d || {};
+  const cf = d.cloudflare || {};
+  $('domainName').value = d.domain || '';
+  $('domainEnabled').checked = d.enabled !== false;
+  $('domainFailover').checked = !!d.failover_enabled;
+  $('domainActiveNode').value = d.active_node_id || '';
+  $('domainZoneID').value = cf.zone_id || '';
+  $('domainRecordName').value = cf.record_name || d.domain || '';
+  $('domainRecordType').value = cf.record_type || '';
+  $('domainTTL').value = cf.ttl || 1;
+  $('domainProxied').checked = !!cf.proxied;
+  $('domainRenewBefore').value = d.renew_before_days || 30;
+  $('domainImportFullchain').value = '';
+  $('domainImportKey').value = '';
+  renderDomainNodeControls();
+  const assigned = d.node_ids || [];
+  Array.from($('domainNodeList').querySelectorAll('input[type=checkbox]')).forEach(input => {
+    input.checked = assigned.includes(input.value);
+  });
+  $('selectedDomainStatus').textContent = domainStatus(d);
+  renderDomainResult(d);
+}
+
+function renderDomainResult(d) {
+  const cf = (d && d.cloudflare) || {};
+  const cert = (d && d.certificate) || {};
+  const lines = [
+    'domain: ' + escapeHTML((d && d.domain) || '-'),
+    'assigned nodes: ' + escapeHTML(((d && d.node_ids) || []).join(', ') || '-'),
+    'active node: ' + escapeHTML((d && d.active_node_id) || '-'),
+    'dns: ' + escapeHTML(cf.record_type || '-') + ' ' + escapeHTML(cf.record_name || '-') + ' -> ' + escapeHTML((findNode((d && d.active_node_id) || '') || {}).public_ip || '-'),
+    'cloudflare zone: ' + escapeHTML(cf.zone_name || cf.zone_id || '-'),
+    'cloudflare record: ' + escapeHTML(cf.record_id || '-'),
+    'dns synced: ' + escapeHTML(formatDate(cf.last_synced_at)),
+    'cert version: ' + escapeHTML(shortHash(cert.version)),
+    'cert expires: ' + escapeHTML(formatDate(cert.expires_at)),
+    'cert days remaining: ' + escapeHTML(certDaysRemaining(d)),
+    'cert renewal: ' + escapeHTML(certRenewStatus(d)),
+    'renew before days: ' + escapeHTML((d && d.renew_before_days) || 30),
+    'node cert sync: ' + escapeHTML(domainCertSyncStatus(d)),
+    'failover: ' + escapeHTML(domainFailoverStatus(d)),
+    'failover ready nodes: ' + escapeHTML(((d && d.runtime) || {}).failover_ready_nodes || 0)
+  ];
+  if (d && d.runtime && d.runtime.failover_blocked_reason) lines.push('failover blocked: ' + escapeHTML(d.runtime.failover_blocked_reason));
+  if (cf.last_error) lines.push('dns error: ' + escapeHTML(cf.last_error));
+  if (cert.last_error) lines.push('cert error: ' + escapeHTML(cert.last_error));
+  $('domainResult').innerHTML = lines.join('\n');
+}
+
+function findNode(nodeID) {
+  return nodesCache.find(n => n.node_id === nodeID);
+}
+
+async function saveDomain() {
+  const domain = $('domainName').value.trim();
+  const nodeIDs = selectedDomainNodes();
+  const activeNode = $('domainActiveNode').value || nodeIDs[0] || '';
+  const payload = {
+    domain,
+    enabled: $('domainEnabled').checked,
+    node_ids: nodeIDs,
+    active_node_id: activeNode,
+    failover_enabled: $('domainFailover').checked,
+    renew_before_days: Number($('domainRenewBefore').value || 30),
+    dns_provider: 'cloudflare',
+    cloudflare: {
+      zone_id: $('domainZoneID').value.trim(),
+      record_name: $('domainRecordName').value.trim() || domain,
+      record_type: $('domainRecordType').value,
+      ttl: Number($('domainTTL').value || 1),
+      proxied: $('domainProxied').checked
+    }
+  };
+  await fetchJSON('/api/domains', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  $('selectedDomainStatus').textContent = 'saved';
+  await loadDomains();
+}
+
+function renderDNSPlan(plan, prefix) {
+  plan = plan || {};
+  const lines = [
+    (prefix || 'DNS plan'),
+    'action: ' + escapeHTML(plan.action || '-'),
+    'domain: ' + escapeHTML(plan.domain || '-'),
+    'node: ' + escapeHTML(plan.node_id || '-') + ' (' + escapeHTML(plan.node_public_ip || '-') + ')',
+    'zone: ' + escapeHTML(plan.zone_name || '-') + ' (' + escapeHTML(plan.zone_id || '-') + ')',
+    'record: ' + escapeHTML(plan.record_type || '-') + ' ' + escapeHTML(plan.record_name || '-'),
+    'target: ' + escapeHTML(plan.target_content || '-'),
+    'ttl: ' + escapeHTML(plan.ttl || '-'),
+    'proxied: ' + (plan.proxied ? 'yes' : 'no')
+  ];
+  if (plan.existing_id || plan.existing_content) {
+    lines.push('existing record: ' + escapeHTML(plan.existing_id || '-') + ' -> ' + escapeHTML(plan.existing_content || '-'));
+    lines.push('existing ttl/proxied: ' + escapeHTML(plan.existing_ttl || '-') + ' / ' + (plan.existing_proxied ? 'yes' : 'no'));
+  }
+  return lines.join('\n');
+}
+
+function renderCertPlan(plan, prefix) {
+  plan = plan || {};
+  const lines = [
+    (prefix || 'Certificate plan'),
+    'action: ' + escapeHTML(plan.action || '-'),
+    'domain: ' + escapeHTML(plan.domain || '-'),
+    'zone: ' + escapeHTML(plan.zone_name || '-') + ' (' + escapeHTML(plan.zone_id || '-') + ')',
+    'challenge: ' + escapeHTML(plan.challenge_record || '-'),
+    'acme email: ' + escapeHTML(plan.email || '-'),
+    'acme directory: ' + escapeHTML(plan.directory_url || '-'),
+    'current cert: ' + escapeHTML(shortHash(plan.current_version || '')),
+    'expires: ' + escapeHTML(formatDate(plan.expires_at)),
+    'days remaining: ' + escapeHTML(plan.days_remaining || 0),
+    'renew: ' + escapeHTML(plan.renew_status || '-') + ' / in ' + escapeHTML(plan.renew_in_days || 0) + 'd',
+    'renew before days: ' + escapeHTML(plan.renew_before_days || 30),
+    'assigned nodes: ' + escapeHTML((plan.node_ids || []).join(', ') || '-')
+  ];
+  return lines.join('\n');
+}
+
+async function previewDomainDNS() {
+  const domain = $('domainName').value.trim();
+  if (!domain) return;
+  await saveDomain();
+  $('domainResult').textContent = 'Building Cloudflare DNS plan...';
+  const data = await fetchJSON('/api/domains/' + encodeURIComponent(domain) + '/dns-plan', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ node_id: $('domainActiveNode').value })
+  });
+  $('domainResult').innerHTML = renderDNSPlan(data.plan, 'DNS preview');
+}
+
+async function previewDomainCert() {
+  const domain = $('domainName').value.trim();
+  if (!domain) return;
+  await saveDomain();
+  $('domainResult').textContent = 'Building certificate plan...';
+  const data = await fetchJSON('/api/domains/' + encodeURIComponent(domain) + '/cert-plan', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ email: $('domainACMEEmail').value.trim(), directory_url: $('domainACMEDirectory').value.trim() })
+  });
+  $('domainResult').innerHTML = renderCertPlan(data.plan, 'Certificate preview');
+}
+
+async function saveCloudflareSettings() {
+  const payload = {
+    account_id: $('cfAccountID').value.trim(),
+    acme_email: $('cfACMEEmail').value.trim(),
+    acme_directory_url: $('cfACMEDirectory').value.trim()
+  };
+  const token = $('cfAPIToken').value.trim();
+  if (token) payload.api_token = token;
+  $('cfSettingsResult').textContent = 'Saving Cloudflare settings...';
+  cloudflareSettings = await fetchJSON('/api/settings/cloudflare', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  renderCloudflareSettings();
+}
+
+async function verifyCloudflareToken() {
+  $('cfSettingsResult').textContent = 'Verifying Cloudflare token...';
+  try {
+    const payload = {
+      domain: ($('cfVerifyDomain') && $('cfVerifyDomain').value.trim()) || '',
+      dns_edit_test: !!(($('cfDNSEditTest') && $('cfDNSEditTest').checked))
+    };
+    const data = await fetchJSON('/api/settings/cloudflare/verify', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const lines = [
+      'verify: ok',
+      'scope: ' + escapeHTML(data.scope || '-'),
+      'status: ' + escapeHTML(data.status || '-'),
+      'token id: ' + escapeHTML(data.id || '-'),
+      'not before: ' + escapeHTML(formatDate(data.not_before)),
+      'expires: ' + escapeHTML(formatDate(data.expires_on))
+    ];
+    if (data.zone) {
+      lines.push('zone: ' + escapeHTML(data.zone.zone_name || '-') + ' (' + escapeHTML(data.zone.zone_id || '-') + ')');
+      lines.push('zone read: ' + (data.zone.zone_read_ok ? 'ok' : '-'));
+      lines.push('dns edit: ' + (data.zone.dns_edit_ok ? 'ok' : (payload.dns_edit_test ? 'failed' : 'not tested')));
+      if (data.zone.test_record) lines.push('test record: ' + escapeHTML(data.zone.test_record));
+    }
+    $('cfSettingsResult').innerHTML = lines.join('\n');
+  } catch (e) {
+    $('cfSettingsResult').innerHTML = '<span class="pill err">verify failed</span> ' + escapeHTML(e.message);
+  }
+}
+
+async function clearCloudflareToken() {
+  $('cfSettingsResult').textContent = 'Clearing Cloudflare token...';
+  cloudflareSettings = await fetchJSON('/api/settings/cloudflare', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      clear_token: true,
+      account_id: $('cfAccountID').value.trim(),
+      acme_email: $('cfACMEEmail').value.trim(),
+      acme_directory_url: $('cfACMEDirectory').value.trim()
+    })
+  });
+  renderCloudflareSettings();
+}
+
+async function deleteDomain() {
+  const domain = $('domainName').value.trim();
+  if (!domain) return;
+  await fetchJSON('/api/domains/' + encodeURIComponent(domain), { method: 'DELETE' });
+  clearDomainForm();
+  await loadDomains();
+}
+
+function clearDomainForm() {
+  ['domainName','domainZoneID','domainRecordName','domainACMEEmail','domainACMEDirectory','domainImportFullchain','domainImportKey'].forEach(id => { $(id).value = ''; });
+  $('domainRecordType').value = '';
+  $('domainTTL').value = 1;
+  $('domainRenewBefore').value = 30;
+  $('domainEnabled').checked = true;
+  $('domainProxied').checked = false;
+  $('domainFailover').checked = false;
+  $('domainActiveNode').value = '';
+  Array.from($('domainNodeList').querySelectorAll('input[type=checkbox]')).forEach(i => { i.checked = false; });
+  $('selectedDomainStatus').textContent = 'new';
+  $('domainResult').textContent = 'Select or save a domain. Cloudflare and ACME credentials stay on the admin server.';
+}
+
+async function syncDomainDNS() {
+  const domain = $('domainName').value.trim();
+  if (!domain) return;
+  await saveDomain();
+  $('domainResult').textContent = 'Syncing Cloudflare DNS...';
+  const data = await fetchJSON('/api/domains/' + encodeURIComponent(domain) + '/sync-dns', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ node_id: $('domainActiveNode').value })
+  });
+  $('domainResult').innerHTML = renderDNSPlan(data.plan, 'DNS synced') + '\nactive node: ' + escapeHTML(data.active_node || '-');
+  await loadDomains();
+}
+
+async function issueDomainCert() {
+  const domain = $('domainName').value.trim();
+  if (!domain) return;
+  await saveDomain();
+  $('domainResult').textContent = 'Issuing certificate with ACME DNS-01...';
+  const data = await fetchJSON('/api/domains/' + encodeURIComponent(domain) + '/issue-cert', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ email: $('domainACMEEmail').value.trim(), directory_url: $('domainACMEDirectory').value.trim() })
+  });
+  const issued = 'Certificate issued\nversion: ' + escapeHTML(shortHash(data.cert_version)) + '\nexpires: ' + escapeHTML(formatDate(data.expires_at));
+  $('domainResult').innerHTML = data.plan ? renderCertPlan(data.plan, issued) : issued;
+  await loadDomains();
+}
+
+async function importDomainCert() {
+  const domain = $('domainName').value.trim();
+  if (!domain) return;
+  const fullchain = $('domainImportFullchain').value.trim();
+  const key = $('domainImportKey').value.trim();
+  if (!fullchain || !key) {
+    $('domainResult').textContent = 'Fullchain PEM and private key PEM are required.';
+    return;
+  }
+  await saveDomain();
+  $('domainResult').textContent = 'Importing certificate...';
+  const data = await fetchJSON('/api/domains/' + encodeURIComponent(domain) + '/import-cert', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ fullchain_pem: fullchain, private_key_pem: key })
+  });
+  $('domainImportFullchain').value = '';
+  $('domainImportKey').value = '';
+  $('domainResult').innerHTML = 'Certificate imported\nversion: ' + escapeHTML(shortHash(data.cert_version)) + '\nexpires: ' + escapeHTML(formatDate(data.expires_at));
+  await loadDomains();
+}
+
+function nodeStatus(n) {
+  if (n.error) return 'error';
+  const updated = new Date(n.updated_at || 0).getTime();
+  if (!updated || isNaN(updated)) return 'offline';
+  const age = Date.now() - updated;
+  if (age <= 90 * 1000) return 'online';
+  if (age <= 5 * 60 * 1000) return 'stale';
+  return 'offline';
+}
+
+function formatDate(iso) {
+  if (!iso) return 'unknown';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return 'unknown';
+  return d.toLocaleString();
+}
+
+function formatDuration(seconds) {
+  seconds = Number(seconds || 0);
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (d) return d + 'd ' + h + 'h';
+  if (h) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
+
+function formatBytes(bytes) {
+  bytes = Number(bytes || 0);
+  const units = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  while (bytes >= 1024 && i < units.length - 1) { bytes /= 1024; i++; }
+  return (i === 0 ? bytes.toFixed(0) : bytes.toFixed(1)) + ' ' + units[i];
+}
+
+function shortHash(value) {
+  if (!value) return '-';
+  return value.length > 12 ? value.slice(0, 12) : value;
 }
 
 async function selectRule(name) {
   const rule = await fetchJSON('/api/rules/' + encodeURIComponent(name));
-  document.getElementById('ruleName').value = rule.name;
-  document.getElementById('ruleContent').value = rule.content || '';
+  $('ruleName').value = rule.name;
+  $('ruleContent').value = rule.content || '';
+  $('selectedRuleStatus').textContent = 'selected';
+  showTab('rules');
 }
 
 function selectUser(u) {
-  document.getElementById('userName').value = u.username;
-  document.getElementById('userPass').value = u.password || '';
-  document.getElementById('userRule').value = u.rule || '';
-  document.getElementById('userEnabled').checked = u.enabled !== false;
-  document.getElementById('userExpires').value = isoToLocalInput(u.expires_at);
-}
-
-function saveToken() {
-  adminToken = document.getElementById('adminToken').value.trim();
-  localStorage.setItem('gliderAdminToken', adminToken);
-  setStatus(adminToken ? 'token set' : 'token cleared');
+  $('userName').value = u.username;
+  $('userPass').value = u.password || '';
+  $('userRule').value = u.rule || '';
+  $('userEnabled').checked = u.enabled !== false;
+  $('userExpires').value = isoToLocalInput(u.expires_at);
+  $('selectedUserStatus').textContent = userStatus(u);
+  showTab('users');
 }
 
 async function saveRule() {
-  const name = document.getElementById('ruleName').value.trim();
-  const content = document.getElementById('ruleContent').value;
+  const name = $('ruleName').value.trim();
+  const content = $('ruleContent').value;
   await fetchJSON('/api/rules', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ name, content }) });
+  $('selectedRuleStatus').textContent = 'saved';
   await loadRules();
 }
 
 async function deleteRule() {
-  const name = document.getElementById('ruleName').value.trim();
+  const name = $('ruleName').value.trim();
   if (!name) return;
   await fetchJSON('/api/rules/' + encodeURIComponent(name), { method: 'DELETE' });
-  document.getElementById('ruleName').value = '';
-  document.getElementById('ruleContent').value = '';
+  $('ruleName').value = '';
+  $('ruleContent').value = '';
+  $('selectedRuleStatus').textContent = 'new';
   await loadRules();
 }
 
 async function saveUser() {
-  const username = document.getElementById('userName').value.trim();
-  const password = document.getElementById('userPass').value;
-  const rule = document.getElementById('userRule').value;
-  const enabled = document.getElementById('userEnabled').checked;
-  const expiresRaw = document.getElementById('userExpires').value;
-  const expiresAt = localInputToISO(expiresRaw);
+  const username = $('userName').value.trim();
+  const password = $('userPass').value;
+  const rule = $('userRule').value;
+  const enabled = $('userEnabled').checked;
+  const expiresAt = localInputToISO($('userExpires').value);
   const payload = { username, password, rule, enabled };
   if (expiresAt) payload.expires_at = expiresAt;
   await fetchJSON('/api/users', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  $('selectedUserStatus').textContent = 'saved';
   await loadUsers();
 }
 
 async function deleteUser() {
-  const username = document.getElementById('userName').value.trim();
+  const username = $('userName').value.trim();
   if (!username) return;
   await fetchJSON('/api/users/' + encodeURIComponent(username), { method: 'DELETE' });
-  document.getElementById('userName').value = '';
-  document.getElementById('userPass').value = '';
-  document.getElementById('userRule').value = '';
-  document.getElementById('userEnabled').checked = true;
-  document.getElementById('userExpires').value = '';
+  $('userName').value = '';
+  $('userPass').value = '';
+  $('userRule').value = '';
+  $('userEnabled').checked = true;
+  $('userExpires').value = '';
+  $('selectedUserStatus').textContent = 'new';
   await loadUsers();
 }
 
 async function reloadConfig() {
-  const el = document.getElementById('reloadStatus');
-  el.textContent = '...';
+  const el = $('reloadStatus');
+  el.textContent = 'running';
+  el.className = 'pill warn';
   try {
     await fetchJSON('/api/reload', { method: 'POST' });
     el.textContent = 'ok';
+    el.className = 'pill ok';
   } catch (e) {
-    el.textContent = 'error: ' + e.message;
+    el.textContent = 'error';
+    el.className = 'pill err';
+    setStatus(e.message, 'err');
   }
 }
 
-loadRules();
-loadUsers();
-document.getElementById('adminToken').value = adminToken;
+function ipInfoTarget() {
+  return $('checkTarget').value.trim() || $('quickCheckTarget').value.trim() || 'https://ipinfo.io/json';
+}
+
+function checkSelectedUser() {
+  const name = $('userName').value.trim();
+  runCheck({ type: 'user', name, target: ipInfoTarget(), timeout: $('checkTimeout').value || '8s', resultId: 'userCheckResult', probe: 'ipinfo' });
+}
+
+function checkSelectedRule() {
+  const name = $('ruleName').value.trim();
+  runCheck({ type: 'rule', name, target: ipInfoTarget(), timeout: $('checkTimeout').value || '8s', resultId: 'ruleCheckResult', probe: 'ipinfo' });
+}
+
+function runQuickCheck() {
+  runCheck({ type: $('quickCheckType').value, name: $('quickCheckName').value.trim(), target: $('quickCheckTarget').value.trim(), timeout: $('quickCheckTimeout').value.trim(), resultId: 'quickCheckResult', probe: 'ipinfo' });
+}
+
+function runCheckFromForm() {
+  runCheck({ type: $('checkType').value, name: $('checkName').value.trim(), target: $('checkTarget').value.trim(), timeout: $('checkTimeout').value.trim(), resultId: 'checkResult', probe: 'ipinfo' });
+}
+
+async function runCheck(opts) {
+  const el = $(opts.resultId || 'checkResult');
+  el.textContent = 'Checking...';
+  try {
+    const payload = { type: opts.type || 'default', name: opts.name || '', target: opts.target || ipInfoTarget(), network: 'tcp', timeout: opts.timeout || '8s', probe: opts.probe || 'ipinfo' };
+    const data = await fetchJSON('/api/check', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    lastCheck = data;
+    renderStats();
+    el.innerHTML = renderCheckResult(data);
+  } catch (e) {
+    lastCheck = { status: 'error' };
+    renderStats();
+    el.innerHTML = '<span class="pill err">error</span> ' + escapeHTML(e.message);
+  }
+}
+
+function renderCheckResult(data) {
+  const cls = data.status === 'ok' ? 'ok' : 'err';
+  const info = data.ip_info || {};
+  const lines = [
+    '<span class="pill ' + cls + '">' + escapeHTML(data.status) + '</span>',
+    'route: ' + escapeHTML(data.type || 'default') + (data.name ? ' / ' + escapeHTML(data.name) : ''),
+    'url: ' + escapeHTML(data.url || data.target),
+    'dialer: ' + escapeHTML(data.dialer || '-'),
+    'duration: ' + escapeHTML(data.duration_ms) + ' ms'
+  ];
+  if (data.http_status) lines.push('http: ' + escapeHTML(data.http_status));
+  if (info.ip) lines.push('ip: ' + escapeHTML(info.ip));
+  if (info.org) lines.push('org: ' + escapeHTML(info.org));
+  if (info.city || info.region || info.country) lines.push('location: ' + escapeHTML([info.city, info.region, info.country].filter(Boolean).join(', ')));
+  if (info.timezone) lines.push('timezone: ' + escapeHTML(info.timezone));
+  if (data.error) lines.push('error: ' + escapeHTML(data.error));
+  return lines.join('\n');
+}
+
+async function runRulesHealth() {
+  const el = $('rulesHealthStatus');
+  el.textContent = 'running';
+  el.className = 'pill warn';
+  $('rulesHealthTable').textContent = 'Checking all rules...';
+  try {
+    const payload = { target: $('healthTarget').value.trim() || 'https://ipinfo.io/json', timeout: $('healthTimeout').value.trim() || '8s' };
+    rulesHealthCache = await fetchJSON('/api/rules/health', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    renderRulesHealth();
+    el.textContent = 'ok';
+    el.className = 'pill ok';
+  } catch (e) {
+    el.textContent = 'error';
+    el.className = 'pill err';
+    $('rulesHealthTable').innerHTML = '<span class="pill err">error</span> ' + escapeHTML(e.message);
+  }
+  renderStats();
+}
+
+async function loadLatestRulesHealth() {
+  try {
+    rulesHealthCache = await fetchJSON('/api/rules/health?latest=1');
+    renderRulesHealth();
+    if (rulesHealthCache && rulesHealthCache.checked_at) {
+      $('rulesHealthStatus').textContent = 'latest';
+      $('rulesHealthStatus').className = 'pill ok';
+    }
+  } catch (e) {
+    $('rulesHealthStatus').textContent = 'unavailable';
+    $('rulesHealthStatus').className = 'pill warn';
+  }
+  renderStats();
+}
+
+function renderRulesHealth() {
+  const wrap = $('rulesHealthTable');
+  const results = (rulesHealthCache && rulesHealthCache.results) || [];
+  if (!results.length) {
+    const checked = rulesHealthCache && rulesHealthCache.checked_at;
+    wrap.innerHTML = '<div class="empty">' + (checked ? 'No rule health results.' : 'No saved rule health check yet.') + '</div>';
+    return;
+  }
+  wrap.innerHTML = '<table><thead><tr><th>Rule</th><th>Status</th><th>Exit IP</th><th>Org</th><th>Location</th><th>Dialer</th><th>Latency</th><th>Error</th></tr></thead><tbody>' + results.map(r => {
+    const info = r.ip_info || {};
+    return '<tr>' +
+      '<td><strong>' + escapeHTML(r.name || '-') + '</strong></td>' +
+      '<td>' + statusPill(r.status || 'unknown') + '</td>' +
+      '<td class="mono">' + escapeHTML(info.ip || '-') + '</td>' +
+      '<td>' + escapeHTML(info.org || '-') + '</td>' +
+      '<td>' + escapeHTML([info.city, info.region, info.country].filter(Boolean).join(', ') || '-') + '</td>' +
+      '<td class="mono">' + escapeHTML(r.dialer || '-') + '</td>' +
+      '<td>' + escapeHTML(r.duration_ms || 0) + ' ms</td>' +
+      '<td>' + escapeHTML(r.error || '-') + '</td>' +
+      '</tr>';
+  }).join('') + '</tbody></table><div class="compact">checked ' + escapeHTML(formatDate(rulesHealthCache.checked_at)) + ' target ' + escapeHTML(rulesHealthCache.target || '-') + '</div>';
+}
+
+function toggleHealthAuto() {
+  if (healthTimer) {
+    clearInterval(healthTimer);
+    healthTimer = null;
+  }
+  if ($('healthAuto').checked) {
+    const seconds = Math.max(15, Number($('healthInterval').value || 60));
+    healthTimer = setInterval(runRulesHealth, seconds * 1000);
+    runRulesHealth();
+  }
+}
+
+$('adminToken').value = adminToken;
+refreshAll();
 </script>
 </body>
 </html>`

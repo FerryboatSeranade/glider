@@ -1,0 +1,19 @@
+services:
+  glider-node:
+    image: ghcr.io/ferryboatseranade/glider:${GLIDER_VERSION:-latest}
+    container_name: glider
+    user: "0:0"
+    ports:
+      - "443:443"
+      - "8443:8443"
+    env_file:
+      - .env
+    volumes:
+      - ./glider.conf:/etc/glider.conf:ro
+      - ./rules.d:/etc/rules.d
+      - ./cache:/etc/glider-cache
+      - ./certs:/etc/glider-certs
+      # Optional: keep an external cert mount if you still use NPM-managed certs.
+      # - /root/data/docker_data/nginx-proxy-manager/letsencrypt:/cert:ro
+    command: -config /etc/glider.conf
+    restart: unless-stopped

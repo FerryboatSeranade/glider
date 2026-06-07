@@ -1,0 +1,13 @@
+services:
+  glider-admin:
+    image: ghcr.io/ferryboatseranade/glider:${GLIDER_VERSION:-latest}
+    container_name: glider-admin
+    user: "0:0"
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - ./glider.conf:/etc/glider.conf
+      - ./rules.d:/etc/rules.d
+    command: -config /etc/glider.conf
+    restart: unless-stopped

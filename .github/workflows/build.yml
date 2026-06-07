@@ -9,9 +9,11 @@ on:
 
 env:
   APP_NAME: glider
-  DOCKERHUB_REPO: nadoo/glider
-  GHCR_REPO: ghcr.io/nadoo/glider
   PLATFORMS: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/riscv64
+
+permissions:
+  contents: write
+  packages: write
 
 jobs:
   build:
@@ -26,6 +28,7 @@ jobs:
       - name: Set Vars
         run: |
           echo "SHA_SHORT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "GHCR_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${APP_NAME}" >> $GITHUB_ENV
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -68,13 +71,8 @@ jobs:
         id: buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Docker - Login to DockerHub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Docker - Login to GHCR
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -85,19 +83,20 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ${{ env.DOCKERHUB_REPO }}
-            ${{ env.GHCR_REPO }}
+          images: ${{ env.GHCR_IMAGE }}
           tags: |
             type=ref,event=branch
+            type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
 
       - name: Docker - Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: .Dockerfile
+          file: Dockerfile
           platforms: ${{ env.PLATFORMS }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

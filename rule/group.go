@@ -103,8 +103,16 @@ func newFwdrGroup(name string, fwdrs []*Forwarder, c *Strategy) *FwdrGroup {
 
 // Dial connects to the address addr on the network net.
 func (p *FwdrGroup) Dial(network, addr string) (net.Conn, proxy.Dialer, error) {
+	return p.DialWithUser("", network, addr)
+}
+
+// DialWithUser connects to the address addr on the network net with a user label.
+func (p *FwdrGroup) DialWithUser(user, network, addr string) (net.Conn, proxy.Dialer, error) {
 	nd := p.NextDialer(addr)
 	c, err := nd.Dial(network, addr)
+	if err == nil {
+		c = newMeteredConn(c, user, p.name, nd.Addr())
+	}
 	return c, nd, err
 }
 
