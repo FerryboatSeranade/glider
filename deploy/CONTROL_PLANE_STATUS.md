@@ -10,29 +10,29 @@ This file tracks the current central-admin plus node deployment state used durin
 - Node deploy directory: `/root/data/docker_data/glider`
 - Runtime image tag under validation: `ghcr.io/ferryboatseranade/glider:v2026.06.08-control56`
 
-The tag above was loaded onto the current hosts with `docker save | ssh docker load` because the local GHCR token did not have `write:packages`. Both remote compose files use `pull_policy: never` until the tag is pushed to GHCR.
+The tag above is now published to GHCR and both remote compose files pull it from the registry. The earlier `docker save | ssh docker load` bootstrap path has been retired for the current hosts, and `pull_policy: never` was removed from both remote compose files.
 
-As of 2026-06-08, `docker manifest inspect ghcr.io/ferryboatseranade/glider:v2026.06.08-control55` returned `manifest unknown`, so the manually loaded control-plane tags were not available from GHCR yet. The local Docker context is `orbstack`, but Docker daemon probes timed out during validation, so a local `docker push` could not be retried in this session.
+The tag was published by GitHub Actions run `27106664483`, which completed successfully on 2026-06-08. Remote `docker manifest inspect ghcr.io/ferryboatseranade/glider:v2026.06.08-control56` shows a multi-architecture OCI index.
 
-## Required Registry Finalization
+## Registry Publishing
 
 The GitHub Actions build workflow is configured to publish `ghcr.io/<owner>/glider` on branch/tag pushes with `packages: write`. It includes `type=ref,event=tag`, so a Git tag such as `v2026.06.08-control56` publishes the same GHCR image tag instead of only semver-stripped or `sha-*` aliases.
 
-For a one-off local push, log in with a GitHub token that has package write permission:
+For a one-off local push, log in with a GitHub token that has package write permission, then push the tag:
 
 ```bash
 docker login ghcr.io
 docker push ghcr.io/ferryboatseranade/glider:v2026.06.08-control56
 ```
 
-After a GHCR push succeeds, remove `pull_policy: never` from remote compose files if you want hosts to pull future images from the registry instead of relying on manually loaded images.
+The current hosts already pull `v2026.06.08-control56` from GHCR. Keep `pull_policy: never` out of normal compose files so future image refreshes use the registry.
 
 ## Verified Checks
 
 - `ovh-xboard` runs `glider-admin` on `:8444` with image `v2026.06.08-control56`.
 - `zgo` runs node mode with image `v2026.06.08-control56` and publishes proxy ports `443` and `8443`; it still does not publish Admin `8444`.
-- The amd64 `/usr/local/bin/glider` binary SHA256 is `d377fe7c6bcc6426899d13d3aee8bda0215c9222ae69f8b18aff6e38e8f00c0f` on both remote containers.
-- On 2026-06-08, both remote containers were rechecked and reported image `ghcr.io/ferryboatseranade/glider:v2026.06.08-control56`, running state, and the expected binary SHA above. `zgo` listened only on `443` and `8443`, and `8444` was not exposed.
+- The amd64 `/usr/local/bin/glider` binary SHA256 from the GHCR image is `66223918dc645c40d30aa15db51439f57df01bc459178fbfdac2a8585de9591e` on both remote containers.
+- On 2026-06-08, both remote containers were rechecked after `docker compose pull` and reported image `ghcr.io/ferryboatseranade/glider:v2026.06.08-control56`, running state, and the expected binary SHA above. `zgo` listened only on `443` and `8443`, and `8444` was not exposed.
 - Admin exposes `/api/config/status` and shows central config version plus node synced/stale state in the Overview and Nodes views.
 - `zgo` was verified synced to central config version `d4aa2e1bd01a91de...`.
 - Node API now supports optional dedicated per-node tokens. Admin stores only SHA-256 token hashes; nodes without dedicated tokens continue to use the shared `GLIDER_NODE_TOKEN` for compatibility. Heartbeats record `auth_mode` so the Nodes view can show whether the last successful heartbeat used shared or dedicated auth. Dedicated-token switching was verified with `zgo` by setting a temporary dedicated token, confirming heartbeat/config sync, clearing it, and returning the node to the shared token. On `control24`, `zgo` reports `auth_mode=shared`.
