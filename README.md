@@ -486,7 +486,7 @@ Recommended node deployment shape:
 
 Keep source code in GitHub and publish versioned images such as `ghcr.io/ferryboatseranade/glider:<version>`. VPS nodes should use fixed image tags instead of `build: ../glider`.
 
-The GitHub Actions build workflow publishes `ghcr.io/<owner>/glider` with branch, tag, semver, and `sha-*` tags. When you create a tag such as `v2026.06.08-control56`, the workflow also publishes the same GHCR tag, so compose files can pin that exact version.
+The GitHub Actions build workflow publishes `ghcr.io/<owner>/glider` on `master`, `main`, `dev`, and tag pushes with branch, tag, semver, and `sha-*` tags. When you create a tag such as `v2026.06.08-control56`, the workflow also publishes the same GHCR tag, so compose files can pin that exact version.
 
 Central `.env`:
 

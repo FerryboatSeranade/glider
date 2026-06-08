@@ -16,7 +16,7 @@ The tag was published by GitHub Actions run `27106664483`, which completed succe
 
 ## Registry Publishing
 
-The GitHub Actions build workflow is configured to publish `ghcr.io/<owner>/glider` on branch/tag pushes with `packages: write`. It includes `type=ref,event=tag`, so a Git tag such as `v2026.06.08-control56` publishes the same GHCR image tag instead of only semver-stripped or `sha-*` aliases.
+The GitHub Actions build workflow is configured to publish `ghcr.io/<owner>/glider` on `master`, `main`, `dev`, and tag pushes with `packages: write`. It includes `type=ref,event=tag`, so a Git tag such as `v2026.06.08-control56` publishes the same GHCR image tag instead of only semver-stripped or `sha-*` aliases.
 
 For a one-off local push, log in with a GitHub token that has package write permission, then push the tag:
 
