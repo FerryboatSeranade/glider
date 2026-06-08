@@ -40,6 +40,9 @@ jobs:
       - name: Test
         run: go test -v ./...
 
+      - name: Test Deploy Scripts
+        run: python3 -m unittest discover -s deploy/scripts -p '*_test.py' -v
+
       - name: Build
         uses: goreleaser/goreleaser-action@v6
         if: "!startsWith(github.ref, 'refs/tags/')"
