@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Validate a Glider domain/node/Cloudflare onboarding path.
 
-The default mode is read-mostly: it verifies Admin auth, node heartbeat,
-Cloudflare settings/token, saves the domain assignment, and runs DNS/cert
-preview APIs. Use --sync-dns or --issue-cert for write operations.
+The default mode is mostly read-only: it verifies Admin auth, node heartbeat,
+Cloudflare settings/token, and runs DNS/cert preview APIs. Use
+--save-domain, --sync-dns, or --issue-cert for write operations. Use
+--save-cloudflare-settings only when you intentionally want to store the
+provided Cloudflare token in Admin.
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -57,6 +61,11 @@ def main() -> int:
     parser.add_argument("--admin-token", required=True, help="GLIDER_ADMIN_TOKEN")
     parser.add_argument("--domain", required=True, help="Domain to onboard, for example proxy.example.com")
     parser.add_argument("--node-id", required=True, help="Target node id, for example zgo")
+    parser.add_argument("--cloudflare-token", default=os.getenv("GLIDER_CLOUDFLARE_API_TOKEN", ""), help="Cloudflare API token, or set GLIDER_CLOUDFLARE_API_TOKEN")
+    parser.add_argument("--prompt-cloudflare-token", action="store_true", help="Prompt for a Cloudflare token without echo")
+    parser.add_argument("--cloudflare-account-id", default=os.getenv("GLIDER_CLOUDFLARE_ACCOUNT_ID", ""), help="Account ID for account-owned Cloudflare tokens")
+    parser.add_argument("--save-cloudflare-settings", action="store_true", help="Store the provided Cloudflare token/settings in Admin before checks")
+    parser.add_argument("--dns-edit-test", action="store_true", help="Verify Cloudflare DNS:Edit by creating and deleting a temporary TXT record")
     parser.add_argument("--acme-email", default="", help="Override ACME email for cert preview/issue")
     parser.add_argument("--acme-directory", default="", help="Override ACME directory URL")
     parser.add_argument("--record-type", default="", choices=["", "A", "AAAA"], help="DNS record type; empty means Auto")
@@ -64,9 +73,16 @@ def main() -> int:
     parser.add_argument("--proxied", action="store_true", help="Set Cloudflare proxied=true")
     parser.add_argument("--failover", action="store_true", help="Enable domain failover")
     parser.add_argument("--renew-before-days", type=int, default=30)
+    parser.add_argument("--save-domain", action="store_true", help="Save or update the domain/node assignment in Admin")
     parser.add_argument("--sync-dns", action="store_true", help="Actually update Cloudflare DNS")
     parser.add_argument("--issue-cert", action="store_true", help="Actually issue/renew the ACME certificate")
     args = parser.parse_args()
+
+    if args.prompt_cloudflare_token and not args.cloudflare_token:
+        args.cloudflare_token = getpass.getpass("Cloudflare API token: ").strip()
+
+    if (args.sync_dns or args.issue_cert) and not args.save_domain:
+        args.save_domain = True
 
     cfg = require_ok("admin config status", *request(args.admin_url, args.admin_token, "GET", "/api/config/status"))
     print(f"  config_version={short(cfg.get('config_version'))} users={cfg.get('users_count')} rules={cfg.get('rules_count')}")
@@ -79,16 +95,29 @@ def main() -> int:
         return 1
     print(f"  node={args.node_id} public_ip={node.get('public_ip') or '-'} config={short(node.get('config_version'))} cert={short(node.get('cert_version'))}")
 
+    if args.save_cloudflare_settings:
+        if not args.cloudflare_token:
+            print("[error] --save-cloudflare-settings requires --cloudflare-token, --prompt-cloudflare-token, or GLIDER_CLOUDFLARE_API_TOKEN", file=sys.stderr)
+            return 1
+        settings_payload = {
+            "api_token": args.cloudflare_token,
+            "account_id": args.cloudflare_account_id,
+            "acme_email": args.acme_email,
+            "acme_directory_url": args.acme_directory,
+        }
+        cf_saved = require_ok("save cloudflare settings", *request(args.admin_url, args.admin_token, "POST", "/api/settings/cloudflare", settings_payload))
+        print(f"  cloudflare_saved=masked account_id={'yes' if cf_saved.get('account_id') else 'no'}")
+
     cf = require_ok("cloudflare settings", *request(args.admin_url, args.admin_token, "GET", "/api/settings/cloudflare"))
     if not cf.get("configured"):
-        print("[error] Cloudflare settings are not configured in Admin", file=sys.stderr)
+        print("[error] Cloudflare settings are not configured in Admin. Use the Admin UI or rerun with --save-cloudflare-settings.", file=sys.stderr)
         return 1
     print(f"  cloudflare_source={cf.get('source') or '-'} account_id={'yes' if cf.get('account_id') else 'no'}")
 
-    verify_payload = {"domain": args.domain, "dns_edit_test": False}
+    verify_payload = {"domain": args.domain, "dns_edit_test": args.dns_edit_test}
     verify = require_ok("cloudflare token zone check", *request(args.admin_url, args.admin_token, "POST", "/api/settings/cloudflare/verify", verify_payload))
     zone = verify.get("zone") or {}
-    print(f"  scope={verify.get('scope') or '-'} zone={zone.get('zone_name') or '-'} zone_read={zone.get('zone_read_ok')}")
+    print(f"  scope={verify.get('scope') or '-'} zone={zone.get('zone_name') or '-'} zone_read={zone.get('zone_read_ok')} dns_edit={zone.get('dns_edit_ok') if args.dns_edit_test else 'not tested'}")
 
     domain_payload = {
         "domain": args.domain,
@@ -105,9 +134,19 @@ def main() -> int:
             "proxied": args.proxied,
         },
     }
-    require_ok("save domain assignment", *request(args.admin_url, args.admin_token, "POST", "/api/domains", domain_payload))
+    if args.save_domain:
+        require_ok("save domain assignment", *request(args.admin_url, args.admin_token, "POST", "/api/domains", domain_payload))
+    else:
+        print("[skip] save domain assignment; pass --save-domain, --sync-dns, or --issue-cert to write it")
 
     encoded = urllib.parse.quote(args.domain, safe="")
+    if not args.save_domain:
+        status, body = request(args.admin_url, args.admin_token, "GET", f"/api/domains/{encoded}")
+        if status == 404:
+            print(f"[error] domain {args.domain!r} is not saved in Admin; rerun with --save-domain", file=sys.stderr)
+            return 1
+        require_ok("domain exists", status, body)
+
     dns_plan = require_ok("dns preview", *request(args.admin_url, args.admin_token, "POST", f"/api/domains/{encoded}/dns-plan", {"node_id": args.node_id}))
     plan = dns_plan.get("plan") or {}
     print(f"  dns_action={plan.get('action') or '-'} {plan.get('record_type') or '-'} {plan.get('record_name') or '-'} -> {plan.get('target') or '-'}")
