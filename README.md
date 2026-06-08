@@ -670,7 +670,7 @@ python3 deploy/scripts/domain_onboarding_check.py \
   --acme-email admin@example.com
 ```
 
-- To save Cloudflare settings from the CLI instead of the Admin UI, pass `--save-cloudflare-settings` with either `--prompt-cloudflare-token`, `--cloudflare-token`, or `GLIDER_CLOUDFLARE_API_TOKEN`. The script does not print the token. For account-owned Cloudflare tokens, also pass `--cloudflare-account-id <account-id>`. Add `--dns-edit-test` when you want the script to prove `DNS:Edit` by creating and deleting a temporary TXT record.
+- To save Cloudflare settings from the CLI instead of the Admin UI, pass `--save-cloudflare-settings` with either `--prompt-cloudflare-token`, `--cloudflare-token`, or `GLIDER_CLOUDFLARE_API_TOKEN`. The script does not print the token. For account-owned Cloudflare tokens, also pass `--cloudflare-account-id <account-id>`. Existing account ID, ACME email, and ACME directory values are preserved unless you pass a replacement value or one of the explicit clear flags. Add `--dns-edit-test` when you want the script to prove `DNS:Edit` by creating and deleting a temporary TXT record.
 - Add `--save-domain` to create or update the domain/node assignment before previewing DNS and certificate plans.
 - Add `--issue-cert` to request or renew the Let's Encrypt certificate with ACME DNS-01. Add `--sync-dns` after the certificate is issued and the node heartbeat reports the matching domain certificate version. DNS sync refuses to point a TLS domain at a node that is stale, unassigned, missing a public IP, or missing the current certificate version.
 

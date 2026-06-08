@@ -55,6 +55,14 @@ def short(value: str | None) -> str:
     return value[:12] if len(value) > 12 else value or "-"
 
 
+def setting_value(current: dict, key: str, value: str, clear: bool) -> str:
+    if clear:
+        return ""
+    if value:
+        return value
+    return current.get(key) or ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--admin-url", required=True, help="Central Admin URL, for example http://1.2.3.4:8444")
@@ -65,9 +73,12 @@ def main() -> int:
     parser.add_argument("--prompt-cloudflare-token", action="store_true", help="Prompt for a Cloudflare token without echo")
     parser.add_argument("--cloudflare-account-id", default=os.getenv("GLIDER_CLOUDFLARE_ACCOUNT_ID", ""), help="Account ID for account-owned Cloudflare tokens")
     parser.add_argument("--save-cloudflare-settings", action="store_true", help="Store the provided Cloudflare token/settings in Admin before checks")
+    parser.add_argument("--clear-cloudflare-account-id", action="store_true", help="Clear the stored Cloudflare account ID")
     parser.add_argument("--dns-edit-test", action="store_true", help="Verify Cloudflare DNS:Edit by creating and deleting a temporary TXT record")
     parser.add_argument("--acme-email", default="", help="Override ACME email for cert preview/issue")
     parser.add_argument("--acme-directory", default="", help="Override ACME directory URL")
+    parser.add_argument("--clear-acme-email", action="store_true", help="Clear the stored ACME email")
+    parser.add_argument("--clear-acme-directory", action="store_true", help="Clear the stored ACME directory URL")
     parser.add_argument("--record-type", default="", choices=["", "A", "AAAA"], help="DNS record type; empty means Auto")
     parser.add_argument("--ttl", type=int, default=1, help="Cloudflare TTL, 1 means automatic")
     parser.add_argument("--proxied", action="store_true", help="Set Cloudflare proxied=true")
@@ -95,20 +106,21 @@ def main() -> int:
         return 1
     print(f"  node={args.node_id} public_ip={node.get('public_ip') or '-'} config={short(node.get('config_version'))} cert={short(node.get('cert_version'))}")
 
+    cf = require_ok("cloudflare settings", *request(args.admin_url, args.admin_token, "GET", "/api/settings/cloudflare"))
+
     if args.save_cloudflare_settings:
         if not args.cloudflare_token:
             print("[error] --save-cloudflare-settings requires --cloudflare-token, --prompt-cloudflare-token, or GLIDER_CLOUDFLARE_API_TOKEN", file=sys.stderr)
             return 1
         settings_payload = {
             "api_token": args.cloudflare_token,
-            "account_id": args.cloudflare_account_id,
-            "acme_email": args.acme_email,
-            "acme_directory_url": args.acme_directory,
+            "account_id": setting_value(cf, "account_id", args.cloudflare_account_id, args.clear_cloudflare_account_id),
+            "acme_email": setting_value(cf, "acme_email", args.acme_email, args.clear_acme_email),
+            "acme_directory_url": setting_value(cf, "acme_directory_url", args.acme_directory, args.clear_acme_directory),
         }
         cf_saved = require_ok("save cloudflare settings", *request(args.admin_url, args.admin_token, "POST", "/api/settings/cloudflare", settings_payload))
         print(f"  cloudflare_saved=masked account_id={'yes' if cf_saved.get('account_id') else 'no'}")
-
-    cf = require_ok("cloudflare settings", *request(args.admin_url, args.admin_token, "GET", "/api/settings/cloudflare"))
+        cf = cf_saved
     if not cf.get("configured"):
         print("[error] Cloudflare settings are not configured in Admin. Use the Admin UI or rerun with --save-cloudflare-settings.", file=sys.stderr)
         return 1
