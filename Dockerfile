@@ -1,14 +1,18 @@
 # Build Stage
 FROM golang:1.24-alpine AS build-env
-ADD . /src
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
 RUN apk --no-cache add git \
-    && cd /src && go build -v -ldflags "-s -w"
+    && go build -v -ldflags "-s -w"
 
 # Final Stage
 FROM alpine
-COPY --from=build-env /src/glider /app/
-WORKDIR /app
 RUN apk -U upgrade --no-cache \
-    && apk --no-cache add ca-certificates
+    && apk --no-cache add ca-certificates tzdata \
+    && mkdir -p /etc/rules.d /etc/glider-cache /etc/glider-certs \
+    && chown -R 1000:1000 /etc/rules.d /etc/glider-cache /etc/glider-certs
+COPY --from=build-env /src/glider /usr/local/bin/glider
 USER 1000
-ENTRYPOINT ["./glider"]
+ENTRYPOINT ["glider"]

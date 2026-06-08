@@ -1,0 +1,4 @@
+mode=node
+listen=tls://:443?certDir=/etc/glider-certs,http://
+listen=:8443
+rules-dir=/etc/rules.d

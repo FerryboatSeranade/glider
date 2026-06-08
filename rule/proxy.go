@@ -79,7 +79,7 @@ func (p *Proxy) Dial(network, addr string) (net.Conn, proxy.Dialer, error) {
 
 // DialWithUser dials to target addr with a user hint and returns a conn.
 func (p *Proxy) DialWithUser(user, network, addr string) (net.Conn, proxy.Dialer, error) {
-	return p.findDialerWithUser(user, addr).Dial(network, addr)
+	return p.findDialerWithUser(user, addr).DialWithUser(user, network, addr)
 }
 
 // DialUDP connects to the given address via the proxy.

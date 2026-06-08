@@ -24,9 +24,9 @@
 /dev/
 dev*.go
 
-*_test.go
-
 dist
+__pycache__/
+*.pyc
 
 *.zip
 /*.conf

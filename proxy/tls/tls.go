@@ -8,7 +8,10 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/nadoo/glider/pkg/log"
 	"github.com/nadoo/glider/proxy"
@@ -25,12 +28,24 @@ type TLS struct {
 	serverName string
 	skipVerify bool
 
-	certFile string
-	keyFile  string
+	certFile   string
+	keyFile    string
+	certDir    string
+	certMu     sync.Mutex
+	cert       *stdtls.Certificate
+	certMod    time.Time
+	keyMod     time.Time
+	certByName map[string]*namedCertificate
 
 	alpn []string
 
 	server proxy.Server
+}
+
+type namedCertificate struct {
+	cert    *stdtls.Certificate
+	certMod time.Time
+	keyMod  time.Time
 }
 
 func init() {
@@ -55,6 +70,7 @@ func NewTLS(s string, d proxy.Dialer, p proxy.Proxy) (*TLS, error) {
 		skipVerify: query.Get("skipVerify") == "true",
 		certFile:   query.Get("cert"),
 		keyFile:    query.Get("key"),
+		certDir:    query.Get("certDir"),
 		alpn:       query["alpn"],
 	}
 
@@ -108,20 +124,23 @@ func NewTLSServer(s string, p proxy.Proxy) (proxy.Server, error) {
 		return nil, err
 	}
 
-	if t.certFile == "" || t.keyFile == "" {
-		return nil, errors.New("[tls] cert and key file path must be spcified")
+	if (t.certFile == "") != (t.keyFile == "") {
+		return nil, errors.New("[tls] cert and key file path must be specified together")
 	}
-
-	cert, err := stdtls.LoadX509KeyPair(t.certFile, t.keyFile)
-	if err != nil {
-		log.F("[tls] unable to load cert: %s, key %s", t.certFile, t.keyFile)
-		return nil, err
+	if t.certFile == "" && t.certDir == "" {
+		return nil, errors.New("[tls] cert/key or certDir must be specified")
+	}
+	if t.certFile != "" {
+		if _, err := t.loadCertificateIfChanged(); err != nil {
+			log.F("[tls] unable to load cert: %s, key %s", t.certFile, t.keyFile)
+			return nil, err
+		}
 	}
 
 	t.config = &stdtls.Config{
-		Certificates: []stdtls.Certificate{cert},
-		NextProtos:   t.alpn,
-		MinVersion:   stdtls.VersionTLS12,
+		GetCertificate: t.getCertificate,
+		NextProtos:     t.alpn,
+		MinVersion:     stdtls.VersionTLS12,
 	}
 
 	if len(schemes) > 1 {
@@ -132,6 +151,140 @@ func NewTLSServer(s string, p proxy.Proxy) (proxy.Server, error) {
 	}
 
 	return t, nil
+}
+
+func (s *TLS) getCertificate(hello *stdtls.ClientHelloInfo) (*stdtls.Certificate, error) {
+	if hello != nil {
+		cert, matched, err := s.loadCertificateForServerName(hello.ServerName)
+		if matched {
+			if err != nil && s.certFile != "" && s.keyFile != "" {
+				log.F("[tls] unable to load SNI cert for %s, trying fallback certificate: %v", hello.ServerName, err)
+				return s.loadCertificateIfChanged()
+			}
+			return cert, err
+		}
+	}
+	return s.loadCertificateIfChanged()
+}
+
+func (s *TLS) loadCertificateIfChanged() (*stdtls.Certificate, error) {
+	s.certMu.Lock()
+	defer s.certMu.Unlock()
+
+	return loadCertificateFilesIfChanged(s.certFile, s.keyFile, &s.cert, &s.certMod, &s.keyMod)
+}
+
+func (s *TLS) loadCertificateForServerName(serverName string) (*stdtls.Certificate, bool, error) {
+	certName, certFile, keyFile, ok := s.certificateFilesForServerName(serverName)
+	if !ok {
+		return nil, false, nil
+	}
+
+	s.certMu.Lock()
+	defer s.certMu.Unlock()
+
+	if s.certByName == nil {
+		s.certByName = make(map[string]*namedCertificate)
+	}
+	cache := s.certByName[certName]
+	if cache == nil {
+		cache = &namedCertificate{}
+		s.certByName[certName] = cache
+	}
+	cert, err := loadCertificateFilesIfChanged(certFile, keyFile, &cache.cert, &cache.certMod, &cache.keyMod)
+	return cert, true, err
+}
+
+func (s *TLS) certificateFilesForServerName(serverName string) (string, string, string, bool) {
+	if strings.TrimSpace(s.certDir) == "" {
+		return "", "", "", false
+	}
+	name, ok := normalizeTLSServerName(serverName)
+	if !ok {
+		return "", "", "", false
+	}
+	for _, candidate := range tlsCertificateNameCandidates(name) {
+		certFile := filepath.Join(s.certDir, candidate, "fullchain.pem")
+		keyFile := filepath.Join(s.certDir, candidate, "privkey.pem")
+		if fileExists(certFile) || fileExists(keyFile) {
+			return candidate, certFile, keyFile, true
+		}
+	}
+	return "", "", "", false
+}
+
+func loadCertificateFilesIfChanged(certFile, keyFile string, cert **stdtls.Certificate, certMod, keyMod *time.Time) (*stdtls.Certificate, error) {
+	if certFile == "" || keyFile == "" {
+		return nil, errors.New("[tls] cert and key file path must be specified")
+	}
+	certInfo, err := os.Stat(certFile)
+	if err != nil {
+		if *cert != nil {
+			log.F("[tls] stat cert %s failed, keeping previous certificate: %v", certFile, err)
+			return *cert, nil
+		}
+		return nil, err
+	}
+	keyInfo, err := os.Stat(keyFile)
+	if err != nil {
+		if *cert != nil {
+			log.F("[tls] stat key %s failed, keeping previous certificate: %v", keyFile, err)
+			return *cert, nil
+		}
+		return nil, err
+	}
+	if *cert != nil && certInfo.ModTime().Equal(*certMod) && keyInfo.ModTime().Equal(*keyMod) {
+		return *cert, nil
+	}
+	loaded, err := stdtls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		if *cert != nil {
+			log.F("[tls] reload cert %s, key %s failed, keeping previous certificate: %v", certFile, keyFile, err)
+			return *cert, nil
+		}
+		return nil, err
+	}
+	*cert = &loaded
+	*certMod = certInfo.ModTime().Truncate(time.Nanosecond)
+	*keyMod = keyInfo.ModTime().Truncate(time.Nanosecond)
+	return *cert, nil
+}
+
+func normalizeTLSServerName(serverName string) (string, bool) {
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(serverName)), ".")
+	if name == "" || len(name) > 253 || strings.ContainsAny(name, `/\`) {
+		return "", false
+	}
+	labels := strings.Split(name, ".")
+	if len(labels) < 2 {
+		return "", false
+	}
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", false
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				continue
+			}
+			return "", false
+		}
+	}
+	return name, true
+}
+
+func tlsCertificateNameCandidates(serverName string) []string {
+	candidates := []string{serverName}
+	labels := strings.Split(serverName, ".")
+	if len(labels) > 2 {
+		candidates = append(candidates, "*."+strings.Join(labels[1:], "."))
+	}
+	return candidates
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // ListenAndServe listens on server's addr and serves connections.
@@ -225,9 +378,11 @@ Proxy over tls client:
   
 TLS server scheme:
   tls://host:port?cert=PATH&key=PATH[&alpn=proto1][&alpn=proto2]
+  tls://host:port?certDir=DIR[&cert=FALLBACK_CERT&key=FALLBACK_KEY][&alpn=proto1][&alpn=proto2]
   
 Proxy over tls server:
   tls://host:port?cert=PATH&key=PATH,scheme://
+  tls://host:port?certDir=DIR,scheme://
   tls://host:port?cert=PATH&key=PATH,http://
   tls://host:port?cert=PATH&key=PATH,socks5://
   tls://host:port?cert=PATH&key=PATH,ss://method:pass@

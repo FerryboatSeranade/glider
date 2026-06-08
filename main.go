@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -19,14 +18,54 @@ import (
 
 var (
 	version = "0.17.0"
-	config  = parseConfig()
-	pxySw   *proxy.Switcher
 )
 
 func main() {
+	config := parseConfig()
+	rule.SetTrafficRecorder(recordProxyTraffic)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	var (
+		pxySw    *proxy.Switcher
+		applier  *ConfigApplier
+		nodeSync *NodeSyncer
+	)
+
+	if shouldRunDataPlane(config) {
+		pxySw = proxy.NewSwitcher(rule.NewProxy(config.Forwards, &config.Strategy, nil))
+		applier = NewConfigApplier(config, pxySw)
+
+		if shouldRunNodeSync(config.Mode) {
+			nodeSync = NewNodeSyncer(config, applier)
+			if err := nodeSync.LoadCache(ctx); err != nil {
+				log.Printf("[node] cached config unavailable: %v", err)
+			}
+		}
+
+		if len(config.rules) == 0 {
+			if err := loadRules(config); err != nil {
+				log.Fatal(err)
+			}
+		}
+		runDataPlane(config, pxySw)
+	}
+
+	if shouldRunAdmin(config.Mode) {
+		startAdminServer(config, pxySw, applier)
+	}
+
+	if nodeSync != nil {
+		nodeSync.Start(ctx)
+	}
+
+	<-ctx.Done()
+}
+
+func runDataPlane(config *Config, pxySw *proxy.Switcher) {
 	// global rule proxy
 	pxy := rule.NewProxy(config.Forwards, &config.Strategy, config.rules)
-	pxySw = proxy.NewSwitcher(pxy)
+	pxySw.Set(pxy)
 
 	// ipset manager
 	ipsetM, _ := ipset.NewManager(config.rules)
@@ -86,9 +125,6 @@ func main() {
 		go local.ListenAndServe()
 	}
 
-	// admin server
-	startAdminServer(config, pxySw)
-
 	// run services
 	for _, s := range config.Services {
 		service, err := service.New(s)
@@ -97,8 +133,4 @@ func main() {
 		}
 		go service.Run()
 	}
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
 }

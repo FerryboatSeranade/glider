@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 
 	"github.com/nadoo/conflag"
 
@@ -22,6 +23,8 @@ type Config struct {
 	TCPBufSize int
 	UDPBufSize int
 
+	Mode string
+
 	Listens []string
 
 	Forwards []string
@@ -38,6 +41,15 @@ type Config struct {
 	Services []string
 
 	Admin string
+
+	NodeID           string
+	CentralURL       string
+	NodeToken        string
+	SyncInterval     string
+	CacheDir         string
+	CertDir          string
+	TrafficInterface string
+	PublicIP         string
 }
 
 func parseConfig() *Config {
@@ -52,6 +64,7 @@ func parseConfig() *Config {
 	flag.IntVar(&conf.LogFlags, "logflags", 19, "do not change it if you do not know what it is, ref: https://pkg.go.dev/log#pkg-constants")
 	flag.IntVar(&conf.TCPBufSize, "tcpbufsize", 32768, "tcp buffer size in Bytes")
 	flag.IntVar(&conf.UDPBufSize, "udpbufsize", 2048, "udp buffer size in Bytes")
+	flag.StringVar(&conf.Mode, "mode", envDefault("GLIDER_MODE", "admin"), "run mode: admin or node; combined is kept as a deprecated compatibility alias")
 	flag.StringSliceUniqVar(&conf.Listens, "listen", nil, "listen url, see the URL section below")
 
 	flag.StringSliceVar(&conf.Forwards, "forward", nil, "forward url, see the URL section below")
@@ -94,7 +107,17 @@ check=disable: disable health check`)
 	flag.StringSliceUniqVar(&conf.Services, "service", nil, "run specified services, format: SERVICE_NAME[,SERVICE_CONFIG]")
 
 	// admin server
-	flag.StringVar(&conf.Admin, "admin", "", "admin web listen address")
+	flag.StringVar(&conf.Admin, "admin", envDefault("GLIDER_ADMIN_ADDR", ""), "admin web/API listen address")
+
+	// node sync
+	flag.StringVar(&conf.NodeID, "node-id", envDefault("GLIDER_NODE_ID", ""), "unique node id for node mode")
+	flag.StringVar(&conf.CentralURL, "central-url", envDefault("GLIDER_CENTRAL_URL", ""), "central control plane base URL")
+	flag.StringVar(&conf.NodeToken, "node-token", envDefault("GLIDER_NODE_TOKEN", ""), "node sync bearer token")
+	flag.StringVar(&conf.SyncInterval, "sync-interval", envDefault("GLIDER_SYNC_INTERVAL", "30s"), "node config sync interval")
+	flag.StringVar(&conf.CacheDir, "cache-dir", envDefault("GLIDER_CACHE_DIR", "/var/lib/glider/cache"), "node local config cache directory")
+	flag.StringVar(&conf.CertDir, "cert-dir", envDefault("GLIDER_CERT_DIR", defaultCertCacheDir), "node certificate cache directory")
+	flag.StringVar(&conf.TrafficInterface, "traffic-interface", envDefault("GLIDER_TRAFFIC_INTERFACE", "eth0"), "interface used for node traffic counters")
+	flag.StringVar(&conf.PublicIP, "public-ip", envDefault("GLIDER_PUBLIC_IP", ""), "public IP reported in node heartbeat")
 
 	flag.Usage = usage
 	if err := flag.Parse(); err != nil {
@@ -116,7 +139,12 @@ check=disable: disable health check`)
 	// setup logger
 	log.Set(conf.Verbose, conf.LogFlags)
 
-	if len(conf.Listens) == 0 && conf.DNS == "" && len(conf.Services) == 0 {
+	conf.Mode = normalizeMode(conf.Mode, conf.Admin != "")
+	if conf.Mode == modeAdmin && conf.Admin == "" {
+		conf.Admin = ":8444"
+	}
+
+	if conf.Mode == modeNode && !hasLocalRuntime(conf) {
 		// flag.Usage()
 		fmt.Fprintf(os.Stderr, "ERROR: listen url must be specified.\n")
 		os.Exit(-1)
@@ -132,10 +160,59 @@ check=disable: disable health check`)
 		proxy.UDPBufSize = conf.UDPBufSize
 	}
 
-	if err := loadRules(conf); err != nil {
-		log.Fatal(err)
-	}
 	return conf
+}
+
+const (
+	modeAdmin    = "admin"
+	modeNode     = "node"
+	modeCombined = "combined"
+)
+
+func normalizeMode(mode string, hasAdmin bool) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case modeAdmin:
+		return modeAdmin
+	case modeNode:
+		return modeNode
+	case modeCombined:
+		return modeAdmin
+	case "":
+		if hasAdmin {
+			return modeAdmin
+		}
+		return modeNode
+	default:
+		fmt.Fprintf(os.Stderr, "ERROR: invalid mode %q, expected admin or node.\n", mode)
+		os.Exit(-1)
+	}
+	return modeAdmin
+}
+
+func hasLocalRuntime(conf *Config) bool {
+	return len(conf.Listens) > 0 || conf.DNS != "" || len(conf.Services) > 0
+}
+
+func shouldRunDataPlane(conf *Config) bool {
+	if conf.Mode == modeNode {
+		return true
+	}
+	return conf.Mode == modeAdmin && hasLocalRuntime(conf)
+}
+
+func shouldRunAdmin(mode string) bool {
+	return mode == modeAdmin
+}
+
+func shouldRunNodeSync(mode string) bool {
+	return mode == modeNode
+}
+
+func envDefault(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func loadRules(conf *Config) error {
@@ -193,6 +270,7 @@ URL:
 
     e.g. -listen socks5://:1080
          -listen tls://:443?cert=crtFilePath&key=keyFilePath,http://    (protocol chain)
+         -listen tls://:443?certDir=/etc/glider-certs,http://           (SNI cert directory)
 
     e.g. -forward socks5://server:1080
          -forward tls://server.com:443,http://                          (protocol chain)

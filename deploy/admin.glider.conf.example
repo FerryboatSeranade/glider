@@ -1,0 +1,7 @@
+mode=admin
+admin=:8444
+
+# Optional local-only proxy runtime for Admin panel connectivity checks.
+# Do not publish this port from Docker.
+listen=127.0.0.1:18080
+rules-dir=/etc/rules.d
