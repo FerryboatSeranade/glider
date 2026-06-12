@@ -14,6 +14,8 @@ The tag above is now published to GHCR and both remote compose files pull it fro
 
 The tag was published by GitHub Actions run `27106664483`, which completed successfully on 2026-06-08. Remote `docker manifest inspect ghcr.io/ferryboatseranade/glider:v2026.06.08-control56` shows a multi-architecture OCI index.
 
+The control-plane PR was merged into `master` as `d78ae8037ca0dc541590d6cbf211ccd405e7736e`. The follow-up `master` push workflow run `27113588882` completed successfully on 2026-06-08 and published `ghcr.io/ferryboatseranade/glider:master`. On 2026-06-12, `ovh-xboard` verified that `ghcr.io/ferryboatseranade/glider:master` resolves to a multi-architecture OCI index. The current remote deployments intentionally remain pinned to `v2026.06.08-control56` until a deliberate rollout changes their compose files.
+
 ## Registry Publishing
 
 The GitHub Actions build workflow is configured to publish `ghcr.io/<owner>/glider` on `master`, `main`, `dev`, and tag pushes with `packages: write`. It includes `type=ref,event=tag`, so a Git tag such as `v2026.06.08-control56` publishes the same GHCR image tag instead of only semver-stripped or `sha-*` aliases.
@@ -32,6 +34,8 @@ The current hosts already pull `v2026.06.08-control56` from GHCR. Keep `pull_pol
 - `ovh-xboard` runs `glider-admin` on `:8444` with image `v2026.06.08-control56`.
 - `zgo` runs node mode with image `v2026.06.08-control56` and publishes proxy ports `443` and `8443`; it still does not publish Admin `8444`.
 - The amd64 `/usr/local/bin/glider` binary SHA256 from the GHCR image is `66223918dc645c40d30aa15db51439f57df01bc459178fbfdac2a8585de9591e` on both remote containers.
+- On 2026-06-12, `ovh-xboard` still reported `glider-admin` running image `ghcr.io/ferryboatseranade/glider:v2026.06.08-control56` with binary SHA256 `66223918dc645c40d30aa15db51439f57df01bc459178fbfdac2a8585de9591e`; `/api/settings/cloudflare` returned `configured=false`, and `/api/nodes` showed `zgo` heartbeat, traffic counters, config version `d4aa2e1bd01a91de...`, and `auth_mode=shared`.
+- On 2026-06-12, `zgo` still reported container `glider` running image `ghcr.io/ferryboatseranade/glider:v2026.06.08-control56` with the same binary SHA256, listening on `443` and `8443` only. No `8444` listener was present.
 - On 2026-06-08, both remote containers were rechecked after `docker compose pull` and reported image `ghcr.io/ferryboatseranade/glider:v2026.06.08-control56`, running state, and the expected binary SHA above. `zgo` listened only on `443` and `8443`, and `8444` was not exposed.
 - Admin exposes `/api/config/status` and shows central config version plus node synced/stale state in the Overview and Nodes views.
 - `zgo` was verified synced to central config version `d4aa2e1bd01a91de...`.

@@ -2531,6 +2531,7 @@ const adminHTML = `<!doctype html>
       cursor: pointer;
     }
     button:hover { border-color: #b8c2cc; background: #f8fafc; }
+    button:disabled { opacity: .62; cursor: wait; }
     button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
     button.primary:hover { background: #166678; }
     button.danger { color: var(--danger); border-color: #f0b8b3; }
@@ -2644,8 +2645,8 @@ const adminHTML = `<!doctype html>
         <label for="adminToken">Admin token</label>
         <input id="adminToken" type="password" autocomplete="current-password" placeholder="Bearer token">
         <div class="side-actions">
-          <button onclick="saveToken()">Save</button>
-          <button onclick="clearToken()">Clear</button>
+          <button id="saveTokenBtn" type="button" onclick="saveToken()">Save</button>
+          <button type="button" onclick="clearToken()">Clear</button>
         </div>
       </div>
     </aside>
@@ -2846,7 +2847,7 @@ const adminHTML = `<!doctype html>
   </div>
 
 <script>
-let adminToken = localStorage.getItem('gliderAdminToken') || '';
+let adminToken = loadStoredAdminToken();
 let usersCache = [];
 let rulesCache = [];
 let nodesCache = [];
@@ -2890,7 +2891,7 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function setStatus(message, tone) {
   const el = $('authStatus');
   el.textContent = message || '';
-  el.style.color = tone === 'err' ? 'var(--danger)' : 'var(--muted)';
+  el.style.color = tone === 'err' ? 'var(--danger)' : tone === 'warn' ? 'var(--warn)' : 'var(--muted)';
 }
 
 function withAuthHeaders(headers) {
@@ -2949,83 +2950,140 @@ function escapeJS(value) {
   return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '\\r');
 }
 
-function saveToken() {
-  adminToken = $('adminToken').value.trim();
-  localStorage.setItem('gliderAdminToken', adminToken);
-  setStatus(adminToken ? 'Token saved' : 'Token cleared');
-  refreshAll();
+function normalizeAdminToken(value) {
+  let token = String(value || '').trim();
+  if (token.indexOf('GLIDER_ADMIN_TOKEN=') === 0) token = token.slice('GLIDER_ADMIN_TOKEN='.length).trim();
+  if (token.toLowerCase().indexOf('bearer ') === 0) token = token.slice(7).trim();
+  if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
+    token = token.slice(1, -1).trim();
+  }
+  return token;
+}
+
+function loadStoredAdminToken() {
+  try {
+    return localStorage.getItem('gliderAdminToken') || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function persistAdminToken(token) {
+  try {
+    if (token) localStorage.setItem('gliderAdminToken', token);
+    else localStorage.removeItem('gliderAdminToken');
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function verifyAdminToken(token) {
+  const res = await fetch('/api/config/status', { headers: token ? {'X-Admin-Token': token} : {} });
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  configStatus = data;
+  renderStats();
+}
+
+async function saveToken() {
+  const previous = adminToken;
+  const token = normalizeAdminToken($('adminToken').value);
+  $('adminToken').value = token;
+  const btn = $('saveTokenBtn');
+  if (btn) btn.disabled = true;
+  setStatus(token ? 'Checking token...' : 'Clearing token...');
+  try {
+    if (token) await verifyAdminToken(token);
+    adminToken = token;
+    const persisted = persistAdminToken(token);
+    setStatus(token ? (persisted ? 'Token saved' : 'Token works for this page; browser storage is unavailable') : 'Token cleared', persisted ? '' : 'warn');
+    if (token) await refreshAll({ preserveStatus: true });
+  } catch (e) {
+    adminToken = previous;
+    $('adminToken').value = previous;
+    setStatus('Token not saved: ' + e.message, 'err');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function clearToken() {
   adminToken = '';
   $('adminToken').value = '';
-  localStorage.removeItem('gliderAdminToken');
+  persistAdminToken('');
   setStatus('Token cleared');
 }
 
-async function refreshAll() {
-  await Promise.all([loadConfigStatus(), loadRules(), loadUsers(), loadNodes(), loadDomains(), loadCloudflareSettings(), loadLatestRulesHealth()]);
+async function refreshAll(opts) {
+  const options = opts || {};
+  await Promise.all([loadConfigStatus(options), loadRules(options), loadUsers(options), loadNodes(options), loadDomains(options), loadCloudflareSettings(options), loadLatestRulesHealth()]);
   renderStats();
 }
 
-async function loadConfigStatus() {
+function maybeClearStatus(options) {
+  if (!options || !options.preserveStatus) setStatus('');
+}
+
+async function loadConfigStatus(options) {
   try {
     configStatus = await fetchJSON('/api/config/status');
     renderStats();
-    setStatus('');
+    maybeClearStatus(options);
   } catch (e) {
     setStatus(e.message, 'err');
   }
 }
 
-async function loadRules() {
+async function loadRules(options) {
   try {
     rulesCache = await fetchJSON('/api/rules');
     renderRules();
-    setStatus('');
+    maybeClearStatus(options);
   } catch (e) {
     setStatus(e.message, 'err');
   }
 }
 
-async function loadUsers() {
+async function loadUsers(options) {
   try {
     usersCache = await fetchJSON('/api/users');
     renderUsers();
-    setStatus('');
+    maybeClearStatus(options);
   } catch (e) {
     setStatus(e.message, 'err');
   }
 }
 
-async function loadNodes() {
+async function loadNodes(options) {
   try {
     const data = await fetchJSON('/api/nodes');
     nodesCache = data.nodes || [];
     renderNodes(data.now);
-    setStatus('');
+    maybeClearStatus(options);
   } catch (e) {
     setStatus(e.message, 'err');
   }
 }
 
-async function loadDomains() {
+async function loadDomains(options) {
   try {
     const data = await fetchJSON('/api/domains');
     domainsCache = data.domains || [];
     renderDomains();
     renderDomainNodeControls();
-    setStatus('');
+    maybeClearStatus(options);
   } catch (e) {
     setStatus(e.message, 'err');
   }
 }
 
-async function loadCloudflareSettings() {
+async function loadCloudflareSettings(options) {
   try {
     cloudflareSettings = await fetchJSON('/api/settings/cloudflare');
     renderCloudflareSettings();
-    setStatus('');
+    maybeClearStatus(options);
   } catch (e) {
     setStatus(e.message, 'err');
   }
@@ -3865,6 +3923,12 @@ function toggleHealthAuto() {
 }
 
 $('adminToken').value = adminToken;
+$('adminToken').addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    saveToken();
+  }
+});
 refreshAll();
 </script>
 </body>
