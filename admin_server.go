@@ -139,6 +139,7 @@ func startAdminServer(conf *Config, pxySw *proxy.Switcher, applier *ConfigApplie
 	mux.HandleFunc("/api/rules", srv.handleRules)
 	mux.HandleFunc("/api/rules/", srv.handleRule)
 	mux.HandleFunc("/api/reload", srv.handleReload)
+	mux.HandleFunc("/api/auth/check", srv.handleAuthCheck)
 	mux.HandleFunc("/api/config/status", srv.handleConfigStatus)
 	mux.HandleFunc("/api/check", srv.handleCheck)
 	mux.HandleFunc("/api/rules/health", srv.handleRulesHealth)
@@ -263,9 +264,24 @@ func (s *adminServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(adminHTML))
+}
+
+func (s *adminServer) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireToken(w, r) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
+		"now":    time.Now().UTC(),
+	})
 }
 
 func (s *adminServer) handleUsers(w http.ResponseWriter, r *http.Request) {
@@ -2979,12 +2995,15 @@ function persistAdminToken(token) {
 }
 
 async function verifyAdminToken(token) {
-  const res = await fetch('/api/config/status', { headers: token ? {'X-Admin-Token': token} : {} });
+  const res = await fetch('/api/auth/check', {
+    method: 'POST',
+    headers: token ? {'X-Admin-Token': token} : {},
+    cache: 'no-store'
+  });
   let data = {};
   try { data = await res.json(); } catch (e) {}
   if (!res.ok) throw new Error(data.error || res.statusText);
-  configStatus = data;
-  renderStats();
+  return data;
 }
 
 async function saveToken() {
@@ -2993,7 +3012,7 @@ async function saveToken() {
   $('adminToken').value = token;
   const btn = $('saveTokenBtn');
   if (btn) btn.disabled = true;
-  setStatus(token ? 'Checking token...' : 'Clearing token...');
+  setStatus(token ? 'Checking token via /api/auth/check...' : 'Clearing token...');
   try {
     if (token) await verifyAdminToken(token);
     adminToken = token;

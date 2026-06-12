@@ -171,6 +171,7 @@ func TestAdminHTMLSmoke(t *testing.T) {
 		"Cloudflare Settings",
 		"normalizeAdminToken",
 		"verifyAdminToken",
+		"/api/auth/check",
 		"Checking token",
 		"Token not saved",
 		"addEventListener('keydown'",
