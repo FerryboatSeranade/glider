@@ -164,7 +164,7 @@ OPTION:
   -maxfailures int
         max failures to change forwarder status to disabled (default 3)
   -mode string
-        run mode: admin or node; combined is kept as a deprecated compatibility alias
+        run mode: admin or node
   -node-id string
         unique node id for node mode
   -central-url string
@@ -461,7 +461,6 @@ Modes:
 
 - `admin`: runs the Web Admin/API, connects to MongoDB, manages users/rules/nodes/config versions, and exposes `/api/node/config` plus `/api/node/heartbeat`. If `listen`, `dns`, or `service` is configured, admin also starts a local proxy runtime for panel connectivity checks.
 - `node`: runs proxy listeners only, does not start the Admin UI, reads cached config first, then pulls config from the central API and hot-reloads only when `config_version` changes.
-- `combined`: deprecated compatibility alias for old single-host configs. New deployments should use `admin` or `node`.
 
 Recommended central deployment shape:
 

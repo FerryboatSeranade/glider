@@ -2,15 +2,12 @@ package main
 
 import "testing"
 
-func TestNormalizeModeKeepsTwoPublicModes(t *testing.T) {
+func TestNormalizeModeDefaultsToAdminOrNode(t *testing.T) {
 	if got := normalizeMode("", false); got != modeNode {
 		t.Fatalf("empty mode without admin = %q, want node", got)
 	}
 	if got := normalizeMode("", true); got != modeAdmin {
 		t.Fatalf("empty mode with admin = %q, want admin", got)
-	}
-	if got := normalizeMode(modeCombined, true); got != modeAdmin {
-		t.Fatalf("combined mode = %q, want admin compatibility alias", got)
 	}
 }
 

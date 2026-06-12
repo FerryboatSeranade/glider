@@ -64,7 +64,7 @@ func parseConfig() *Config {
 	flag.IntVar(&conf.LogFlags, "logflags", 19, "do not change it if you do not know what it is, ref: https://pkg.go.dev/log#pkg-constants")
 	flag.IntVar(&conf.TCPBufSize, "tcpbufsize", 32768, "tcp buffer size in Bytes")
 	flag.IntVar(&conf.UDPBufSize, "udpbufsize", 2048, "udp buffer size in Bytes")
-	flag.StringVar(&conf.Mode, "mode", envDefault("GLIDER_MODE", "admin"), "run mode: admin or node; combined is kept as a deprecated compatibility alias")
+	flag.StringVar(&conf.Mode, "mode", envDefault("GLIDER_MODE", "admin"), "run mode: admin or node")
 	flag.StringSliceUniqVar(&conf.Listens, "listen", nil, "listen url, see the URL section below")
 
 	flag.StringSliceVar(&conf.Forwards, "forward", nil, "forward url, see the URL section below")
@@ -164,9 +164,8 @@ check=disable: disable health check`)
 }
 
 const (
-	modeAdmin    = "admin"
-	modeNode     = "node"
-	modeCombined = "combined"
+	modeAdmin = "admin"
+	modeNode  = "node"
 )
 
 func normalizeMode(mode string, hasAdmin bool) string {
@@ -175,8 +174,6 @@ func normalizeMode(mode string, hasAdmin bool) string {
 		return modeAdmin
 	case modeNode:
 		return modeNode
-	case modeCombined:
-		return modeAdmin
 	case "":
 		if hasAdmin {
 			return modeAdmin
