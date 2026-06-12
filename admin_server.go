@@ -3230,9 +3230,18 @@ function renderNodes(nowValue) {
       '<td>' + escapeHTML(formatDuration(n.uptime || 0)) + '</td>' +
       '<td>' + escapeHTML(formatDate(n.updated_at)) + '</td>' +
       '<td>' + escapeHTML(n.error || '-') + (n.cert_error ? '<div class="compact">cert ' + escapeHTML(n.cert_error) + '</div>' : '') + '</td>' +
-      '<td><button onclick="setNodeToken(\\'' + escapeJS(n.node_id) + '\\')">Set Token</button><button onclick="clearNodeToken(\\'' + escapeJS(n.node_id) + '\\')">Clear Token</button><button class="danger" onclick="deleteNode(\\'' + escapeJS(n.node_id) + '\\')">Delete</button></td>' +
+      '<td><button data-node-action="set-token" data-node-id="' + escapeHTML(n.node_id) + '">Set Token</button><button data-node-action="clear-token" data-node-id="' + escapeHTML(n.node_id) + '">Clear Token</button><button class="danger" data-node-action="delete" data-node-id="' + escapeHTML(n.node_id) + '">Delete</button></td>' +
       '</tr>';
   }).join('') + '</tbody></table>';
+  document.querySelectorAll('[data-node-action]').forEach(btn => {
+    const nodeID = btn.getAttribute('data-node-id') || '';
+    const action = btn.getAttribute('data-node-action') || '';
+    btn.onclick = () => {
+      if (action === 'set-token') return setNodeToken(nodeID);
+      if (action === 'clear-token') return clearNodeToken(nodeID);
+      if (action === 'delete') return deleteNode(nodeID);
+    };
+  });
   renderStats();
 }
 

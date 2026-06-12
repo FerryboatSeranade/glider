@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -233,6 +235,27 @@ func TestAdminHTMLSmoke(t *testing.T) {
 		if !strings.Contains(adminHTML, needle) {
 			t.Fatalf("adminHTML missing %q", needle)
 		}
+	}
+}
+
+func TestAdminHTMLScriptSyntax(t *testing.T) {
+	start := strings.Index(adminHTML, "<script>")
+	end := strings.Index(adminHTML, "</script>")
+	if start < 0 || end < 0 || end <= start {
+		t.Fatalf("adminHTML script block not found")
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available for admin HTML script syntax check")
+	}
+	script := adminHTML[start+len("<script>") : end]
+	path := t.TempDir() + "/admin.js"
+	if err := os.WriteFile(path, []byte(script), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(node, "--check", path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("admin HTML script syntax invalid: %v\n%s", err, out)
 	}
 }
 
