@@ -1913,6 +1913,64 @@ func TestFailoverSkipsHealthyNodeWithoutSyncedDomainCertificate(t *testing.T) {
 	}
 }
 
+func TestNodeFailoverReadinessReasonExplainsBlockingState(t *testing.T) {
+	now := time.Now().UTC()
+	expired := now.Add(-time.Hour)
+	future := now.Add(time.Hour)
+	d := dbDomain{
+		Domain:      "proxy.example.com",
+		Enabled:     true,
+		NodeIDs:     []string{"missing", "stale", "proxy", "private", "wrong-cert", "expired-cert", "ready"},
+		Certificate: domainCertificate{Version: "cert-v1"},
+	}
+	checked := now.Add(-time.Minute)
+	cases := []struct {
+		name   string
+		nodeID string
+		node   NodeHeartbeat
+		want   string
+	}{
+		{name: "missing", nodeID: "missing", node: NodeHeartbeat{}, want: "heartbeat missing"},
+		{name: "stale", nodeID: "stale", node: NodeHeartbeat{NodeID: "stale", UpdatedAt: now.Add(-10 * time.Minute), PublicIP: "8.8.8.8"}, want: "heartbeat stale"},
+		{name: "proxy", nodeID: "proxy", node: NodeHeartbeat{NodeID: "proxy", UpdatedAt: now, PublicIP: "8.8.8.8", ProxyStatus: "error", ProxyCheckedAt: &checked, ProxyError: "connect refused"}, want: "proxy error: connect refused"},
+		{name: "private", nodeID: "private", node: NodeHeartbeat{NodeID: "private", UpdatedAt: now, PublicIP: "192.168.1.10"}, want: "public_ip is not public"},
+		{name: "wrong cert", nodeID: "wrong-cert", node: NodeHeartbeat{NodeID: "wrong-cert", UpdatedAt: now, PublicIP: "8.8.8.8", CertDomains: []NodeCertState{{Domain: "proxy.example.com", Version: "old", ExpiresAt: &future}}}, want: "certificate version mismatch"},
+		{name: "expired cert", nodeID: "expired-cert", node: NodeHeartbeat{NodeID: "expired-cert", UpdatedAt: now, PublicIP: "8.8.8.8", CertDomains: []NodeCertState{{Domain: "proxy.example.com", Version: "cert-v1", ExpiresAt: &expired}}}, want: "certificate expired"},
+		{name: "ready", nodeID: "ready", node: NodeHeartbeat{NodeID: "ready", UpdatedAt: now, PublicIP: "8.8.8.8", CertDomains: []NodeCertState{{Domain: "proxy.example.com", Version: "cert-v1", ExpiresAt: &future}}}, want: "ready"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nodeFailoverReadinessReason(d, tc.nodeID, tc.node, now); got != tc.want {
+				t.Fatalf("reason = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDomainRuntimeIncludesFailoverReadinessReason(t *testing.T) {
+	now := time.Now().UTC()
+	d := dbDomain{
+		Domain:          "proxy.example.com",
+		Enabled:         true,
+		FailoverEnabled: true,
+		ActiveNodeID:    "active",
+		NodeIDs:         []string{"active", "standby"},
+	}
+	runtime := domainRuntime(d, map[string]NodeHeartbeat{
+		"active":  {NodeID: "active", UpdatedAt: now, PublicIP: "8.8.8.8"},
+		"standby": {NodeID: "standby", UpdatedAt: now.Add(-10 * time.Minute), PublicIP: "8.8.4.4"},
+	}, now)
+	if len(runtime.AssignedNodeStatus) != 2 {
+		t.Fatalf("assigned node status = %#v", runtime.AssignedNodeStatus)
+	}
+	if runtime.AssignedNodeStatus[0].FailoverReason != "ready" {
+		t.Fatalf("active reason = %q", runtime.AssignedNodeStatus[0].FailoverReason)
+	}
+	if runtime.AssignedNodeStatus[1].FailoverReason != "heartbeat stale" {
+		t.Fatalf("standby reason = %q", runtime.AssignedNodeStatus[1].FailoverReason)
+	}
+}
+
 func TestFailoverTargetOnlySwitchesWhenActiveIsUnhealthy(t *testing.T) {
 	now := time.Now().UTC()
 	nodes := map[string]NodeHeartbeat{

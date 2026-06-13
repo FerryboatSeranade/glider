@@ -964,6 +964,8 @@ func (s *adminServer) handleDomainAction(w http.ResponseWriter, r *http.Request)
 		s.handleDomainFailoverPlan(w, r, domain)
 	case action == "failover-run" && r.Method == http.MethodPost:
 		s.handleDomainFailoverRun(w, r, domain)
+	case action == "failover-reset" && r.Method == http.MethodPost:
+		s.handleDomainFailoverReset(w, r, domain)
 	case action == "issue-cert" && r.Method == http.MethodPost:
 		s.handleDomainIssueCert(w, r, domain)
 	case action == "cert-plan" && r.Method == http.MethodPost:
@@ -1040,6 +1042,7 @@ type domainNodeCertSync struct {
 	LastSeenAt     *time.Time `json:"last_seen_at,omitempty"`
 	Error          string     `json:"error,omitempty"`
 	CertError      string     `json:"cert_error,omitempty"`
+	FailoverReason string     `json:"failover_reason,omitempty"`
 }
 
 func newDomainResponse(d dbDomain, nodes map[string]NodeHeartbeat, now time.Time) domainResponse {
@@ -1205,6 +1208,7 @@ func domainNodeCertState(d dbDomain, nodeID string, node NodeHeartbeat, now time
 		break
 	}
 	state.FailoverReady = state.Online && nodeReadyForDomainAt(node, d, now)
+	state.FailoverReason = nodeFailoverReadinessReason(d, nodeID, node, now)
 	return state
 }
 
@@ -1414,6 +1418,43 @@ func (s *adminServer) handleDomainFailoverRun(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *adminServer) handleDomainFailoverReset(w http.ResponseWriter, r *http.Request, domain string) {
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	d, err := s.store.GetDomain(ctx, domain)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	reset := domainFailoverState{}
+	if err := s.store.UpdateDomainFailoverState(context.Background(), d.Domain, reset); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordEvent(dbEvent{
+		Type:    "domain.failover_reset",
+		Message: "domain failover state reset",
+		Domain:  d.Domain,
+		Metadata: map[string]any{
+			"previous_failures": d.FailoverState.ActiveFailureCount,
+			"previous_error":    d.FailoverState.LastError,
+			"previous_reason":   d.FailoverState.LastReason,
+		},
+	})
+	nodes, err := s.store.Nodes(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "state": reset})
+		return
+	}
+	cleared := *d
+	cleared.FailoverState = reset
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"state":   reset,
+		"runtime": domainRuntime(cleared, nodeMapByID(nodes), time.Now().UTC()),
+	})
 }
 
 func (s *adminServer) domainFailoverPlan(ctx context.Context, domain string, includeDNSPlan bool) (failoverPlanResponse, error) {
@@ -2906,6 +2947,70 @@ func nodeReadyForDomain(node NodeHeartbeat, d dbDomain) bool {
 	return nodeReadyForDomainAt(node, d, time.Now().UTC())
 }
 
+func nodeFailoverReadinessReason(d dbDomain, nodeID string, node NodeHeartbeat, now time.Time) string {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	nodeID = strings.TrimSpace(firstNonEmpty(nodeID, node.NodeID))
+	if nodeID == "" {
+		return "node id missing"
+	}
+	if !d.Enabled {
+		return "domain disabled"
+	}
+	if !domainAssignedToNode(d, nodeID) {
+		return "node is not assigned to domain"
+	}
+	if strings.TrimSpace(node.NodeID) == "" {
+		return "heartbeat missing"
+	}
+	if strings.TrimSpace(node.Error) != "" {
+		return "node error: " + node.Error
+	}
+	if node.UpdatedAt.IsZero() {
+		return "heartbeat missing"
+	}
+	if now.Sub(node.UpdatedAt) > 90*time.Second {
+		return "heartbeat stale"
+	}
+	if strings.EqualFold(node.ProxyStatus, "error") && node.ProxyCheckedAt != nil && now.Sub(*node.ProxyCheckedAt) <= 3*time.Minute {
+		if strings.TrimSpace(node.ProxyError) != "" {
+			return "proxy error: " + node.ProxyError
+		}
+		return "proxy error"
+	}
+	if publicIPString(node.PublicIP) == "" {
+		return "public_ip is not public"
+	}
+	version := strings.TrimSpace(d.Certificate.Version)
+	if version != "" && !nodeReadyForDomainAt(node, d, now) {
+		for _, cert := range node.CertDomains {
+			certDomain, err := normalizeDomainName(cert.Domain)
+			if err != nil {
+				continue
+			}
+			domain, err := normalizeDomainName(d.Domain)
+			if err != nil {
+				break
+			}
+			if certDomain != domain {
+				continue
+			}
+			if strings.TrimSpace(cert.Version) != version {
+				return "certificate version mismatch"
+			}
+			if cert.ExpiresAt == nil {
+				return "certificate expiry missing"
+			}
+			if !cert.ExpiresAt.After(now) {
+				return "certificate expired"
+			}
+		}
+		return "certificate not synced"
+	}
+	return "ready"
+}
+
 func nodeReadyForDomainAt(node NodeHeartbeat, d dbDomain, now time.Time) bool {
 	version := strings.TrimSpace(d.Certificate.Version)
 	if version == "" {
@@ -3955,6 +4060,7 @@ const adminHTML = `<!doctype html>
                   <button onclick="syncDomainDNS()">Sync DNS</button>
                   <button onclick="previewDomainFailover()">Preview Failover</button>
                   <button onclick="runDomainFailover()">Run Failover</button>
+                  <button onclick="resetDomainFailover()">Reset Failover</button>
                   <button onclick="previewDomainCert()">Preview Cert</button>
                   <button onclick="issueDomainCert()">Issue Cert</button>
                   <button onclick="importDomainCert()">Import Cert</button>
@@ -5049,6 +5155,12 @@ function renderDomainResult(d) {
     'failover ready nodes: ' + escapeHTML(((d && d.runtime) || {}).failover_ready_nodes || 0)
   ];
   if (d && d.runtime && d.runtime.failover_blocked_reason) lines.push('failover blocked: ' + escapeHTML(d.runtime.failover_blocked_reason));
+  const nodeReasons = domainFailoverNodeReasons(d);
+  if (nodeReasons.length) {
+    lines.push('');
+    lines.push('failover candidates:');
+    nodeReasons.forEach(line => lines.push(line));
+  }
   if (cf.last_error) lines.push('dns error: ' + escapeHTML(cf.last_error));
   if (cert.last_error) lines.push('cert error: ' + escapeHTML(cert.last_error));
   $('domainResult').innerHTML = lines.join('\n');
@@ -5062,6 +5174,19 @@ function failoverFailureSummary(d) {
   const runtime = (d && d.runtime) || {};
   const policy = (d && d.failover_policy) || {};
   return String(runtime.failover_failures || 0) + '/' + String(runtime.failover_threshold || policy.fail_threshold || 3);
+}
+
+function domainFailoverNodeReasons(d) {
+  const states = ((d && d.runtime) || {}).assigned_node_status || [];
+  return states.map(s => {
+    const label = (s.node_id || '-') + (s.failover_ready ? ' ready' : ' blocked');
+    const reason = s.failover_reason || (s.failover_ready ? 'ready' : 'not ready');
+    const extra = [];
+    if (s.public_ip) extra.push(s.public_ip);
+    if (s.proxy_status) extra.push('proxy ' + s.proxy_status);
+    if (s.cert_version) extra.push('cert ' + shortHash(s.cert_version));
+    return '  - ' + escapeHTML(label + ': ' + reason + (extra.length ? ' (' + extra.join(', ') + ')' : ''));
+  });
 }
 
 async function saveDomain() {
@@ -5134,6 +5259,12 @@ function renderFailoverPlan(data, prefix) {
     'runtime: ' + escapeHTML(runtime.failover_status || '-')
   ];
   if (runtime.failover_blocked_reason) lines.push('blocked: ' + escapeHTML(runtime.failover_blocked_reason));
+  const nodeReasons = domainFailoverNodeReasons({ runtime });
+  if (nodeReasons.length) {
+    lines.push('');
+    lines.push('failover candidates:');
+    nodeReasons.forEach(line => lines.push(line));
+  }
   if (data.error) lines.push('error: ' + escapeHTML(data.error));
   if (data.plan) lines.push('', renderDNSPlan(data.plan, 'DNS switch plan'));
   return lines.join('\n');
@@ -5315,6 +5446,33 @@ async function runDomainFailover() {
   $('domainResult').innerHTML = renderFailoverPlan(data, data.should_switch ? 'Failover executed' : 'Failover checked');
   await loadDomains();
   await loadEvents();
+}
+
+async function resetDomainFailover() {
+  const domain = $('domainName').value.trim();
+  if (!domain) return;
+  await saveDomain();
+  $('domainResult').textContent = 'Resetting failover state...';
+  const data = await fetchJSON('/api/domains/' + encodeURIComponent(domain) + '/failover-reset', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'}
+  });
+  $('domainResult').innerHTML = renderFailoverReset(data);
+  await loadDomains();
+  await loadEvents();
+}
+
+function renderFailoverReset(data) {
+  data = data || {};
+  const runtime = data.runtime || {};
+  const lines = [
+    'Failover state reset',
+    'status: ' + escapeHTML(data.status || '-'),
+    'failures: ' + escapeHTML((data.state || {}).active_failure_count || runtime.failover_failures || 0),
+    'runtime: ' + escapeHTML(runtime.failover_status || '-')
+  ];
+  if (runtime.failover_blocked_reason) lines.push('blocked: ' + escapeHTML(runtime.failover_blocked_reason));
+  return lines.join('\n');
 }
 
 async function issueDomainCert() {
