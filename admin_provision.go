@@ -219,20 +219,31 @@ func (s *adminServer) runSSHTestJob(jobID, serverID string) {
 	ctx := context.Background()
 	_ = s.store.StartJob(ctx, jobID)
 	logger := jobLogger{store: s.store, jobID: jobID}
-	logger.Log("loading server %s", serverID)
-	server, err := s.store.GetServer(ctx, serverID)
-	if err != nil {
+	var server *dbServer
+	if err := logger.Step("load-server", fmt.Sprintf("load server %s", serverID), func() error {
+		var err error
+		server, err = s.store.GetServer(ctx, serverID)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, "", "error", err)
 		return
 	}
-	runner, err := connectSSH(ctx, *server, logger)
-	if err != nil {
+	var runner *sshRunner
+	if err := logger.Step("ssh-connect", "connect to server over SSH", func() error {
+		var err error
+		runner, err = connectSSH(ctx, *server, logger)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, "", "unreachable", err)
 		return
 	}
 	defer runner.Close()
-	out, err := runner.Run(ctx, "printf 'glider-ssh-ok '; uname -s; id -un")
-	if err != nil {
+	var out string
+	if err := logger.Step("ssh-smoke-test", "run SSH smoke command", func() error {
+		var err error
+		out, err = runner.Run(ctx, "printf 'glider-ssh-ok '; uname -s; id -un")
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, "", "error", err)
 		return
 	}
@@ -253,18 +264,30 @@ func (s *adminServer) runPreflightNodeJob(jobID, serverID string) {
 	ctx := context.Background()
 	_ = s.store.StartJob(ctx, jobID)
 	logger := jobLogger{store: s.store, jobID: jobID}
-	job, err := s.store.GetJob(ctx, jobID)
-	if err != nil {
+	var job *dbJob
+	if err := logger.Step("load-job", "load provisioning job", func() error {
+		var err error
+		job, err = s.store.GetJob(ctx, jobID)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, "", "error", err)
 		return
 	}
-	server, err := s.store.GetServer(ctx, serverID)
-	if err != nil {
+	var server *dbServer
+	if err := logger.Step("load-server", fmt.Sprintf("load server %s", serverID), func() error {
+		var err error
+		server, err = s.store.GetServer(ctx, serverID)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, "", "error", err)
 		return
 	}
-	runner, err := connectSSH(ctx, *server, logger)
-	if err != nil {
+	var runner *sshRunner
+	if err := logger.Step("ssh-connect", "connect to server over SSH", func() error {
+		var err error
+		runner, err = connectSSH(ctx, *server, logger)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "unreachable", err)
 		return
 	}
@@ -276,7 +299,9 @@ func (s *adminServer) runPreflightNodeJob(jobID, serverID string) {
 	if len(req.ProxyPorts) == 0 {
 		req.ProxyPorts = firstNonEmptySlice(server.ProxyPorts, []string{"443:443", "8443:8443"})
 	}
-	if err := preflightNodeOverSSH(ctx, runner, logger, *server, req); err != nil {
+	if err := logger.Step("preflight-node", "inspect remote node prerequisites", func() error {
+		return preflightNodeOverSSH(ctx, runner, logger, *server, req)
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "preflight_failed", err)
 		return
 	}
@@ -297,18 +322,30 @@ func (s *adminServer) runDeployNodeJob(jobID, serverID, nodeToken string) {
 	ctx := context.Background()
 	_ = s.store.StartJob(ctx, jobID)
 	logger := jobLogger{store: s.store, jobID: jobID}
-	job, err := s.store.GetJob(ctx, jobID)
-	if err != nil {
+	var job *dbJob
+	if err := logger.Step("load-job", "load deployment job", func() error {
+		var err error
+		job, err = s.store.GetJob(ctx, jobID)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, "", "error", err)
 		return
 	}
-	server, err := s.store.GetServer(ctx, serverID)
-	if err != nil {
+	var server *dbServer
+	if err := logger.Step("load-server", fmt.Sprintf("load server %s", serverID), func() error {
+		var err error
+		server, err = s.store.GetServer(ctx, serverID)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, "", "error", err)
 		return
 	}
-	runner, err := connectSSH(ctx, *server, logger)
-	if err != nil {
+	var runner *sshRunner
+	if err := logger.Step("ssh-connect", "connect to server over SSH", func() error {
+		var err error
+		runner, err = connectSSH(ctx, *server, logger)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "unreachable", err)
 		return
 	}
@@ -329,7 +366,9 @@ func (s *adminServer) runDeployNodeJob(jobID, serverID, nodeToken string) {
 	}
 
 	if req.InstallDocker {
-		if err := ensureDocker(ctx, runner, logger); err != nil {
+		if err := logger.Step("ensure-docker", "ensure Docker and Compose are available", func() error {
+			return ensureDocker(ctx, runner, logger)
+		}); err != nil {
 			s.finishProvisionJob(jobID, serverID, server.NodeID, "error", err)
 			return
 		}
@@ -362,18 +401,30 @@ func (s *adminServer) runOnboardNodeJob(jobID, serverID string) {
 	ctx := context.Background()
 	_ = s.store.StartJob(ctx, jobID)
 	logger := jobLogger{store: s.store, jobID: jobID}
-	job, err := s.store.GetJob(ctx, jobID)
-	if err != nil {
+	var job *dbJob
+	if err := logger.Step("load-job", "load onboarding job", func() error {
+		var err error
+		job, err = s.store.GetJob(ctx, jobID)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, "", "error", err)
 		return
 	}
-	server, err := s.store.GetServer(ctx, serverID)
-	if err != nil {
+	var server *dbServer
+	if err := logger.Step("load-server", fmt.Sprintf("load server %s", serverID), func() error {
+		var err error
+		server, err = s.store.GetServer(ctx, serverID)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, "", "error", err)
 		return
 	}
-	runner, err := connectSSH(ctx, *server, logger)
-	if err != nil {
+	var runner *sshRunner
+	if err := logger.Step("ssh-connect", "connect to server over SSH", func() error {
+		var err error
+		runner, err = connectSSH(ctx, *server, logger)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "unreachable", err)
 		return
 	}
@@ -397,12 +448,16 @@ func (s *adminServer) runOnboardNodeJob(jobID, serverID string) {
 	}
 
 	logger.Log("starting node onboarding for %s", server.NodeID)
-	if err := preflightNodeOverSSH(ctx, runner, logger, *server, req); err != nil {
+	if err := logger.Step("preflight-node", "inspect remote node prerequisites", func() error {
+		return preflightNodeOverSSH(ctx, runner, logger, *server, req)
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "preflight_failed", err)
 		return
 	}
 	if req.InstallDocker {
-		if err := ensureDocker(ctx, runner, logger); err != nil {
+		if err := logger.Step("ensure-docker", "ensure Docker and Compose are available", func() error {
+			return ensureDocker(ctx, runner, logger)
+		}); err != nil {
 			s.finishProvisionJob(jobID, serverID, server.NodeID, "error", err)
 			return
 		}
@@ -418,7 +473,9 @@ func (s *adminServer) runOnboardNodeJob(jobID, serverID string) {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "error", err)
 		return
 	}
-	if err := s.waitForNodeHeartbeat(ctx, logger, server.NodeID, time.Duration(req.WaitHeartbeatSeconds)*time.Second); err != nil {
+	if err := logger.Step("wait-heartbeat", "wait for fresh node heartbeat", func() error {
+		return s.waitForNodeHeartbeat(ctx, logger, server.NodeID, time.Duration(req.WaitHeartbeatSeconds)*time.Second)
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "heartbeat_pending", err)
 		return
 	}
@@ -439,18 +496,30 @@ func (s *adminServer) runNodeOperationJob(jobID, serverID string) {
 	ctx := context.Background()
 	_ = s.store.StartJob(ctx, jobID)
 	logger := jobLogger{store: s.store, jobID: jobID}
-	job, err := s.store.GetJob(ctx, jobID)
-	if err != nil {
+	var job *dbJob
+	if err := logger.Step("load-job", "load node operation job", func() error {
+		var err error
+		job, err = s.store.GetJob(ctx, jobID)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, "", "error", err)
 		return
 	}
-	server, err := s.store.GetServer(ctx, serverID)
-	if err != nil {
+	var server *dbServer
+	if err := logger.Step("load-server", fmt.Sprintf("load server %s", serverID), func() error {
+		var err error
+		server, err = s.store.GetServer(ctx, serverID)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, "", "error", err)
 		return
 	}
-	runner, err := connectSSH(ctx, *server, logger)
-	if err != nil {
+	var runner *sshRunner
+	if err := logger.Step("ssh-connect", "connect to server over SSH", func() error {
+		var err error
+		runner, err = connectSSH(ctx, *server, logger)
+		return err
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "unreachable", err)
 		return
 	}
@@ -459,11 +528,16 @@ func (s *adminServer) runNodeOperationJob(jobID, serverID string) {
 	if req.DeployDir == "" {
 		req.DeployDir = firstNonEmpty(server.DeployDir, "/root/data/docker_data/glider")
 	}
+	var err error
 	switch job.Type {
 	case jobTypeRestartNode:
-		err = restartNodeOverSSH(ctx, runner, logger, req.DeployDir)
+		err = logger.Step("restart-node", "restart remote node container", func() error {
+			return restartNodeOverSSH(ctx, runner, logger, req.DeployDir)
+		})
 	case jobTypeUpgradeNode:
-		err = upgradeNodeOverSSH(ctx, runner, logger, req.DeployDir, req.Image)
+		err = logger.Step("upgrade-node", "pull new image and recreate remote node", func() error {
+			return upgradeNodeOverSSH(ctx, runner, logger, req.DeployDir, req.Image)
+		})
 	default:
 		err = fmt.Errorf("unsupported node operation %s", job.Type)
 	}
@@ -547,6 +621,33 @@ func (l jobLogger) Log(format string, args ...any) {
 	if l.store != nil && l.jobID != "" {
 		_ = l.store.AppendJobLog(context.Background(), l.jobID, msg)
 	}
+}
+
+func (l jobLogger) Step(name, message string, fn func() error) error {
+	name = strings.TrimSpace(name)
+	if message == "" {
+		message = name
+	}
+	l.Log("step %s started: %s", name, message)
+	if l.store != nil && l.jobID != "" {
+		_ = l.store.StartJobStep(context.Background(), l.jobID, name, message)
+	}
+	err := fn()
+	status := jobStatusSucceeded
+	errText := ""
+	if err != nil {
+		status = jobStatusFailed
+		errText = err.Error()
+	}
+	if l.store != nil && l.jobID != "" {
+		_ = l.store.FinishJobStep(context.Background(), l.jobID, name, status, errText)
+	}
+	if err != nil {
+		l.Log("step %s failed: %s", name, errText)
+		return err
+	}
+	l.Log("step %s succeeded", name)
+	return nil
 }
 
 func connectSSH(ctx context.Context, server dbServer, logger jobLogger) (*sshRunner, error) {
@@ -763,7 +864,10 @@ func deployNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger,
 	confContent := renderNodeGliderConf(certDir)
 
 	logger.Log("creating deploy directory %s", deployDir)
-	if _, err := runner.Run(ctx, "mkdir -p "+shellQuote(deployDir)+"/rules.d "+shellQuote(deployDir)+"/cache "+shellQuote(deployDir)+"/certs"); err != nil {
+	if err := logger.Step("prepare-deploy-dir", "create node deployment directories", func() error {
+		_, err := runner.Run(ctx, "mkdir -p "+shellQuote(deployDir)+"/rules.d "+shellQuote(deployDir)+"/cache "+shellQuote(deployDir)+"/certs")
+		return err
+	}); err != nil {
 		return err
 	}
 	files := []struct {
@@ -775,39 +879,53 @@ func deployNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger,
 		{deployDir + "/compose.yml", composeContent, "644"},
 		{deployDir + "/glider.conf", confContent, "644"},
 	}
-	for _, file := range files {
-		logger.Log("writing %s", file.path)
-		if err := runner.WriteFile(ctx, file.path, file.content, file.perm); err != nil {
-			return err
+	if err := logger.Step("write-node-files", "write node .env, compose, and config", func() error {
+		for _, file := range files {
+			logger.Log("writing %s", file.path)
+			if err := runner.WriteFile(ctx, file.path, file.content, file.perm); err != nil {
+				return err
+			}
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	logger.Log("pulling image %s", req.Image)
-	pullCmd := "cd " + shellQuote(deployDir) + " && docker compose pull"
-	out, err := runner.Run(ctx, pullCmd)
-	if strings.TrimSpace(out) != "" {
-		logger.Log("%s", strings.TrimSpace(out))
-	}
-	if err != nil {
+	var out string
+	if err := logger.Step("pull-image", fmt.Sprintf("pull image %s", req.Image), func() error {
+		pullCmd := "cd " + shellQuote(deployDir) + " && docker compose pull"
+		var err error
+		out, err = runner.Run(ctx, pullCmd)
+		if strings.TrimSpace(out) != "" {
+			logger.Log("%s", strings.TrimSpace(out))
+		}
+		return err
+	}); err != nil {
 		return err
 	}
 	if beforeStart != nil {
-		if err := beforeStart(); err != nil {
+		if err := logger.Step("save-node-token", "save dedicated node token hash before start", beforeStart); err != nil {
 			return err
 		}
 	}
-	cmd := "cd " + shellQuote(deployDir) + " && docker compose up -d"
-	out, err = runner.Run(ctx, cmd)
-	if strings.TrimSpace(out) != "" {
-		logger.Log("%s", strings.TrimSpace(out))
-	}
-	if err != nil {
+	if err := logger.Step("start-node", "start node container", func() error {
+		cmd := "cd " + shellQuote(deployDir) + " && docker compose up -d"
+		var err error
+		out, err = runner.Run(ctx, cmd)
+		if strings.TrimSpace(out) != "" {
+			logger.Log("%s", strings.TrimSpace(out))
+		}
+		return err
+	}); err != nil {
 		return err
 	}
-	out, err = runner.Run(ctx, "cd "+shellQuote(deployDir)+" && docker compose ps")
-	if strings.TrimSpace(out) != "" {
-		logger.Log("%s", strings.TrimSpace(out))
-	}
-	return err
+	return logger.Step("verify-node-container", "inspect node container state", func() error {
+		out, err := runner.Run(ctx, "cd "+shellQuote(deployDir)+" && docker compose ps")
+		if strings.TrimSpace(out) != "" {
+			logger.Log("%s", strings.TrimSpace(out))
+		}
+		return err
+	})
 }
 
 func (s *adminServer) waitForNodeHeartbeat(ctx context.Context, logger jobLogger, nodeID string, timeout time.Duration) error {

@@ -126,12 +126,22 @@ type dbJob struct {
 	FinishedAt *time.Time   `bson:"finished_at,omitempty" json:"finished_at,omitempty"`
 	Error      string       `bson:"error,omitempty" json:"error,omitempty"`
 	Logs       []dbJobLog   `bson:"logs,omitempty" json:"logs,omitempty"`
+	Steps      []dbJobStep  `bson:"steps,omitempty" json:"steps,omitempty"`
 	Request    dbJobRequest `bson:"request,omitempty" json:"request,omitempty"`
 }
 
 type dbJobLog struct {
 	At      time.Time `bson:"at" json:"at"`
 	Message string    `bson:"message" json:"message"`
+}
+
+type dbJobStep struct {
+	Name       string     `bson:"name" json:"name"`
+	Status     string     `bson:"status" json:"status"`
+	StartedAt  *time.Time `bson:"started_at,omitempty" json:"started_at,omitempty"`
+	FinishedAt *time.Time `bson:"finished_at,omitempty" json:"finished_at,omitempty"`
+	Error      string     `bson:"error,omitempty" json:"error,omitempty"`
+	Message    string     `bson:"message,omitempty" json:"message,omitempty"`
 }
 
 type dbJobRequest struct {
@@ -835,6 +845,52 @@ func (s *mongoStore) AppendJobLog(ctx context.Context, jobID, message string) er
 			At:      time.Now().UTC(),
 			Message: message,
 		}},
+	})
+	return err
+}
+
+func (s *mongoStore) StartJobStep(ctx context.Context, jobID, name, message string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	now := time.Now().UTC()
+	step := dbJobStep{
+		Name:      name,
+		Status:    jobStatusRunning,
+		StartedAt: &now,
+		Message:   strings.TrimSpace(message),
+	}
+	_, err := s.db.Collection(jobsCollection).UpdateOne(ctx, bson.M{"job_id": jobID}, bson.M{
+		"$pull": bson.M{"steps": bson.M{"name": name}},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Collection(jobsCollection).UpdateOne(ctx, bson.M{"job_id": jobID}, bson.M{
+		"$push": bson.M{"steps": step},
+	})
+	return err
+}
+
+func (s *mongoStore) FinishJobStep(ctx context.Context, jobID, name, status, errText string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	if strings.TrimSpace(status) == "" {
+		status = jobStatusSucceeded
+	}
+	now := time.Now().UTC()
+	_, err := s.db.Collection(jobsCollection).UpdateOne(ctx, bson.M{
+		"job_id":     jobID,
+		"steps.name": name,
+	}, bson.M{
+		"$set": bson.M{
+			"steps.$.status":      status,
+			"steps.$.finished_at": now,
+			"steps.$.error":       strings.TrimSpace(errText),
+		},
 	})
 	return err
 }

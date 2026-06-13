@@ -4222,6 +4222,7 @@ function renderJobs() {
   }
   wrap.innerHTML = '<table><thead><tr><th>Job</th><th>Status</th><th>Target</th><th>Created</th><th>Finished</th><th>Error</th><th>Logs</th></tr></thead><tbody>' + jobsCache.map(job => {
     const logs = (job.logs || []).slice(-4).map(l => '<div class="compact">' + escapeHTML(formatDate(l.at)) + ' ' + escapeHTML(l.message) + '</div>').join('');
+    const steps = jobStepsSummary(job);
     return '<tr>' +
       '<td><strong>' + escapeHTML(job.type || '-') + '</strong><div class="compact mono">' + escapeHTML(job.job_id || '-') + '</div></td>' +
       '<td>' + statusPill(job.status || 'unknown') + '</td>' +
@@ -4229,10 +4230,21 @@ function renderJobs() {
       '<td>' + escapeHTML(formatDate(job.created_at)) + '</td>' +
       '<td>' + escapeHTML(formatDate(job.finished_at)) + '</td>' +
       '<td>' + escapeHTML(job.error || '-') + '</td>' +
-      '<td>' + (logs || '<span class="compact">-</span>') + '</td>' +
+      '<td>' + steps + (logs || '<span class="compact">-</span>') + '</td>' +
       '</tr>';
   }).join('') + '</tbody></table>';
   renderStats();
+}
+
+function jobStepsSummary(job) {
+  const steps = (job && job.steps) || [];
+  if (!steps.length) return '';
+  return '<div class="job-steps">' + steps.map(step => {
+    const status = step.status || 'unknown';
+    const when = step.finished_at || step.started_at;
+    const err = step.error ? '<div class="compact">' + escapeHTML(step.error) + '</div>' : '';
+    return '<div class="compact">' + statusPill(status) + ' <span class="mono">' + escapeHTML(step.name || '-') + '</span> ' + escapeHTML(formatDate(when)) + err + '</div>';
+  }).join('') + '</div>';
 }
 
 function renderEvents() {
@@ -4475,6 +4487,13 @@ function renderJobDetail(job) {
     'node: ' + escapeHTML(job.node_id || '-')
   ];
   if (job.error) lines.push('error: ' + escapeHTML(job.error));
+  if ((job.steps || []).length) {
+    lines.push('steps:');
+    (job.steps || []).forEach(step => {
+      const err = step.error ? ' error=' + escapeHTML(step.error) : '';
+      lines.push('  ' + escapeHTML(step.status || 'unknown') + ' ' + escapeHTML(step.name || '-') + ' ' + escapeHTML(formatDate(step.finished_at || step.started_at)) + err);
+    });
+  }
   (job.logs || []).forEach(log => lines.push(formatDate(log.at) + ' ' + escapeHTML(log.message)));
   return lines.join('\n');
 }
