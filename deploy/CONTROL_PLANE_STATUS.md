@@ -111,12 +111,12 @@ The current hosts already pull `v2026.06.08-control56` from GHCR. Keep `pull_pol
 
 ## Current Provisioning Rollout
 
-- `ovh-xboard` is running Admin image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision2` from `/root/data/docker_data/glider-admin`.
-- `zgo` is registered in the Admin `servers` collection with `server_id=zgo`, `node_id=zgo`, host `38.49.59.207`, deploy directory `/root/data/docker_data/glider`, image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision2`, and redacted private-key credentials.
+- `ovh-xboard` is running Admin image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision3` from `/root/data/docker_data/glider-admin`.
+- `zgo` is registered in the Admin `servers` collection with `server_id=zgo`, `node_id=zgo`, host `38.49.59.207`, deploy directory `/root/data/docker_data/glider`, image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision3`, and redacted private-key credentials.
 - The Admin-side SSH test job `job-kG4nGtsnzpZ07hQK` succeeded from `ovh-xboard` to `zgo` using the stored server credentials.
-- The Admin-side upgrade job `job-HEYaOnB-KdMc4D7J` succeeded and upgraded `zgo` to image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision2`.
-- After the upgrade, `zgo` reported container `glider` running, compose image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision2`, published ports `443` and `8443`, and no Admin `8444` listener.
+- The Admin-side upgrade job `job-XXxFxGl-B4oRCFe0` succeeded and upgraded `zgo` to image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision3`.
+- After the upgrade, `zgo` reported container `glider` running, compose image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision3`, published ports `443` and `8443`, and no Admin `8444` listener.
 - A proxy check through `zgo` on `127.0.0.1:8443` to `https://ipinfo.io/json` returned exit IP `91.230.73.88` (`AS50131 Spartan Host Ltd`, Dallas, Texas, US), confirming the data plane stayed functional after the Admin-driven upgrade.
-- Admin `/api/servers` now reports `zgo` status `upgraded`, `has_private_key=true`, and `last_deploy_job=job-HEYaOnB-KdMc4D7J`.
+- Admin `/api/servers` now reports `zgo` status `upgraded`, `has_private_key=true`, and `last_deploy_job=job-XXxFxGl-B4oRCFe0`.
 - Admin `/api/nodes` reports `zgo` heartbeat with public IP `38.49.59.207`, config version `d4aa2e1bd01a91de...`, cert version `e3b0c44298fc1c14...`, and no config or certificate sync error.
 - Server `auth_type` now accepts private-key aliases such as `key`, `private-key`, `privatekey`, `ssh_key`, and `ssh-key`, normalizing them to `private_key` for API automation. This is covered by `TestServerAuthTypeAliases`.
