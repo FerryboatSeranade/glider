@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -191,6 +192,12 @@ func TestAdminHTMLSmoke(t *testing.T) {
 		"previewDomainDNS",
 		"renderDNSPlan",
 		"/dns-plan",
+		"Preview Failover",
+		"previewDomainFailover",
+		"runDomainFailover",
+		"renderFailoverPlan",
+		"/failover-plan",
+		"/failover-run",
 		"Preview Cert",
 		"previewDomainCert",
 		"renderCertPlan",
@@ -451,6 +458,39 @@ func TestNodeProxyErrorBlocksFailoverUntilStale(t *testing.T) {
 	decision = evaluateDomainFailover(d, nodes, now)
 	if decision.ShouldSwitch {
 		t.Fatalf("stale proxy error should not trigger failover: %#v", decision)
+	}
+}
+
+func TestFailoverSwitchFailureStateDoesNotLookSwitched(t *testing.T) {
+	now := time.Now().UTC()
+	d := dbDomain{
+		Domain:          "proxy.example.com",
+		Enabled:         true,
+		FailoverEnabled: true,
+		ActiveNodeID:    "active",
+		NodeIDs:         []string{"active", "standby"},
+		FailoverPolicy: domainFailoverPolicy{
+			FailThreshold:   1,
+			CooldownSeconds: 300,
+		},
+	}
+	decision := evaluateDomainFailover(d, map[string]NodeHeartbeat{
+		"active":  {NodeID: "active", UpdatedAt: now.Add(-2 * time.Minute)},
+		"standby": {NodeID: "standby", UpdatedAt: now},
+	}, now)
+	if !decision.ShouldSwitch || decision.State.CooldownUntil == nil || decision.State.LastToNodeID != "standby" {
+		t.Fatalf("expected switch decision with cooldown: %#v", decision)
+	}
+
+	failed := failoverSwitchFailureState(d, decision, fmt.Errorf("cloudflare unavailable"), now)
+	if failed.CooldownUntil != nil || failed.LastSwitchAt != nil || failed.LastToNodeID != "" {
+		t.Fatalf("failed switch state should not look switched: %#v", failed)
+	}
+	if failed.LastError != "failover switch failed: cloudflare unavailable" {
+		t.Fatalf("last error = %q", failed.LastError)
+	}
+	if failed.ActiveFailureCount < 1 {
+		t.Fatalf("failure count should be retained: %#v", failed)
 	}
 }
 

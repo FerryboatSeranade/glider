@@ -960,6 +960,10 @@ func (s *adminServer) handleDomainAction(w http.ResponseWriter, r *http.Request)
 		s.handleDomainSyncDNS(w, r, domain)
 	case action == "dns-plan" && r.Method == http.MethodPost:
 		s.handleDomainDNSPlan(w, r, domain)
+	case action == "failover-plan" && r.Method == http.MethodPost:
+		s.handleDomainFailoverPlan(w, r, domain)
+	case action == "failover-run" && r.Method == http.MethodPost:
+		s.handleDomainFailoverRun(w, r, domain)
 	case action == "issue-cert" && r.Method == http.MethodPost:
 		s.handleDomainIssueCert(w, r, domain)
 	case action == "cert-plan" && r.Method == http.MethodPost:
@@ -1378,6 +1382,213 @@ func validateDomainDNSTarget(d dbDomain, node NodeHeartbeat, now time.Time) erro
 		return fmt.Errorf("node %s has not synced certificate for %s", node.NodeID, d.Domain)
 	}
 	return nil
+}
+
+type failoverPlanResponse struct {
+	Status       string              `json:"status"`
+	Domain       string              `json:"domain"`
+	ActiveNodeID string              `json:"active_node_id,omitempty"`
+	ShouldSwitch bool                `json:"should_switch"`
+	TargetNodeID string              `json:"target_node_id,omitempty"`
+	Reason       string              `json:"reason,omitempty"`
+	StateChanged bool                `json:"state_changed"`
+	State        domainFailoverState `json:"state"`
+	Runtime      domainRuntimeStatus `json:"runtime"`
+	Plan         *cloudflareDNSPlan  `json:"plan,omitempty"`
+	Error        string              `json:"error,omitempty"`
+}
+
+func (s *adminServer) handleDomainFailoverPlan(w http.ResponseWriter, r *http.Request, domain string) {
+	resp, err := s.domainFailoverPlan(r.Context(), domain, true)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *adminServer) handleDomainFailoverRun(w http.ResponseWriter, r *http.Request, domain string) {
+	resp, err := s.runDomainFailoverOnce(r.Context(), domain)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *adminServer) domainFailoverPlan(ctx context.Context, domain string, includeDNSPlan bool) (failoverPlanResponse, error) {
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	d, err := s.store.GetDomain(cctx, domain)
+	if err != nil {
+		return failoverPlanResponse{}, err
+	}
+	nodes, err := s.store.Nodes(cctx)
+	if err != nil {
+		return failoverPlanResponse{}, err
+	}
+	now := time.Now().UTC()
+	nodeMap := nodeMapByID(nodes)
+	decision := evaluateDomainFailover(*d, nodeMap, now)
+	resp := failoverPlanResponse{
+		Status:       "ok",
+		Domain:       d.Domain,
+		ActiveNodeID: d.ActiveNodeID,
+		ShouldSwitch: decision.ShouldSwitch,
+		Reason:       firstNonEmpty(decision.Reason, decision.State.LastError, decision.State.LastReason),
+		StateChanged: decision.StateChanged,
+		State:        decision.State,
+		Runtime:      domainRuntime(*d, nodeMap, now),
+	}
+	if decision.Target.NodeID != "" {
+		resp.TargetNodeID = decision.Target.NodeID
+	}
+	if includeDNSPlan && decision.ShouldSwitch {
+		plan, err := s.domainDNSPlan(cctx, *d, decision.Target.NodeID, true)
+		if err != nil {
+			resp.Error = err.Error()
+		} else {
+			resp.Plan = &plan
+		}
+	}
+	return resp, nil
+}
+
+func (s *adminServer) runDomainFailoverOnce(ctx context.Context, domain string) (failoverPlanResponse, error) {
+	cctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	d, err := s.store.GetDomain(cctx, domain)
+	if err != nil {
+		return failoverPlanResponse{}, err
+	}
+	nodes, err := s.store.Nodes(cctx)
+	if err != nil {
+		return failoverPlanResponse{}, err
+	}
+	now := time.Now().UTC()
+	nodeMap := nodeMapByID(nodes)
+	decision := evaluateDomainFailover(*d, nodeMap, now)
+	resp := failoverPlanResponse{
+		Status:       "ok",
+		Domain:       d.Domain,
+		ActiveNodeID: d.ActiveNodeID,
+		ShouldSwitch: decision.ShouldSwitch,
+		Reason:       firstNonEmpty(decision.Reason, decision.State.LastError, decision.State.LastReason),
+		StateChanged: decision.StateChanged,
+		State:        decision.State,
+		Runtime:      domainRuntime(*d, nodeMap, now),
+	}
+	if decision.Target.NodeID != "" {
+		resp.TargetNodeID = decision.Target.NodeID
+	}
+	if decision.StateChanged && !decision.ShouldSwitch {
+		if err := s.store.UpdateDomainFailoverState(context.Background(), d.Domain, decision.State); err != nil {
+			return resp, err
+		}
+	}
+	if !decision.ShouldSwitch {
+		s.recordEvent(dbEvent{
+			Type:    "domain.failover_checked",
+			Message: "domain failover checked",
+			Domain:  d.Domain,
+			Metadata: map[string]any{
+				"reason":        resp.Reason,
+				"state_changed": decision.StateChanged,
+			},
+		})
+		return resp, nil
+	}
+	settings, err := s.effectiveCloudflareSettings(cctx)
+	if err != nil {
+		return resp, err
+	}
+	target := decision.Target
+	runDomain := *d
+	runDomain.ActiveNodeID = target.NodeID
+	cfConfig, err := syncCloudflareDNSWithToken(cctx, runDomain, target, settings.APIToken)
+	if updateErr := s.store.UpdateDomainCloudflare(context.Background(), d.Domain, cfConfig); updateErr != nil && err == nil {
+		err = updateErr
+	}
+	if err == nil {
+		err = s.store.SwitchDomainActiveNode(context.Background(), d.Domain, target.NodeID, decision.State)
+	}
+	if err != nil {
+		resp.Status = "error"
+		resp.Error = err.Error()
+		failedState := failoverSwitchFailureState(*d, decision, err, time.Now().UTC())
+		resp.State = failedState
+		resp.StateChanged = true
+		_ = s.store.UpdateDomainFailoverState(context.Background(), d.Domain, failedState)
+		s.recordEvent(dbEvent{
+			Type:     "domain.failover_failed",
+			Severity: "error",
+			Message:  "domain failover failed",
+			Domain:   d.Domain,
+			NodeID:   target.NodeID,
+			Metadata: map[string]any{"error": err.Error(), "from_node_id": decision.State.LastFromNodeID, "to_node_id": target.NodeID},
+		})
+		return resp, err
+	}
+	resp.ActiveNodeID = target.NodeID
+	resp.Plan = &cloudflareDNSPlan{
+		Domain:        d.Domain,
+		NodeID:        target.NodeID,
+		NodePublicIP:  target.PublicIP,
+		RecordName:    cfConfig.RecordName,
+		RecordType:    cfConfig.RecordType,
+		TargetContent: target.PublicIP,
+		TTL:           cfConfig.TTL,
+		Proxied:       cfConfig.Proxied,
+		Action:        "synced",
+		ZoneID:        cfConfig.ZoneID,
+		ZoneName:      cfConfig.ZoneName,
+	}
+	s.recordEvent(dbEvent{
+		Type:    "domain.failover_switched",
+		Message: "domain failover switched active node",
+		Domain:  d.Domain,
+		NodeID:  target.NodeID,
+		Metadata: map[string]any{
+			"from_node_id":   decision.State.LastFromNodeID,
+			"to_node_id":     target.NodeID,
+			"reason":         decision.Reason,
+			"cooldown_until": decision.State.CooldownUntil,
+			"record_name":    cfConfig.RecordName,
+			"record_type":    cfConfig.RecordType,
+			"target":         target.PublicIP,
+		},
+	})
+	return resp, nil
+}
+
+func failoverSwitchFailureState(d dbDomain, decision failoverDecision, switchErr error, now time.Time) domainFailoverState {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	state := d.FailoverState
+	if decision.State.LastCheckAt != nil {
+		state.LastCheckAt = decision.State.LastCheckAt
+	} else {
+		state.LastCheckAt = &now
+	}
+	if decision.State.LastFailureAt != nil {
+		state.LastFailureAt = decision.State.LastFailureAt
+	} else {
+		state.LastFailureAt = &now
+	}
+	state.ActiveFailureCount = decision.State.ActiveFailureCount
+	if state.ActiveFailureCount <= 0 {
+		state.ActiveFailureCount = d.FailoverState.ActiveFailureCount
+	}
+	if state.ActiveFailureCount <= 0 {
+		state.ActiveFailureCount = failoverPolicyWithDefaultsForDomain(d).FailThreshold
+	}
+	state.LastReason = firstNonEmpty(decision.State.LastReason, decision.Reason, activeFailureReasonAt(d.ActiveNodeID, NodeHeartbeat{}, now))
+	state.LastError = "failover switch failed"
+	if switchErr != nil {
+		state.LastError += ": " + switchErr.Error()
+	}
+	return state
 }
 
 type certificatePlan struct {
@@ -2362,7 +2573,7 @@ func (s *adminServer) reconcileDomainFailover(ctx context.Context) error {
 			continue
 		}
 		decision := evaluateDomainFailover(d, nodeMap, time.Now().UTC())
-		if decision.StateChanged {
+		if decision.StateChanged && !decision.ShouldSwitch {
 			if err := s.store.UpdateDomainFailoverState(context.Background(), d.Domain, decision.State); err != nil {
 				log.Printf("[admin] save failover state for %s failed: %v", d.Domain, err)
 			}
@@ -2381,6 +2592,10 @@ func (s *adminServer) reconcileDomainFailover(ctx context.Context) error {
 		}
 		if err != nil {
 			log.Printf("[admin] failover %s to %s failed: %v", d.Domain, next.NodeID, err)
+			failedState := failoverSwitchFailureState(d, decision, err, time.Now().UTC())
+			if updateErr := s.store.UpdateDomainFailoverState(context.Background(), d.Domain, failedState); updateErr != nil {
+				log.Printf("[admin] save failover failure state for %s failed: %v", d.Domain, updateErr)
+			}
 			s.recordEvent(dbEvent{
 				Type:     "domain.failover_failed",
 				Severity: "error",
@@ -3702,6 +3917,8 @@ const adminHTML = `<!doctype html>
                   <button class="primary" onclick="saveDomain()">Save Domain</button>
                   <button onclick="previewDomainDNS()">Preview DNS</button>
                   <button onclick="syncDomainDNS()">Sync DNS</button>
+                  <button onclick="previewDomainFailover()">Preview Failover</button>
+                  <button onclick="runDomainFailover()">Run Failover</button>
                   <button onclick="previewDomainCert()">Preview Cert</button>
                   <button onclick="issueDomainCert()">Issue Cert</button>
                   <button onclick="importDomainCert()">Import Cert</button>
@@ -4819,6 +5036,29 @@ function renderDNSPlan(plan, prefix) {
   return lines.join('\n');
 }
 
+function renderFailoverPlan(data, prefix) {
+  data = data || {};
+  const state = data.state || {};
+  const runtime = data.runtime || {};
+  const lines = [
+    (prefix || 'Failover plan'),
+    'status: ' + escapeHTML(data.status || '-'),
+    'domain: ' + escapeHTML(data.domain || '-'),
+    'active node: ' + escapeHTML(data.active_node_id || '-'),
+    'should switch: ' + (data.should_switch ? 'yes' : 'no'),
+    'target node: ' + escapeHTML(data.target_node_id || '-'),
+    'reason: ' + escapeHTML(data.reason || '-'),
+    'state changed: ' + (data.state_changed ? 'yes' : 'no'),
+    'failures: ' + escapeHTML(state.active_failure_count || runtime.failover_failures || 0) + '/' + escapeHTML(runtime.failover_threshold || '-'),
+    'cooldown until: ' + escapeHTML(formatDate(state.cooldown_until || runtime.failover_cooldown_until)),
+    'runtime: ' + escapeHTML(runtime.failover_status || '-')
+  ];
+  if (runtime.failover_blocked_reason) lines.push('blocked: ' + escapeHTML(runtime.failover_blocked_reason));
+  if (data.error) lines.push('error: ' + escapeHTML(data.error));
+  if (data.plan) lines.push('', renderDNSPlan(data.plan, 'DNS switch plan'));
+  return lines.join('\n');
+}
+
 function renderCertPlan(plan, prefix) {
   plan = plan || {};
   const lines = [
@@ -4863,6 +5103,19 @@ async function previewDomainCert() {
     body: JSON.stringify({ email: $('domainACMEEmail').value.trim(), directory_url: $('domainACMEDirectory').value.trim() })
   });
   $('domainResult').innerHTML = renderCertPlan(data.plan, 'Certificate preview');
+}
+
+async function previewDomainFailover() {
+  const domain = $('domainName').value.trim();
+  if (!domain) return;
+  await saveDomain();
+  $('domainResult').textContent = 'Evaluating failover state...';
+  const data = await fetchJSON('/api/domains/' + encodeURIComponent(domain) + '/failover-plan', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'}
+  });
+  $('domainResult').innerHTML = renderFailoverPlan(data, 'Failover preview');
+  await loadDomains();
 }
 
 async function saveCloudflareSettings() {
@@ -4968,6 +5221,20 @@ async function syncDomainDNS() {
   });
   $('domainResult').innerHTML = renderDNSPlan(data.plan, 'DNS synced') + '\nactive node: ' + escapeHTML(data.active_node || '-');
   await loadDomains();
+}
+
+async function runDomainFailover() {
+  const domain = $('domainName').value.trim();
+  if (!domain) return;
+  await saveDomain();
+  $('domainResult').textContent = 'Running failover check...';
+  const data = await fetchJSON('/api/domains/' + encodeURIComponent(domain) + '/failover-run', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'}
+  });
+  $('domainResult').innerHTML = renderFailoverPlan(data, data.should_switch ? 'Failover executed' : 'Failover checked');
+  await loadDomains();
+  await loadEvents();
 }
 
 async function issueDomainCert() {

@@ -623,7 +623,7 @@ Servers and remote provisioning:
 Domains and certificates:
 
 - The Admin panel includes a Domains tab backed by MongoDB. It stores domain name, assigned node IDs, active node, Cloudflare zone/record metadata, DNS sync status, certificate bundle, certificate version, expiry, and renew-before days.
-- Admin exposes `GET /api/domains`, `POST /api/domains`, `GET|PUT|DELETE /api/domains/<domain>`, `POST /api/domains/<domain>/dns-plan`, `POST /api/domains/<domain>/sync-dns`, `POST /api/domains/<domain>/cert-plan`, `POST /api/domains/<domain>/issue-cert`, and `POST /api/domains/<domain>/import-cert`.
+- Admin exposes `GET /api/domains`, `POST /api/domains`, `GET|PUT|DELETE /api/domains/<domain>`, `POST /api/domains/<domain>/dns-plan`, `POST /api/domains/<domain>/sync-dns`, `POST /api/domains/<domain>/failover-plan`, `POST /api/domains/<domain>/failover-run`, `POST /api/domains/<domain>/cert-plan`, `POST /api/domains/<domain>/issue-cert`, and `POST /api/domains/<domain>/import-cert`.
 - `GET /api/domains` and `GET /api/domains/<domain>` include a read-only `runtime` object with DNS status, certificate status, renewal status, days remaining, renewal window, assigned-node certificate sync details, failover readiness, failure count, threshold, and cooldown state.
 - `POST /api/domains/<domain>/dns-plan` builds a read-only Cloudflare DNS plan for the selected node. It shows the zone, record name/type, target node public IP, TTL/proxied flag, existing record content when found, and whether the sync would create, update, or leave the record unchanged.
 - `POST /api/domains/<domain>/sync-dns` updates the Cloudflare DNS record to the active node's `public_ip`. It supports A and AAAA records, with TTL `1` meaning Cloudflare automatic TTL. Leave record type as `Auto` to choose A for IPv4 node IPs and AAAA for IPv6 node IPs.
@@ -706,6 +706,7 @@ Failover behavior:
 - When `auto_failback` is true, the active node is healthy, the primary node has recovered, the primary node is certificate-ready, and the domain is outside cooldown, Admin switches DNS back to the primary node and starts a new cooldown window.
 - Failover candidates must be assigned to the domain, have a fresh heartbeat, pass the latest fresh proxy health state, have a public IP, and, when the domain has a certificate version, report the same unexpired certificate version in heartbeat.
 - On a failover, Admin updates the Cloudflare A/AAAA record to the selected node's heartbeat `public_ip` and records the from-node, to-node, switch time, cooldown, and last reason in `failover_state`.
+- Use `Preview Failover` or `POST /api/domains/<domain>/failover-plan` to evaluate the current state without writing failover state or changing DNS. Use `Run Failover` or `POST /api/domains/<domain>/failover-run` to run the same state machine once immediately; it records state changes and, when the threshold/cooldown/manual-lock rules allow a switch, updates Cloudflare DNS and the active node.
 - The certificate worker checks managed domains every `GLIDER_CERT_RENEW_INTERVAL`. If a certificate is missing or within `renew_before_days`, it renews with ACME DNS-01 and increments the certificate version.
 - Automatic renewal requires a Cloudflare token and ACME email configured either in the Admin panel or through the central `.env` fallback.
 - Cloudflare Load Balancing can also be used if you want Cloudflare-managed health checks instead of DNS-record switching inside Glider.
@@ -720,6 +721,7 @@ Formal deployment flow:
 6. Wait for the node heartbeat to appear in `Nodes`; confirm it is online, has the expected public IP, and is synced to the central `config_version`.
 7. In `Domains`, assign a domain to multiple nodes, choose the active node, issue or import the certificate, wait until assigned nodes report the matching `cert_version`, then run `Sync DNS`.
 8. Enable failover with a threshold and cooldown. Use manual lock when you want DNS pinned during maintenance.
+9. Use `Preview Failover` to confirm the current active node, target candidate, threshold, cooldown, and block reason. Use `Run Failover` for an immediate one-shot check instead of waiting for the next reconcile tick.
 
 Traffic notes:
 
@@ -773,6 +775,7 @@ Test plan:
 - Node proxy health test: publish a working test user, verify Admin stores `proxy_status=ok` with the exit IP/ASN for a reachable node, then break the proxy port and verify a fresh `proxy_status=error` blocks failover until the probe result becomes stale or recovers.
 - Failover debounce test: mark the active node stale and verify no DNS switch happens before `fail_threshold`, then verify the next failed check selects a healthy assigned standby and sets `cooldown_until`.
 - Failover lock test: set `manual_lock=true` and verify automatic failover is blocked even when the active node is unhealthy and a standby is ready.
+- Manual failover API test: call `/api/domains/<domain>/failover-plan` and verify it reports the same state-machine decision as the background worker without changing state; call `/failover-run` and verify it records state changes and only updates DNS when `should_switch=true`.
 
 ## Service
 
