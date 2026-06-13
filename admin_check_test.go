@@ -180,6 +180,10 @@ func TestAdminHTMLSmoke(t *testing.T) {
 		"Token not saved",
 		"addEventListener('keydown'",
 		"Cloudflare DNS",
+		"Onboarding Check",
+		"checkDomainOnboarding",
+		"renderOnboardingCheck",
+		"/onboarding-check",
 		"account token only",
 		"token owner",
 		"Zone test domain",
@@ -471,6 +475,104 @@ func TestNodeProxyErrorBlocksFailoverUntilStale(t *testing.T) {
 	if decision.ShouldSwitch {
 		t.Fatalf("stale proxy error should not trigger failover: %#v", decision)
 	}
+}
+
+func TestDomainOnboardingStaticChecksBlockUnsafeDomain(t *testing.T) {
+	now := time.Now().UTC()
+	d := dbDomain{
+		Domain:          "proxy.example.com",
+		Enabled:         true,
+		FailoverEnabled: true,
+		ActiveNodeID:    "node-a",
+		NodeIDs:         []string{"node-a"},
+	}
+	nodes := map[string]NodeHeartbeat{
+		"node-a": {
+			NodeID:    "node-a",
+			UpdatedAt: now,
+			PublicIP:  "8.8.8.8",
+		},
+	}
+	runtime := domainRuntime(d, nodes, now)
+	checks := domainOnboardingStaticChecks(d, runtime, nodes, cloudflareSettings{}, nil, now)
+	if domainOnboardingReady(checks) {
+		t.Fatalf("unsafe onboarding checks reported ready: %#v", checks)
+	}
+	want := map[string]string{
+		"failover_nodes":      "error",
+		"cloudflare_settings": "warn",
+		"certificate":         "error",
+	}
+	for name, status := range want {
+		check, ok := findOnboardingCheck(checks, name)
+		if !ok {
+			t.Fatalf("missing check %s in %#v", name, checks)
+		}
+		if check.Status != status || !check.Required {
+			t.Fatalf("check %s = %#v, want status %s and required", name, check, status)
+		}
+	}
+}
+
+func TestDomainOnboardingStaticChecksReadyWithSyncedCertAndFailover(t *testing.T) {
+	now := time.Now().UTC()
+	exp := now.Add(30 * 24 * time.Hour)
+	d := dbDomain{
+		Domain:          "proxy.example.com",
+		Enabled:         true,
+		FailoverEnabled: true,
+		ActiveNodeID:    "node-a",
+		NodeIDs:         []string{"node-a", "node-b"},
+		Certificate: domainCertificate{
+			Version:   "cert-v1",
+			ExpiresAt: &exp,
+		},
+	}
+	nodes := map[string]NodeHeartbeat{
+		"node-a": {
+			NodeID:    "node-a",
+			UpdatedAt: now,
+			PublicIP:  "8.8.8.8",
+			CertDomains: []NodeCertState{{
+				Domain:    "proxy.example.com",
+				Version:   "cert-v1",
+				ExpiresAt: &exp,
+			}},
+		},
+		"node-b": {
+			NodeID:    "node-b",
+			UpdatedAt: now,
+			PublicIP:  "1.1.1.1",
+			CertDomains: []NodeCertState{{
+				Domain:    "proxy.example.com",
+				Version:   "cert-v1",
+				ExpiresAt: &exp,
+			}},
+		},
+	}
+	runtime := domainRuntime(d, nodes, now)
+	checks := domainOnboardingStaticChecks(d, runtime, nodes, cloudflareSettings{APIToken: "token", ACMEEmail: "admin@example.com", Source: "database"}, nil, now)
+	if !domainOnboardingReady(checks) {
+		t.Fatalf("ready onboarding checks reported blocked: %#v", checks)
+	}
+	for _, name := range []string{"domain_enabled", "node_assignment", "failover_nodes", "active_node", "cloudflare_settings", "node_active", "node_standby", "certificate"} {
+		check, ok := findOnboardingCheck(checks, name)
+		if !ok {
+			t.Fatalf("missing check %s in %#v", name, checks)
+		}
+		if check.Status != "ok" {
+			t.Fatalf("check %s = %#v, want ok", name, check)
+		}
+	}
+}
+
+func findOnboardingCheck(checks []domainOnboardingCheck, name string) (domainOnboardingCheck, bool) {
+	for _, check := range checks {
+		if check.Name == name {
+			return check, true
+		}
+	}
+	return domainOnboardingCheck{}, false
 }
 
 func TestFailoverSwitchFailureStateDoesNotLookSwitched(t *testing.T) {

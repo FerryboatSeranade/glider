@@ -960,6 +960,8 @@ func (s *adminServer) handleDomainAction(w http.ResponseWriter, r *http.Request)
 		s.handleDomainSyncDNS(w, r, domain)
 	case action == "dns-plan" && r.Method == http.MethodPost:
 		s.handleDomainDNSPlan(w, r, domain)
+	case action == "onboarding-check" && r.Method == http.MethodPost:
+		s.handleDomainOnboardingCheck(w, r, domain)
 	case action == "failover-plan" && r.Method == http.MethodPost:
 		s.handleDomainFailoverPlan(w, r, domain)
 	case action == "failover-run" && r.Method == http.MethodPost:
@@ -1361,6 +1363,405 @@ func (s *adminServer) domainDNSPlan(ctx context.Context, d dbDomain, nodeID stri
 		return cloudflareDNSPlan{}, err
 	}
 	return planCloudflareDNSWithClient(ctx, d, *node, cf, lookupExisting)
+}
+
+type domainOnboardingCheckResponse struct {
+	Status             string                  `json:"status"`
+	Domain             string                  `json:"domain"`
+	Ready              bool                    `json:"ready"`
+	CheckedAt          time.Time               `json:"checked_at"`
+	Summary            string                  `json:"summary"`
+	Checks             []domainOnboardingCheck `json:"checks"`
+	Runtime            domainRuntimeStatus     `json:"runtime"`
+	DNSPlan            *cloudflareDNSPlan      `json:"dns_plan,omitempty"`
+	CertificatePlan    *certificatePlan        `json:"certificate_plan,omitempty"`
+	FailoverPlan       *failoverPlanResponse   `json:"failover_plan,omitempty"`
+	CloudflareSettings cloudflareSettingsState `json:"cloudflare_settings"`
+}
+
+type domainOnboardingCheck struct {
+	Name     string         `json:"name"`
+	Status   string         `json:"status"`
+	Message  string         `json:"message"`
+	Details  map[string]any `json:"details,omitempty"`
+	NodeID   string         `json:"node_id,omitempty"`
+	Required bool           `json:"required"`
+}
+
+type cloudflareSettingsState struct {
+	Configured bool   `json:"configured"`
+	Source     string `json:"source,omitempty"`
+	ACMEEmail  bool   `json:"acme_email"`
+	AccountID  bool   `json:"account_id"`
+}
+
+func (s *adminServer) handleDomainOnboardingCheck(w http.ResponseWriter, r *http.Request, domain string) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	resp, err := s.domainOnboardingCheck(ctx, domain)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *adminServer) domainOnboardingCheck(ctx context.Context, domain string) (domainOnboardingCheckResponse, error) {
+	d, err := s.store.GetDomain(ctx, domain)
+	if err != nil {
+		return domainOnboardingCheckResponse{}, err
+	}
+	nodes, err := s.store.Nodes(ctx)
+	if err != nil {
+		return domainOnboardingCheckResponse{}, err
+	}
+	now := time.Now().UTC()
+	nodeMap := nodeMapByID(nodes)
+	runtime := domainRuntime(*d, nodeMap, now)
+	settings, settingsErr := s.effectiveCloudflareSettings(ctx)
+
+	checks := domainOnboardingStaticChecks(*d, runtime, nodeMap, settings, settingsErr, now)
+	var dnsPlan *cloudflareDNSPlan
+	if settingsErr == nil && strings.TrimSpace(settings.APIToken) != "" && strings.TrimSpace(d.ActiveNodeID) != "" {
+		plan, err := s.domainDNSPlan(ctx, *d, d.ActiveNodeID, true)
+		if err != nil {
+			checks = append(checks, domainOnboardingCheck{
+				Name:     "dns_plan",
+				Status:   "error",
+				Message:  err.Error(),
+				Required: true,
+			})
+		} else {
+			dnsPlan = &plan
+			checks = append(checks, domainOnboardingCheck{
+				Name:     "dns_plan",
+				Status:   "ok",
+				Message:  "Cloudflare DNS plan is ready",
+				Required: true,
+				Details: map[string]any{
+					"action":      plan.Action,
+					"record_name": plan.RecordName,
+					"record_type": plan.RecordType,
+					"target":      plan.TargetContent,
+					"zone":        firstNonEmpty(plan.ZoneName, plan.ZoneID),
+				},
+			})
+		}
+	}
+
+	var certPlan *certificatePlan
+	if settingsErr == nil && strings.TrimSpace(settings.APIToken) != "" && strings.TrimSpace(settings.ACMEEmail) != "" {
+		plan, err := s.domainCertificatePlan(ctx, *d, "", "")
+		if err != nil {
+			checks = append(checks, domainOnboardingCheck{
+				Name:     "certificate_plan",
+				Status:   "warn",
+				Message:  err.Error(),
+				Required: false,
+			})
+		} else {
+			certPlan = &plan
+			checks = append(checks, domainOnboardingCheck{
+				Name:     "certificate_plan",
+				Status:   "ok",
+				Message:  "ACME certificate plan is ready",
+				Required: false,
+				Details: map[string]any{
+					"action":           plan.Action,
+					"renew_status":     plan.RenewStatus,
+					"days_remaining":   plan.DaysRemaining,
+					"challenge_record": plan.ChallengeRecord,
+				},
+			})
+		}
+	}
+
+	failover, err := s.domainFailoverPlan(ctx, d.Domain, false)
+	if err == nil {
+		failoverPlan := failover
+		respFailoverSummary := firstNonEmpty(failover.Reason, runtime.FailoverStatus)
+		checkStatus := "ok"
+		required := false
+		if d.FailoverEnabled {
+			required = len(d.NodeIDs) > 1
+			if runtime.FailoverBlockedReason != "" {
+				checkStatus = "warn"
+			}
+			if failover.Error != "" {
+				checkStatus = "warn"
+				respFailoverSummary = failover.Error
+			}
+		}
+		checks = append(checks, domainOnboardingCheck{
+			Name:     "failover_policy",
+			Status:   checkStatus,
+			Message:  respFailoverSummary,
+			Required: required,
+			Details: map[string]any{
+				"enabled":           d.FailoverEnabled,
+				"manual_lock":       failoverPolicyWithDefaultsForDomain(*d).ManualLock,
+				"fail_threshold":    failoverPolicyWithDefaultsForDomain(*d).FailThreshold,
+				"cooldown_seconds":  failoverPolicyWithDefaultsForDomain(*d).CooldownSeconds,
+				"ready_standby":     runtime.FailoverReadyNodes,
+				"should_switch_now": failover.ShouldSwitch,
+			},
+		})
+		return domainOnboardingResponse(*d, runtime, settings, settingsErr, checks, dnsPlan, certPlan, &failoverPlan, now), nil
+	}
+	checks = append(checks, domainOnboardingCheck{
+		Name:     "failover_policy",
+		Status:   "warn",
+		Message:  err.Error(),
+		Required: false,
+	})
+	return domainOnboardingResponse(*d, runtime, settings, settingsErr, checks, dnsPlan, certPlan, nil, now), nil
+}
+
+func domainOnboardingStaticChecks(d dbDomain, runtime domainRuntimeStatus, nodes map[string]NodeHeartbeat, settings cloudflareSettings, settingsErr error, now time.Time) []domainOnboardingCheck {
+	checks := []domainOnboardingCheck{
+		{
+			Name:     "domain_enabled",
+			Status:   boolCheckStatus(d.Enabled, "ok", "error"),
+			Message:  boolCheckMessage(d.Enabled, "domain is enabled", "domain is disabled"),
+			Required: true,
+		},
+		{
+			Name:     "node_assignment",
+			Status:   boolCheckStatus(len(d.NodeIDs) > 0, "ok", "error"),
+			Message:  fmt.Sprintf("%d node(s) assigned", len(d.NodeIDs)),
+			Required: true,
+			Details:  map[string]any{"node_ids": append([]string(nil), d.NodeIDs...)},
+		},
+		{
+			Name:     "failover_nodes",
+			Status:   boolCheckStatus(!d.FailoverEnabled || len(d.NodeIDs) >= 2, "ok", "error"),
+			Message:  failoverNodesCheckMessage(d),
+			Required: d.FailoverEnabled,
+			Details: map[string]any{
+				"failover_enabled": d.FailoverEnabled,
+				"assigned_nodes":   len(d.NodeIDs),
+			},
+		},
+		{
+			Name:     "active_node",
+			Status:   boolCheckStatus(strings.TrimSpace(d.ActiveNodeID) != "" && domainAssignedToNode(d, d.ActiveNodeID), "ok", "error"),
+			Message:  activeNodeCheckMessage(d),
+			Required: true,
+			NodeID:   d.ActiveNodeID,
+		},
+	}
+	if settingsErr != nil {
+		checks = append(checks, domainOnboardingCheck{
+			Name:     "cloudflare_settings",
+			Status:   "warn",
+			Message:  settingsErr.Error(),
+			Required: true,
+		})
+	} else {
+		checks = append(checks, domainOnboardingCheck{
+			Name:     "cloudflare_settings",
+			Status:   boolCheckStatus(strings.TrimSpace(settings.APIToken) != "", "ok", "warn"),
+			Message:  boolCheckMessage(strings.TrimSpace(settings.APIToken) != "", "Cloudflare token is configured", "Cloudflare token is not configured"),
+			Required: true,
+			Details: map[string]any{
+				"source":     settings.Source,
+				"acme_email": strings.TrimSpace(settings.ACMEEmail) != "",
+				"account_id": strings.TrimSpace(settings.AccountID) != "",
+			},
+		})
+	}
+
+	active := nodes[d.ActiveNodeID]
+	checks = append(checks, nodeDomainReadinessChecks(d, d.ActiveNodeID, active, now, true)...)
+	for _, nodeID := range d.NodeIDs {
+		if nodeID == d.ActiveNodeID {
+			continue
+		}
+		checks = append(checks, nodeDomainReadinessChecks(d, nodeID, nodes[nodeID], now, false)...)
+	}
+
+	checks = append(checks, domainOnboardingCheck{
+		Name:     "certificate",
+		Status:   certificateOnboardingStatus(d, now),
+		Message:  certificateOnboardingMessage(d, runtime, now),
+		Required: true,
+		Details: map[string]any{
+			"version":        shortVersion(d.Certificate.Version),
+			"status":         runtime.CertStatus,
+			"sync_status":    runtime.CertSyncStatus,
+			"days_remaining": runtime.CertDaysRemaining,
+		},
+	})
+	return checks
+}
+
+func nodeDomainReadinessChecks(d dbDomain, nodeID string, node NodeHeartbeat, now time.Time, active bool) []domainOnboardingCheck {
+	role := "standby"
+	required := false
+	if active {
+		role = "active"
+		required = true
+	}
+	reason := nodeFailoverReadinessReason(d, nodeID, node, now)
+	status := "ok"
+	if reason != "ready" {
+		status = "warn"
+		if active {
+			status = "error"
+		}
+	}
+	details := map[string]any{
+		"role":          role,
+		"reason":        reason,
+		"public_ip":     node.PublicIP,
+		"proxy_status":  node.ProxyStatus,
+		"proxy_exit_ip": node.ProxyExitIP,
+		"last_seen_at":  node.UpdatedAt,
+	}
+	if node.ProxyError != "" {
+		details["proxy_error"] = node.ProxyError
+	}
+	if node.Error != "" {
+		details["node_error"] = node.Error
+	}
+	return []domainOnboardingCheck{{
+		Name:     "node_" + role,
+		Status:   status,
+		Message:  fmt.Sprintf("%s node %s: %s", role, firstNonEmpty(nodeID, node.NodeID, "-"), reason),
+		NodeID:   firstNonEmpty(nodeID, node.NodeID),
+		Required: required,
+		Details:  details,
+	}}
+}
+
+func domainOnboardingResponse(d dbDomain, runtime domainRuntimeStatus, settings cloudflareSettings, settingsErr error, checks []domainOnboardingCheck, dnsPlan *cloudflareDNSPlan, certPlan *certificatePlan, failoverPlan *failoverPlanResponse, now time.Time) domainOnboardingCheckResponse {
+	ready := domainOnboardingReady(checks)
+	status := "ready"
+	if !ready {
+		status = "blocked"
+	}
+	settingsState := cloudflareSettingsState{
+		Configured: settingsErr == nil && strings.TrimSpace(settings.APIToken) != "",
+		Source:     settings.Source,
+		ACMEEmail:  settingsErr == nil && strings.TrimSpace(settings.ACMEEmail) != "",
+		AccountID:  settingsErr == nil && strings.TrimSpace(settings.AccountID) != "",
+	}
+	return domainOnboardingCheckResponse{
+		Status:             status,
+		Domain:             d.Domain,
+		Ready:              ready,
+		CheckedAt:          now,
+		Summary:            domainOnboardingSummary(checks),
+		Checks:             checks,
+		Runtime:            runtime,
+		DNSPlan:            dnsPlan,
+		CertificatePlan:    certPlan,
+		FailoverPlan:       failoverPlan,
+		CloudflareSettings: settingsState,
+	}
+}
+
+func domainOnboardingReady(checks []domainOnboardingCheck) bool {
+	for _, check := range checks {
+		if !check.Required {
+			continue
+		}
+		if check.Status == "error" || check.Status == "warn" {
+			return false
+		}
+	}
+	return true
+}
+
+func domainOnboardingSummary(checks []domainOnboardingCheck) string {
+	errorsCount := 0
+	warningsCount := 0
+	for _, check := range checks {
+		switch check.Status {
+		case "error":
+			errorsCount++
+		case "warn":
+			warningsCount++
+		}
+	}
+	if errorsCount == 0 && warningsCount == 0 {
+		return "ready"
+	}
+	return fmt.Sprintf("%d error(s), %d warning(s)", errorsCount, warningsCount)
+}
+
+func boolCheckStatus(ok bool, okStatus, badStatus string) string {
+	if ok {
+		return okStatus
+	}
+	return badStatus
+}
+
+func boolCheckMessage(ok bool, okMessage, badMessage string) string {
+	if ok {
+		return okMessage
+	}
+	return badMessage
+}
+
+func activeNodeCheckMessage(d dbDomain) string {
+	if strings.TrimSpace(d.ActiveNodeID) == "" {
+		return "active node is not selected"
+	}
+	if !domainAssignedToNode(d, d.ActiveNodeID) {
+		return "active node is not assigned to the domain"
+	}
+	return "active node is assigned"
+}
+
+func failoverNodesCheckMessage(d dbDomain) string {
+	if !d.FailoverEnabled {
+		return "failover is disabled"
+	}
+	if len(d.NodeIDs) < 2 {
+		return "failover requires at least two assigned nodes"
+	}
+	return "failover has at least two assigned nodes"
+}
+
+func certificateOnboardingStatus(d dbDomain, now time.Time) string {
+	if strings.TrimSpace(d.Certificate.LastError) != "" {
+		return "warn"
+	}
+	if strings.TrimSpace(d.Certificate.Version) == "" {
+		return "error"
+	}
+	if d.Certificate.ExpiresAt == nil {
+		return "error"
+	}
+	if d.Certificate.ExpiresAt != nil && !d.Certificate.ExpiresAt.After(now) {
+		return "error"
+	}
+	return "ok"
+}
+
+func certificateOnboardingMessage(d dbDomain, runtime domainRuntimeStatus, now time.Time) string {
+	if strings.TrimSpace(d.Certificate.LastError) != "" {
+		return "certificate error: " + d.Certificate.LastError
+	}
+	if strings.TrimSpace(d.Certificate.Version) == "" {
+		return "certificate has not been issued or imported"
+	}
+	if d.Certificate.ExpiresAt == nil {
+		return "certificate expiry is missing"
+	}
+	if d.Certificate.ExpiresAt != nil && !d.Certificate.ExpiresAt.After(now) {
+		return "certificate is expired"
+	}
+	return runtime.CertSyncStatus
+}
+
+func shortVersion(version string) string {
+	version = strings.TrimSpace(version)
+	if len(version) <= 12 {
+		return version
+	}
+	return version[:12]
 }
 
 func validateDomainDNSTarget(d dbDomain, node NodeHeartbeat, now time.Time) error {
@@ -4056,6 +4457,7 @@ const adminHTML = `<!doctype html>
                 </div>
                 <div class="actions">
                   <button class="primary" onclick="saveDomain()">Save Domain</button>
+                  <button onclick="checkDomainOnboarding()">Onboarding Check</button>
                   <button onclick="previewDomainDNS()">Preview DNS</button>
                   <button onclick="syncDomainDNS()">Sync DNS</button>
                   <button onclick="previewDomainFailover()">Preview Failover</button>
@@ -5288,6 +5690,52 @@ function renderCertPlan(plan, prefix) {
     'assigned nodes: ' + escapeHTML((plan.node_ids || []).join(', ') || '-')
   ];
   return lines.join('\n');
+}
+
+function renderOnboardingCheck(data) {
+  data = data || {};
+  const lines = [
+    'Domain onboarding check',
+    'status: ' + escapeHTML(data.status || '-'),
+    'ready: ' + (data.ready ? 'yes' : 'no'),
+    'summary: ' + escapeHTML(data.summary || '-'),
+    'checked: ' + escapeHTML(formatDate(data.checked_at))
+  ];
+  const settings = data.cloudflare_settings || {};
+  lines.push('cloudflare: ' + (settings.configured ? 'configured' : 'not configured') + ' / source ' + escapeHTML(settings.source || '-'));
+  lines.push('');
+  lines.push('checks:');
+  (data.checks || []).forEach(check => {
+    const req = check.required ? ' required' : ' optional';
+    const node = check.node_id ? ' node=' + check.node_id : '';
+    lines.push('  - [' + escapeHTML(check.status || '-') + req + '] ' + escapeHTML(check.name || '-') + node + ': ' + escapeHTML(check.message || '-'));
+  });
+  if (data.dns_plan) {
+    lines.push('');
+    lines.push(renderDNSPlan(data.dns_plan, 'DNS plan'));
+  }
+  if (data.certificate_plan) {
+    lines.push('');
+    lines.push(renderCertPlan(data.certificate_plan, 'Certificate plan'));
+  }
+  if (data.failover_plan) {
+    lines.push('');
+    lines.push(renderFailoverPlan(data.failover_plan, 'Failover plan'));
+  }
+  return lines.join('\n');
+}
+
+async function checkDomainOnboarding() {
+  const domain = $('domainName').value.trim();
+  if (!domain) return;
+  await saveDomain();
+  $('domainResult').textContent = 'Checking domain onboarding readiness...';
+  const data = await fetchJSON('/api/domains/' + encodeURIComponent(domain) + '/onboarding-check', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'}
+  });
+  $('domainResult').innerHTML = renderOnboardingCheck(data);
+  await loadDomains();
 }
 
 async function previewDomainDNS() {
