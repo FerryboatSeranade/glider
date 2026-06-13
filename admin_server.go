@@ -2139,6 +2139,23 @@ func (s *adminServer) handleServerAction(w http.ResponseWriter, r *http.Request)
 			Metadata: map[string]any{"image": job.Request.Image},
 		})
 		writeJSON(w, http.StatusAccepted, job)
+	case action == "rollback-node" && r.Method == http.MethodPost:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		job, err := s.createNodeOperationJob(ctx, serverID, jobTypeRollbackNode, nodeOperationPayload{})
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.recordEvent(dbEvent{
+			Type:     "server.rollback_queued",
+			Message:  "node rollback queued",
+			ServerID: serverID,
+			NodeID:   job.NodeID,
+			JobID:    job.JobID,
+			Metadata: map[string]any{"image": job.Request.Image},
+		})
+		writeJSON(w, http.StatusAccepted, job)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -3860,6 +3877,7 @@ const adminHTML = `<!doctype html>
 	                  <button onclick="deployServerNode()">Deploy Node</button>
 	                  <button onclick="restartServerNode()">Restart Node</button>
 	                  <button onclick="upgradeServerNode()">Upgrade Node</button>
+	                  <button onclick="rollbackServerNode()">Rollback Node</button>
 	                  <button class="danger" onclick="deleteServer()">Delete</button>
 	                </div>
 	                <div id="serverResult" class="result">Save a server, test SSH, then deploy node mode.</div>
@@ -4431,7 +4449,7 @@ function renderServers() {
 
 function serverStatusTone(status) {
   status = String(status || '').toLowerCase();
-  if (status === 'ssh_ok' || status === 'preflight_ok' || status === 'inspect_ok' || status === 'deployed' || status === 'onboarded' || status === 'restarted' || status === 'upgraded') return 'ok';
+  if (status === 'ssh_ok' || status === 'preflight_ok' || status === 'inspect_ok' || status === 'deployed' || status === 'onboarded' || status === 'restarted' || status === 'upgraded' || status === 'rolled_back') return 'ok';
   if (status === 'heartbeat_pending') return 'warn';
   if (status === 'unreachable' || status === 'preflight_failed' || status === 'inspect_failed' || status === 'container_missing' || status === 'error') return 'error';
   if (status.startsWith('container_')) return 'warn';
@@ -4550,6 +4568,7 @@ function renderServerResult(s) {
     'node id: ' + escapeHTML(s.node_id || '-'),
     'deploy dir: ' + escapeHTML(s.deploy_dir || '-'),
     'image: ' + escapeHTML(s.image || '-'),
+    'previous image: ' + escapeHTML(s.previous_image || '-'),
     'credentials: password ' + (s.has_password ? 'yes' : 'no') + ', private key ' + (s.has_private_key ? 'yes' : 'no'),
     'status: ' + escapeHTML(s.status || '-'),
     'last ssh test: ' + escapeHTML(formatDate(s.last_test_at)),
@@ -4731,6 +4750,15 @@ async function upgradeServerNode() {
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ image })
   });
+  await pollJob(job.job_id, 'serverResult');
+  await Promise.all([loadServers(), loadJobs(), loadEvents(), loadNodes()]);
+}
+
+async function rollbackServerNode() {
+  const serverID = $('serverID').value.trim();
+  if (!serverID) return;
+  $('serverResult').textContent = 'Queued node rollback...';
+  const job = await fetchJSON('/api/servers/' + encodeURIComponent(serverID) + '/rollback-node', { method: 'POST' });
   await pollJob(job.job_id, 'serverResult');
   await Promise.all([loadServers(), loadJobs(), loadEvents(), loadNodes()]);
 }

@@ -187,6 +187,17 @@ func TestParseInspectNodeOutput(t *testing.T) {
 	}
 }
 
+func TestParseInspectNodeOutputFallsBackToConfigMode(t *testing.T) {
+	values := parseKeyValueLines("CONFIG_MODE=node\nGLIDER_NODE_ID=zgo\n")
+	snap := serverRuntimeSnapshot{Mode: values["GLIDER_MODE"]}
+	if snap.Mode == "" {
+		snap.Mode = values["CONFIG_MODE"]
+	}
+	if snap.Mode != "node" {
+		t.Fatalf("mode fallback = %q, want node", snap.Mode)
+	}
+}
+
 func TestSanitizeInspectLogRemovesNodeToken(t *testing.T) {
 	out := sanitizeInspectLog("GLIDER_MODE=node\nGLIDER_NODE_TOKEN=secret\nGLIDER_NODE_ID=zgo\n")
 	if strings.Contains(out, "GLIDER_NODE_TOKEN") || strings.Contains(out, "secret") {

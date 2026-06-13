@@ -88,6 +88,7 @@ type dbServer struct {
 	Passphrase     string                `bson:"passphrase,omitempty" json:"-"`
 	DeployDir      string                `bson:"deploy_dir,omitempty" json:"deploy_dir,omitempty"`
 	Image          string                `bson:"image,omitempty" json:"image,omitempty"`
+	PreviousImage  string                `bson:"previous_image,omitempty" json:"previous_image,omitempty"`
 	ProxyPorts     []string              `bson:"proxy_ports,omitempty" json:"proxy_ports,omitempty"`
 	CertHostPath   string                `bson:"cert_host_path,omitempty" json:"cert_host_path,omitempty"`
 	TrafficIface   string                `bson:"traffic_iface,omitempty" json:"traffic_iface,omitempty"`
@@ -829,6 +830,20 @@ func (s *mongoStore) UpdateServerRuntime(ctx context.Context, serverID string, r
 	}
 	if strings.TrimSpace(status) != "" {
 		set["status"] = strings.TrimSpace(status)
+	}
+	_, err := s.db.Collection(serversCollection).UpdateOne(ctx, bson.M{"server_id": serverID}, bson.M{"$set": set})
+	return err
+}
+
+func (s *mongoStore) UpdateServerImages(ctx context.Context, serverID, image, previousImage string) error {
+	set := bson.M{
+		"updated_at": time.Now().UTC(),
+	}
+	if strings.TrimSpace(image) != "" {
+		set["image"] = strings.TrimSpace(image)
+	}
+	if strings.TrimSpace(previousImage) != "" {
+		set["previous_image"] = strings.TrimSpace(previousImage)
 	}
 	_, err := s.db.Collection(serversCollection).UpdateOne(ctx, bson.M{"server_id": serverID}, bson.M{"$set": set})
 	return err

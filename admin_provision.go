@@ -19,13 +19,14 @@ import (
 )
 
 const (
-	jobTypeSSHTest     = "ssh_test"
-	jobTypePreflight   = "preflight_node"
-	jobTypeInspectNode = "inspect_node"
-	jobTypeDeployNode  = "deploy_node"
-	jobTypeOnboardNode = "onboard_node"
-	jobTypeRestartNode = "restart_node"
-	jobTypeUpgradeNode = "upgrade_node"
+	jobTypeSSHTest      = "ssh_test"
+	jobTypePreflight    = "preflight_node"
+	jobTypeInspectNode  = "inspect_node"
+	jobTypeDeployNode   = "deploy_node"
+	jobTypeOnboardNode  = "onboard_node"
+	jobTypeRestartNode  = "restart_node"
+	jobTypeUpgradeNode  = "upgrade_node"
+	jobTypeRollbackNode = "rollback_node"
 
 	jobStatusQueued    = "queued"
 	jobStatusRunning   = "running"
@@ -196,6 +197,12 @@ func (s *adminServer) createNodeOperationJob(ctx context.Context, serverID, jobT
 	}
 	if jobType == jobTypeUpgradeNode && strings.TrimSpace(req.Image) == "" {
 		return dbJob{}, fmt.Errorf("image required")
+	}
+	if jobType == jobTypeRollbackNode {
+		req.Image = strings.TrimSpace(server.PreviousImage)
+		if req.Image == "" {
+			return dbJob{}, fmt.Errorf("previous_image required")
+		}
 	}
 	job := newJob(jobType, serverID, server.NodeID, req)
 	if err := s.store.CreateJob(ctx, job); err != nil {
@@ -628,6 +635,10 @@ func (s *adminServer) runNodeOperationJob(jobID, serverID string) {
 		err = logger.Step("upgrade-node", "pull new image and recreate remote node", func() error {
 			return upgradeNodeOverSSH(ctx, runner, logger, req.DeployDir, req.Image)
 		})
+	case jobTypeRollbackNode:
+		err = logger.Step("rollback-node", "restore previous image and recreate remote node", func() error {
+			return upgradeNodeOverSSH(ctx, runner, logger, req.DeployDir, req.Image)
+		})
 	default:
 		err = fmt.Errorf("unsupported node operation %s", job.Type)
 	}
@@ -641,21 +652,12 @@ func (s *adminServer) runNodeOperationJob(jobID, serverID string) {
 	if job.Type == jobTypeUpgradeNode {
 		status = "upgraded"
 		eventType = "server.upgrade_succeeded"
-		_ = s.store.UpsertServer(context.Background(), dbServer{
-			ServerID:     server.ServerID,
-			Name:         server.Name,
-			NodeID:       server.NodeID,
-			Host:         server.Host,
-			SSHPort:      server.SSHPort,
-			SSHUser:      server.SSHUser,
-			AuthType:     server.AuthType,
-			DeployDir:    server.DeployDir,
-			Image:        req.Image,
-			ProxyPorts:   server.ProxyPorts,
-			CertHostPath: server.CertHostPath,
-			TrafficIface: server.TrafficIface,
-			CreatedAt:    server.CreatedAt,
-		}, serverSecretUpdate{})
+		_ = s.store.UpdateServerImages(context.Background(), serverID, req.Image, server.Image)
+	}
+	if job.Type == jobTypeRollbackNode {
+		status = "rolled_back"
+		eventType = "server.rollback_succeeded"
+		_ = s.store.UpdateServerImages(context.Background(), serverID, req.Image, server.Image)
 	}
 	_ = s.store.UpdateServerStatus(context.Background(), serverID, status, "", nil, &now, jobID)
 	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
@@ -941,6 +943,7 @@ func inspectNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger
 		"docker inspect glider --format 'container_started={{.State.StartedAt}}' 2>/dev/null || printf 'container_started=\\n'",
 		"docker port glider 2>/dev/null | tr '\\n' ';' | sed 's/^/container_ports=/; s/;$//'",
 		"if test -f " + shellQuote(deployDir+"/.env") + "; then awk -F= '/^GLIDER_(MODE|NODE_ID|CENTRAL_URL|SYNC_INTERVAL|TRAFFIC_INTERFACE|CACHE_DIR|CERT_DIR)=/ {print $1\"=\"$2}' " + shellQuote(deployDir+"/.env") + "; fi",
+		"if test -f " + shellQuote(deployDir+"/glider.conf") + "; then awk -F= '/^[[:space:]]*mode[[:space:]]*=/ {gsub(/[[:space:]]/, \"\", $1); sub(/^[[:space:]]*/, \"\", $2); print \"CONFIG_MODE=\"$2; exit}' " + shellQuote(deployDir+"/glider.conf") + "; fi",
 		"printf 'disk=%s\\n' \"$(df -h " + shellQuote(deployDir) + " 2>/dev/null | tail -n 1 || df -h / 2>/dev/null | tail -n 1)\"",
 		"printf 'memory=%s\\n' \"$(free -m 2>/dev/null | awk 'NR==2{print $2\"MB total, \"$7\"MB available\"}')\"",
 	}, "\n")
@@ -965,6 +968,9 @@ func inspectNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger
 	snap.ContainerStarted = values["container_started"]
 	snap.ContainerPorts = values["container_ports"]
 	snap.Mode = values["GLIDER_MODE"]
+	if snap.Mode == "" {
+		snap.Mode = values["CONFIG_MODE"]
+	}
 	snap.RuntimeNodeID = values["GLIDER_NODE_ID"]
 	snap.CentralURL = values["GLIDER_CENTRAL_URL"]
 	snap.SyncInterval = values["GLIDER_SYNC_INTERVAL"]
