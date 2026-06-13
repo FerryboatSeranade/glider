@@ -12,7 +12,7 @@ This file tracks the current central-admin plus node deployment state used durin
 
 The tag above is now published to GHCR and both remote compose files pull it from the registry. The earlier `docker save | ssh docker load` bootstrap path has been retired for the current hosts, and `pull_policy: never` was removed from both remote compose files.
 
-The current tag was published by GitHub Actions run `27459247351` on 2026-06-13. Tests, deploy-script tests, and the multi-architecture Docker build/push completed successfully; the Release step was still running during rollout verification. `docker manifest inspect ghcr.io/ferryboatseranade/glider:v2026.06.13-faildiag1` shows amd64 and arm64 images under digest `sha256:6a8db88e866ae73e0e0c712b9ecb730b1814376bf3eed5282f3fa4b9edb330d0`.
+The current tag was published by GitHub Actions run `27459247351` on 2026-06-13. Tests, deploy-script tests, multi-architecture Docker build/push, and Release all completed successfully. `docker manifest inspect ghcr.io/ferryboatseranade/glider:v2026.06.13-faildiag1` shows amd64 and arm64 images under digest `sha256:6a8db88e866ae73e0e0c712b9ecb730b1814376bf3eed5282f3fa4b9edb330d0`.
 
 The earlier baseline tag `v2026.06.08-control56` was published by GitHub Actions run `27106664483`, which completed successfully on 2026-06-08. Remote `docker manifest inspect ghcr.io/ferryboatseranade/glider:v2026.06.08-control56` showed a multi-architecture OCI index.
 
@@ -113,7 +113,7 @@ The current hosts already pull `v2026.06.13-faildiag1` from GHCR. Keep `pull_pol
 
 ## Current Provisioning Rollout
 
-- GitHub Actions run `27456616394` completed successfully for `v2026.06.13-onboard3`; tests, deploy-script tests, multi-arch Docker publish, and Release all passed. GitHub Actions run `27458777348` published `ghcr.io/ferryboatseranade/glider:v2026.06.13-rollback1` for amd64 and arm64. GitHub Actions run `27459247351` has completed tests, deploy-script tests, and multi-arch Docker publish for `v2026.06.13-faildiag1`; its Release step was still running during rollout verification, but GHCR already published `ghcr.io/ferryboatseranade/glider:v2026.06.13-faildiag1` for amd64 and arm64.
+- GitHub Actions run `27456616394` completed successfully for `v2026.06.13-onboard3`; tests, deploy-script tests, multi-arch Docker publish, and Release all passed. GitHub Actions run `27458777348` published `ghcr.io/ferryboatseranade/glider:v2026.06.13-rollback1` for amd64 and arm64. GitHub Actions run `27459247351` completed successfully for `v2026.06.13-faildiag1`; tests, deploy-script tests, multi-arch Docker publish, and Release all passed.
 - `ovh-xboard` is running Admin image `ghcr.io/ferryboatseranade/glider:v2026.06.13-faildiag1` from `/root/data/docker_data/glider-admin`; the container started at `2026-06-13T06:44:59Z`.
 - `zgo` is registered in the Admin `servers` collection with `server_id=zgo`, `node_id=zgo`, host `38.49.59.207`, deploy directory `/root/data/docker_data/glider`, and redacted private-key credentials. The remote compose deployment now runs image `ghcr.io/ferryboatseranade/glider:v2026.06.13-faildiag1`; the container started at `2026-06-13T06:45:00Z`.
 - The Admin-side SSH test job `job-kG4nGtsnzpZ07hQK` succeeded from `ovh-xboard` to `zgo` using the stored server credentials.
