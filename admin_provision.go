@@ -826,7 +826,7 @@ func (s *adminServer) waitForNodeHeartbeat(ctx context.Context, logger jobLogger
 		cctx, cancel := withTimeout(ctx)
 		node, err := s.store.GetNode(cctx, nodeID)
 		cancel()
-		if err == nil && nodeHealthyAt(*node, time.Now().UTC()) {
+		if err == nil && nodeHeartbeatFresh(*node, time.Now().UTC()) {
 			logger.Log("node %s heartbeat received from %s with config %s", nodeID, firstNonEmpty(node.PublicIP, node.Hostname, "-"), shortLogVersion(node.ConfigVersion))
 			return nil
 		}
