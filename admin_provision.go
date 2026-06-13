@@ -21,6 +21,7 @@ import (
 const (
 	jobTypeSSHTest     = "ssh_test"
 	jobTypePreflight   = "preflight_node"
+	jobTypeInspectNode = "inspect_node"
 	jobTypeDeployNode  = "deploy_node"
 	jobTypeOnboardNode = "onboard_node"
 	jobTypeRestartNode = "restart_node"
@@ -96,6 +97,24 @@ func (s *adminServer) createPreflightNodeJob(ctx context.Context, serverID strin
 		return dbJob{}, err
 	}
 	go s.runPreflightNodeJob(job.JobID, serverID)
+	return job, nil
+}
+
+func (s *adminServer) createInspectNodeJob(ctx context.Context, serverID string) (dbJob, error) {
+	server, err := s.store.GetServer(ctx, serverID)
+	if err != nil {
+		return dbJob{}, err
+	}
+	req := dbJobRequest{
+		Image:      firstNonEmpty(server.Image, "ghcr.io/ferryboatseranade/glider:latest"),
+		DeployDir:  firstNonEmpty(server.DeployDir, "/root/data/docker_data/glider"),
+		ProxyPorts: normalizeStringList(firstNonEmptySlice(server.ProxyPorts, []string{"443:443", "8443:8443"})),
+	}
+	job := newJob(jobTypeInspectNode, serverID, server.NodeID, req)
+	if err := s.store.CreateJob(ctx, job); err != nil {
+		return dbJob{}, err
+	}
+	go s.runInspectNodeJob(job.JobID, serverID)
 	return job, nil
 }
 
@@ -257,6 +276,77 @@ func (s *adminServer) runSSHTestJob(jobID, serverID string) {
 		ServerID: serverID,
 		NodeID:   server.NodeID,
 		JobID:    jobID,
+	})
+}
+
+func (s *adminServer) runInspectNodeJob(jobID, serverID string) {
+	ctx := context.Background()
+	_ = s.store.StartJob(ctx, jobID)
+	logger := jobLogger{store: s.store, jobID: jobID}
+	var job *dbJob
+	if err := logger.Step("load-job", "load inspect job", func() error {
+		var err error
+		job, err = s.store.GetJob(ctx, jobID)
+		return err
+	}); err != nil {
+		s.finishProvisionJob(jobID, serverID, "", "error", err)
+		return
+	}
+	var server *dbServer
+	if err := logger.Step("load-server", fmt.Sprintf("load server %s", serverID), func() error {
+		var err error
+		server, err = s.store.GetServer(ctx, serverID)
+		return err
+	}); err != nil {
+		s.finishProvisionJob(jobID, serverID, "", "error", err)
+		return
+	}
+	var runner *sshRunner
+	if err := logger.Step("ssh-connect", "connect to server over SSH", func() error {
+		var err error
+		runner, err = connectSSH(ctx, *server, logger)
+		return err
+	}); err != nil {
+		s.finishProvisionJob(jobID, serverID, server.NodeID, "unreachable", err)
+		return
+	}
+	defer runner.Close()
+	req := job.Request
+	if req.DeployDir == "" {
+		req.DeployDir = firstNonEmpty(server.DeployDir, "/root/data/docker_data/glider")
+	}
+	if len(req.ProxyPorts) == 0 {
+		req.ProxyPorts = firstNonEmptySlice(server.ProxyPorts, []string{"443:443", "8443:8443"})
+	}
+	var runtime serverRuntimeSnapshot
+	if err := logger.Step("inspect-node", "inspect remote node runtime", func() error {
+		var err error
+		runtime, err = inspectNodeOverSSH(ctx, runner, logger, *server, req)
+		return err
+	}); err != nil {
+		s.finishProvisionJob(jobID, serverID, server.NodeID, "inspect_failed", err)
+		return
+	}
+	status := "inspect_ok"
+	if runtime.ContainerStatus == "" || runtime.ContainerStatus == "missing" {
+		status = "container_missing"
+	} else if runtime.ContainerStatus != "running" {
+		status = "container_" + strings.ReplaceAll(runtime.ContainerStatus, " ", "_")
+	}
+	_ = s.store.UpdateServerRuntime(context.Background(), serverID, runtime, status, "", jobID)
+	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
+	s.recordEvent(dbEvent{
+		Type:     "server.inspect_succeeded",
+		Message:  "node runtime inspected",
+		ServerID: serverID,
+		NodeID:   server.NodeID,
+		JobID:    jobID,
+		Metadata: map[string]any{
+			"deploy_dir":       runtime.DeployDir,
+			"container_status": runtime.ContainerStatus,
+			"compose_image":    runtime.ComposeImage,
+			"runtime_node_id":  runtime.RuntimeNodeID,
+		},
 	})
 }
 
@@ -827,6 +917,134 @@ func preflightNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogg
 		}
 	}
 	return nil
+}
+
+func inspectNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger, server dbServer, req dbJobRequest) (serverRuntimeSnapshot, error) {
+	deployDir := firstNonEmpty(req.DeployDir, server.DeployDir, "/root/data/docker_data/glider")
+	now := time.Now().UTC()
+	snap := serverRuntimeSnapshot{
+		InspectedAt: &now,
+		DeployDir:   deployDir,
+	}
+	cmd := strings.Join([]string{
+		"set +e",
+		"printf 'hostname=%s\\n' \"$(hostname 2>/dev/null)\"",
+		"printf 'ssh_user=%s\\n' \"$(id -un 2>/dev/null)\"",
+		"printf 'kernel=%s\\n' \"$(uname -sr 2>/dev/null)\"",
+		"printf 'docker_version=%s\\n' \"$(docker --version 2>/dev/null || printf missing)\"",
+		"printf 'compose_version=%s\\n' \"$(docker compose version 2>/dev/null || printf missing)\"",
+		"if test -d " + shellQuote(deployDir) + "; then printf 'deploy_dir_exists=true\\n'; else printf 'deploy_dir_exists=false\\n'; fi",
+		"if test -f " + shellQuote(deployDir+"/compose.yml") + "; then printf 'compose_file_exists=true\\n'; else printf 'compose_file_exists=false\\n'; fi",
+		"if test -f " + shellQuote(deployDir+"/compose.yml") + "; then awk 'BEGIN{found=0} /^[[:space:]]*image:[[:space:]]*/ && found==0 {sub(/^[[:space:]]*image:[[:space:]]*/, \"\"); print \"compose_image=\"$0; found=1}' " + shellQuote(deployDir+"/compose.yml") + "; fi",
+		"docker inspect glider --format 'container_image={{.Config.Image}}' 2>/dev/null || printf 'container_image=missing\\n'",
+		"docker inspect glider --format 'container_status={{.State.Status}}' 2>/dev/null || printf 'container_status=missing\\n'",
+		"docker inspect glider --format 'container_started={{.State.StartedAt}}' 2>/dev/null || printf 'container_started=\\n'",
+		"docker port glider 2>/dev/null | tr '\\n' ';' | sed 's/^/container_ports=/; s/;$//'",
+		"if test -f " + shellQuote(deployDir+"/.env") + "; then awk -F= '/^GLIDER_(MODE|NODE_ID|CENTRAL_URL|SYNC_INTERVAL|TRAFFIC_INTERFACE|CACHE_DIR|CERT_DIR)=/ {print $1\"=\"$2}' " + shellQuote(deployDir+"/.env") + "; fi",
+		"printf 'disk=%s\\n' \"$(df -h " + shellQuote(deployDir) + " 2>/dev/null | tail -n 1 || df -h / 2>/dev/null | tail -n 1)\"",
+		"printf 'memory=%s\\n' \"$(free -m 2>/dev/null | awk 'NR==2{print $2\"MB total, \"$7\"MB available\"}')\"",
+	}, "\n")
+	out, err := runner.Run(ctx, cmd)
+	if strings.TrimSpace(out) != "" {
+		logger.Log("%s", sanitizeInspectLog(out))
+	}
+	if err != nil {
+		return snap, err
+	}
+	values := parseKeyValueLines(out)
+	snap.Hostname = values["hostname"]
+	snap.SSHUser = values["ssh_user"]
+	snap.Kernel = values["kernel"]
+	snap.DockerVersion = values["docker_version"]
+	snap.ComposeVersion = values["compose_version"]
+	snap.DeployDirExists = parseBoolString(values["deploy_dir_exists"])
+	snap.ComposeFileExists = parseBoolString(values["compose_file_exists"])
+	snap.ComposeImage = values["compose_image"]
+	snap.ContainerImage = values["container_image"]
+	snap.ContainerStatus = values["container_status"]
+	snap.ContainerStarted = values["container_started"]
+	snap.ContainerPorts = values["container_ports"]
+	snap.Mode = values["GLIDER_MODE"]
+	snap.RuntimeNodeID = values["GLIDER_NODE_ID"]
+	snap.CentralURL = values["GLIDER_CENTRAL_URL"]
+	snap.SyncInterval = values["GLIDER_SYNC_INTERVAL"]
+	snap.TrafficIface = values["GLIDER_TRAFFIC_INTERFACE"]
+	snap.CacheDir = values["GLIDER_CACHE_DIR"]
+	snap.CertDir = values["GLIDER_CERT_DIR"]
+	snap.Disk = values["disk"]
+	snap.Memory = values["memory"]
+	for _, mapping := range normalizeStringList(req.ProxyPorts) {
+		port := hostPortFromMapping(mapping)
+		if port == "" {
+			continue
+		}
+		status := inspectPortStatus(ctx, runner, port)
+		snap.PortStatus = append(snap.PortStatus, serverPortStatus{Port: port, Status: status})
+		logger.Log("port %s %s", port, status)
+	}
+	if snap.ContainerStatus == "" {
+		snap.ContainerStatus = "unknown"
+	}
+	return snap, nil
+}
+
+func inspectPortStatus(ctx context.Context, runner *sshRunner, port string) string {
+	port = strings.TrimSpace(port)
+	if port == "" {
+		return "unknown"
+	}
+	cmd := fmt.Sprintf("if (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || true) | awk '{print $4}' | grep -Eq '(^|:|\\])%s$'; then printf listening; else printf free; fi", port)
+	out, err := runner.Run(ctx, cmd)
+	if err != nil {
+		return "unknown"
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "unknown"
+	}
+	return out
+}
+
+func parseKeyValueLines(out string) map[string]string {
+	values := make(map[string]string)
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, "=") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		key := strings.TrimSpace(parts[0])
+		value := ""
+		if len(parts) > 1 {
+			value = strings.TrimSpace(parts[1])
+		}
+		if key != "" {
+			values[key] = value
+		}
+	}
+	return values
+}
+
+func parseBoolString(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "y":
+		return true
+	default:
+		return false
+	}
+}
+
+func sanitizeInspectLog(out string) string {
+	var lines []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "GLIDER_NODE_TOKEN=") {
+			continue
+		}
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func hostPortFromMapping(mapping string) string {

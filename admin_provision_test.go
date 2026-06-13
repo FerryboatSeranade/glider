@@ -152,6 +152,51 @@ func TestServerAuthTypeAliases(t *testing.T) {
 	}
 }
 
+func TestParseInspectNodeOutput(t *testing.T) {
+	out := strings.Join([]string{
+		"hostname=zgo",
+		"ssh_user=root",
+		"kernel=Linux 6.1.0",
+		"docker_version=Docker version 29.1.3",
+		"compose_version=Docker Compose version v2.40.3",
+		"deploy_dir_exists=true",
+		"compose_file_exists=true",
+		"compose_image=ghcr.io/ferryboatseranade/glider:v1",
+		"container_image=ghcr.io/ferryboatseranade/glider:v1",
+		"container_status=running",
+		"container_ports=443/tcp -> 0.0.0.0:443;8443/tcp -> 0.0.0.0:8443",
+		"GLIDER_MODE=node",
+		"GLIDER_NODE_ID=zgo",
+		"GLIDER_CENTRAL_URL=http://15.204.95.51:8444",
+		"GLIDER_SYNC_INTERVAL=30s",
+		"GLIDER_TRAFFIC_INTERFACE=eth0",
+		"GLIDER_CACHE_DIR=/etc/glider-cache",
+		"GLIDER_CERT_DIR=/etc/glider-certs",
+		"disk=/dev/vda1 20G 4G 16G 20% /",
+		"memory=2048MB total, 1200MB available",
+	}, "\n")
+	values := parseKeyValueLines(out)
+	if values["GLIDER_NODE_ID"] != "zgo" || values["container_status"] != "running" {
+		t.Fatalf("unexpected parsed inspect values: %#v", values)
+	}
+	if !parseBoolString(values["deploy_dir_exists"]) || !parseBoolString(values["compose_file_exists"]) {
+		t.Fatalf("bool values not parsed: %#v", values)
+	}
+	if parseBoolString("missing") {
+		t.Fatalf("unexpected true for missing")
+	}
+}
+
+func TestSanitizeInspectLogRemovesNodeToken(t *testing.T) {
+	out := sanitizeInspectLog("GLIDER_MODE=node\nGLIDER_NODE_TOKEN=secret\nGLIDER_NODE_ID=zgo\n")
+	if strings.Contains(out, "GLIDER_NODE_TOKEN") || strings.Contains(out, "secret") {
+		t.Fatalf("token leaked in inspect log: %q", out)
+	}
+	if !strings.Contains(out, "GLIDER_MODE=node") || !strings.Contains(out, "GLIDER_NODE_ID=zgo") {
+		t.Fatalf("non-secret fields removed unexpectedly: %q", out)
+	}
+}
+
 func stringPtr(value string) *string {
 	return &value
 }

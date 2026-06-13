@@ -2037,6 +2037,23 @@ func (s *adminServer) handleServerAction(w http.ResponseWriter, r *http.Request)
 			Metadata: map[string]any{"deploy_dir": job.Request.DeployDir, "image": job.Request.Image},
 		})
 		writeJSON(w, http.StatusAccepted, job)
+	case action == "inspect-node" && r.Method == http.MethodPost:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		job, err := s.createInspectNodeJob(ctx, serverID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.recordEvent(dbEvent{
+			Type:     "server.inspect_queued",
+			Message:  "node runtime inspect queued",
+			ServerID: serverID,
+			NodeID:   job.NodeID,
+			JobID:    job.JobID,
+			Metadata: map[string]any{"deploy_dir": job.Request.DeployDir},
+		})
+		writeJSON(w, http.StatusAccepted, job)
 	case action == "deploy-node" && r.Method == http.MethodPost:
 		var payload deployNodePayload
 		if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
@@ -3838,6 +3855,7 @@ const adminHTML = `<!doctype html>
 	                  <button class="primary" onclick="saveServer()">Save Server</button>
 	                  <button onclick="testServerSSH()">Test SSH</button>
 	                  <button onclick="preflightServerNode()">Preflight</button>
+	                  <button onclick="inspectServerNode()">Inspect Node</button>
 	                  <button class="primary" onclick="onboardServerNode()">Onboard Node</button>
 	                  <button onclick="deployServerNode()">Deploy Node</button>
 	                  <button onclick="restartServerNode()">Restart Node</button>
@@ -4413,9 +4431,10 @@ function renderServers() {
 
 function serverStatusTone(status) {
   status = String(status || '').toLowerCase();
-  if (status === 'ssh_ok' || status === 'preflight_ok' || status === 'deployed' || status === 'onboarded' || status === 'restarted' || status === 'upgraded') return 'ok';
+  if (status === 'ssh_ok' || status === 'preflight_ok' || status === 'inspect_ok' || status === 'deployed' || status === 'onboarded' || status === 'restarted' || status === 'upgraded') return 'ok';
   if (status === 'heartbeat_pending') return 'warn';
-  if (status === 'unreachable' || status === 'preflight_failed' || status === 'error') return 'error';
+  if (status === 'unreachable' || status === 'preflight_failed' || status === 'inspect_failed' || status === 'container_missing' || status === 'error') return 'error';
+  if (status.startsWith('container_')) return 'warn';
   return status || 'saved';
 }
 
@@ -4523,6 +4542,7 @@ function selectServerIntoForm(s) {
 
 function renderServerResult(s) {
   s = s || {};
+  const rt = s.runtime || {};
   const lines = [
     'server: ' + escapeHTML(s.server_id || '-'),
     'host: ' + escapeHTML(s.host || '-') + ':' + escapeHTML(s.ssh_port || 22),
@@ -4533,11 +4553,32 @@ function renderServerResult(s) {
     'credentials: password ' + (s.has_password ? 'yes' : 'no') + ', private key ' + (s.has_private_key ? 'yes' : 'no'),
     'status: ' + escapeHTML(s.status || '-'),
     'last ssh test: ' + escapeHTML(formatDate(s.last_test_at)),
+    'last inspect: ' + escapeHTML(formatDate(s.last_inspect_at)),
+    'last inspect job: ' + escapeHTML(s.last_inspect_job || '-'),
     'last deploy: ' + escapeHTML(formatDate(s.last_deploy_at)),
     'last deploy job: ' + escapeHTML(s.last_deploy_job || '-')
   ];
+  if (rt.inspected_at) {
+    lines.push('');
+    lines.push('runtime hostname: ' + escapeHTML(rt.hostname || '-'));
+    lines.push('runtime node id: ' + escapeHTML(rt.runtime_node_id || '-'));
+    lines.push('runtime mode: ' + escapeHTML(rt.mode || '-'));
+    lines.push('central url: ' + escapeHTML(rt.central_url || '-'));
+    lines.push('container: ' + escapeHTML(rt.container_status || '-') + ' ' + escapeHTML(rt.container_image || rt.compose_image || '-'));
+    lines.push('ports: ' + escapeHTML(runtimePorts(rt)));
+    lines.push('docker: ' + escapeHTML(rt.docker_version || '-'));
+    lines.push('compose: ' + escapeHTML(rt.compose_version || '-'));
+    lines.push('disk: ' + escapeHTML(rt.disk || '-'));
+    lines.push('memory: ' + escapeHTML(rt.memory || '-'));
+  }
   if (s.last_error) lines.push('error: ' + escapeHTML(s.last_error));
   $('serverResult').innerHTML = lines.join('\n');
+}
+
+function runtimePorts(rt) {
+  const ports = (rt && rt.port_status) || [];
+  if (!ports.length) return rt.container_ports || '-';
+  return ports.map(p => (p.port || '-') + ':' + (p.status || 'unknown')).join(', ');
 }
 
 function serverPayload() {
@@ -4654,6 +4695,17 @@ async function preflightServerNode() {
   const job = await fetchJSON('/api/servers/' + encodeURIComponent(saved.server_id) + '/preflight-node', { method: 'POST' });
   await pollJob(job.job_id, 'serverResult');
   await Promise.all([loadServers(), loadJobs(), loadEvents(), loadNodes()]);
+}
+
+async function inspectServerNode() {
+  const saved = await fetchJSON('/api/servers', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(serverPayload()) });
+  selectServerIntoForm(saved);
+  $('serverResult').textContent = 'Queued node inspect...';
+  const job = await fetchJSON('/api/servers/' + encodeURIComponent(saved.server_id) + '/inspect-node', { method: 'POST' });
+  await pollJob(job.job_id, 'serverResult');
+  await Promise.all([loadServers(), loadJobs(), loadEvents(), loadNodes()]);
+  const refreshed = await fetchJSON('/api/servers/' + encodeURIComponent(saved.server_id));
+  selectServerIntoForm(refreshed);
 }
 
 async function restartServerNode() {

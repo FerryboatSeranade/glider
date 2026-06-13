@@ -76,33 +76,68 @@ type NodeCertState struct {
 }
 
 type dbServer struct {
-	ServerID       string     `bson:"server_id" json:"server_id"`
-	Name           string     `bson:"name,omitempty" json:"name,omitempty"`
-	NodeID         string     `bson:"node_id,omitempty" json:"node_id,omitempty"`
-	Host           string     `bson:"host" json:"host"`
-	SSHPort        int        `bson:"ssh_port,omitempty" json:"ssh_port,omitempty"`
-	SSHUser        string     `bson:"ssh_user,omitempty" json:"ssh_user,omitempty"`
-	AuthType       string     `bson:"auth_type,omitempty" json:"auth_type,omitempty"`
-	Password       string     `bson:"password,omitempty" json:"-"`
-	PrivateKey     string     `bson:"private_key,omitempty" json:"-"`
-	Passphrase     string     `bson:"passphrase,omitempty" json:"-"`
-	DeployDir      string     `bson:"deploy_dir,omitempty" json:"deploy_dir,omitempty"`
-	Image          string     `bson:"image,omitempty" json:"image,omitempty"`
-	ProxyPorts     []string   `bson:"proxy_ports,omitempty" json:"proxy_ports,omitempty"`
-	CertHostPath   string     `bson:"cert_host_path,omitempty" json:"cert_host_path,omitempty"`
-	TrafficIface   string     `bson:"traffic_iface,omitempty" json:"traffic_iface,omitempty"`
-	Status         string     `bson:"status,omitempty" json:"status,omitempty"`
-	LastError      string     `bson:"last_error,omitempty" json:"last_error,omitempty"`
-	LastTestAt     *time.Time `bson:"last_test_at,omitempty" json:"last_test_at,omitempty"`
-	LastDeployAt   *time.Time `bson:"last_deploy_at,omitempty" json:"last_deploy_at,omitempty"`
-	LastDeployJob  string     `bson:"last_deploy_job,omitempty" json:"last_deploy_job,omitempty"`
-	CreatedAt      time.Time  `bson:"created_at,omitempty" json:"created_at,omitempty"`
-	UpdatedAt      time.Time  `bson:"updated_at" json:"updated_at"`
-	HasPassword    bool       `bson:"-" json:"has_password,omitempty"`
-	HasPrivateKey  bool       `bson:"-" json:"has_private_key,omitempty"`
-	HasPassphrase  bool       `bson:"-" json:"has_passphrase,omitempty"`
-	MaskedPassword string     `bson:"-" json:"masked_password,omitempty"`
-	MaskedKey      string     `bson:"-" json:"masked_key,omitempty"`
+	ServerID       string                `bson:"server_id" json:"server_id"`
+	Name           string                `bson:"name,omitempty" json:"name,omitempty"`
+	NodeID         string                `bson:"node_id,omitempty" json:"node_id,omitempty"`
+	Host           string                `bson:"host" json:"host"`
+	SSHPort        int                   `bson:"ssh_port,omitempty" json:"ssh_port,omitempty"`
+	SSHUser        string                `bson:"ssh_user,omitempty" json:"ssh_user,omitempty"`
+	AuthType       string                `bson:"auth_type,omitempty" json:"auth_type,omitempty"`
+	Password       string                `bson:"password,omitempty" json:"-"`
+	PrivateKey     string                `bson:"private_key,omitempty" json:"-"`
+	Passphrase     string                `bson:"passphrase,omitempty" json:"-"`
+	DeployDir      string                `bson:"deploy_dir,omitempty" json:"deploy_dir,omitempty"`
+	Image          string                `bson:"image,omitempty" json:"image,omitempty"`
+	ProxyPorts     []string              `bson:"proxy_ports,omitempty" json:"proxy_ports,omitempty"`
+	CertHostPath   string                `bson:"cert_host_path,omitempty" json:"cert_host_path,omitempty"`
+	TrafficIface   string                `bson:"traffic_iface,omitempty" json:"traffic_iface,omitempty"`
+	Status         string                `bson:"status,omitempty" json:"status,omitempty"`
+	LastError      string                `bson:"last_error,omitempty" json:"last_error,omitempty"`
+	LastTestAt     *time.Time            `bson:"last_test_at,omitempty" json:"last_test_at,omitempty"`
+	LastInspectAt  *time.Time            `bson:"last_inspect_at,omitempty" json:"last_inspect_at,omitempty"`
+	LastInspectJob string                `bson:"last_inspect_job,omitempty" json:"last_inspect_job,omitempty"`
+	LastDeployAt   *time.Time            `bson:"last_deploy_at,omitempty" json:"last_deploy_at,omitempty"`
+	LastDeployJob  string                `bson:"last_deploy_job,omitempty" json:"last_deploy_job,omitempty"`
+	Runtime        serverRuntimeSnapshot `bson:"runtime,omitempty" json:"runtime,omitempty"`
+	CreatedAt      time.Time             `bson:"created_at,omitempty" json:"created_at,omitempty"`
+	UpdatedAt      time.Time             `bson:"updated_at" json:"updated_at"`
+	HasPassword    bool                  `bson:"-" json:"has_password,omitempty"`
+	HasPrivateKey  bool                  `bson:"-" json:"has_private_key,omitempty"`
+	HasPassphrase  bool                  `bson:"-" json:"has_passphrase,omitempty"`
+	MaskedPassword string                `bson:"-" json:"masked_password,omitempty"`
+	MaskedKey      string                `bson:"-" json:"masked_key,omitempty"`
+}
+
+type serverRuntimeSnapshot struct {
+	InspectedAt       *time.Time         `bson:"inspected_at,omitempty" json:"inspected_at,omitempty"`
+	Hostname          string             `bson:"hostname,omitempty" json:"hostname,omitempty"`
+	SSHUser           string             `bson:"ssh_user,omitempty" json:"ssh_user,omitempty"`
+	Kernel            string             `bson:"kernel,omitempty" json:"kernel,omitempty"`
+	DockerVersion     string             `bson:"docker_version,omitempty" json:"docker_version,omitempty"`
+	ComposeVersion    string             `bson:"compose_version,omitempty" json:"compose_version,omitempty"`
+	DeployDir         string             `bson:"deploy_dir,omitempty" json:"deploy_dir,omitempty"`
+	DeployDirExists   bool               `bson:"deploy_dir_exists,omitempty" json:"deploy_dir_exists,omitempty"`
+	ComposeFileExists bool               `bson:"compose_file_exists,omitempty" json:"compose_file_exists,omitempty"`
+	ComposeImage      string             `bson:"compose_image,omitempty" json:"compose_image,omitempty"`
+	ContainerStatus   string             `bson:"container_status,omitempty" json:"container_status,omitempty"`
+	ContainerImage    string             `bson:"container_image,omitempty" json:"container_image,omitempty"`
+	ContainerStarted  string             `bson:"container_started,omitempty" json:"container_started,omitempty"`
+	ContainerPorts    string             `bson:"container_ports,omitempty" json:"container_ports,omitempty"`
+	Mode              string             `bson:"mode,omitempty" json:"mode,omitempty"`
+	RuntimeNodeID     string             `bson:"runtime_node_id,omitempty" json:"runtime_node_id,omitempty"`
+	CentralURL        string             `bson:"central_url,omitempty" json:"central_url,omitempty"`
+	SyncInterval      string             `bson:"sync_interval,omitempty" json:"sync_interval,omitempty"`
+	TrafficIface      string             `bson:"traffic_iface,omitempty" json:"traffic_iface,omitempty"`
+	CacheDir          string             `bson:"cache_dir,omitempty" json:"cache_dir,omitempty"`
+	CertDir           string             `bson:"cert_dir,omitempty" json:"cert_dir,omitempty"`
+	Disk              string             `bson:"disk,omitempty" json:"disk,omitempty"`
+	Memory            string             `bson:"memory,omitempty" json:"memory,omitempty"`
+	PortStatus        []serverPortStatus `bson:"port_status,omitempty" json:"port_status,omitempty"`
+}
+
+type serverPortStatus struct {
+	Port   string `bson:"port" json:"port"`
+	Status string `bson:"status" json:"status"`
 }
 
 type serverSecretUpdate struct {
@@ -775,6 +810,25 @@ func (s *mongoStore) UpdateServerStatus(ctx context.Context, serverID, status, l
 	}
 	if deployJob != "" {
 		set["last_deploy_job"] = deployJob
+	}
+	_, err := s.db.Collection(serversCollection).UpdateOne(ctx, bson.M{"server_id": serverID}, bson.M{"$set": set})
+	return err
+}
+
+func (s *mongoStore) UpdateServerRuntime(ctx context.Context, serverID string, runtime serverRuntimeSnapshot, status, lastError, jobID string) error {
+	now := time.Now().UTC()
+	if runtime.InspectedAt == nil {
+		runtime.InspectedAt = &now
+	}
+	set := bson.M{
+		"runtime":          runtime,
+		"last_inspect_at":  *runtime.InspectedAt,
+		"last_inspect_job": strings.TrimSpace(jobID),
+		"last_error":       strings.TrimSpace(lastError),
+		"updated_at":       now,
+	}
+	if strings.TrimSpace(status) != "" {
+		set["status"] = strings.TrimSpace(status)
 	}
 	_, err := s.db.Collection(serversCollection).UpdateOne(ctx, bson.M{"server_id": serverID}, bson.M{"$set": set})
 	return err
