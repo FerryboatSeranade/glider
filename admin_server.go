@@ -4202,18 +4202,29 @@ const adminHTML = `<!doctype html>
     input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(31, 122, 140, .12); }
     textarea { min-height: 230px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; line-height: 1.45; }
     label { color: var(--muted); font-size: 12px; }
-    .app { min-height: 100vh; display: grid; grid-template-columns: 250px 1fr; }
-    .sidebar { background: #18212c; color: #dce6f2; padding: 22px 18px; }
+    .app { min-height: 100vh; display: grid; grid-template-columns: 250px 1fr; transition: grid-template-columns .18s ease; }
+    .app.nav-collapsed { grid-template-columns: 76px 1fr; }
+    .sidebar { background: #18212c; color: #dce6f2; padding: 22px 18px; min-width: 0; }
     .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 26px; }
     .brand-mark { width: 34px; height: 34px; border-radius: 8px; background: #2dd4bf; display: grid; place-items: center; color: #102026; font-weight: 800; }
     .brand-title { font-size: 17px; font-weight: 700; }
     .brand-sub { font-size: 12px; color: #9fb0c3; margin-top: 2px; }
-    .nav button { width: 100%; justify-content: flex-start; text-align: left; background: transparent; color: #cbd5e1; border-color: transparent; margin-bottom: 6px; }
+    .nav button { width: 100%; display: flex; align-items: center; gap: 10px; justify-content: flex-start; text-align: left; background: transparent; color: #cbd5e1; border-color: transparent; margin-bottom: 6px; }
     .nav button.active { background: rgba(45, 212, 191, .16); color: #fff; border-color: rgba(45, 212, 191, .24); }
+    .nav-icon { width: 24px; min-width: 24px; height: 24px; border-radius: 6px; display: inline-grid; place-items: center; background: rgba(148, 163, 184, .14); color: #e2e8f0; font-size: 12px; font-weight: 750; }
+    .nav-toggle { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #e2e8f0; background: #243142; border-color: #334155; margin: 0 0 12px; }
+    .nav-toggle-icon { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .side-card { margin-top: 22px; border: 1px solid rgba(203, 213, 225, .14); border-radius: 8px; padding: 12px; background: rgba(255, 255, 255, .04); }
     .side-card input { margin-top: 8px; background: #111827; color: #fff; border-color: #334155; }
+    .side-card select { margin-top: 8px; background: #111827; color: #fff; border-color: #334155; }
     .side-actions { display: flex; gap: 8px; margin-top: 10px; }
     .side-actions button { color: #e2e8f0; background: #243142; border-color: #334155; }
+    .language-row { margin-top: 14px; }
+    .app.nav-collapsed .sidebar { padding: 18px 12px; }
+    .app.nav-collapsed .brand { justify-content: center; margin-bottom: 14px; }
+    .app.nav-collapsed .brand-copy, .app.nav-collapsed .nav-label, .app.nav-collapsed .side-card, .app.nav-collapsed .nav-toggle-label { display: none; }
+    .app.nav-collapsed .nav button { justify-content: center; padding: 0; }
+    .app.nav-collapsed .nav-toggle { justify-content: center; padding: 0; }
     .main { min-width: 0; }
     header { height: 78px; display: flex; align-items: center; justify-content: space-between; padding: 0 28px; border-bottom: 1px solid var(--line); background: rgba(255, 255, 255, .82); backdrop-filter: blur(10px); position: sticky; top: 0; z-index: 2; }
     h1 { font-size: 22px; margin: 0; letter-spacing: 0; }
@@ -4270,7 +4281,10 @@ const adminHTML = `<!doctype html>
     .node-select input { width: auto; }
     @media (max-width: 980px) {
       .app { grid-template-columns: 1fr; }
+      .app.nav-collapsed { grid-template-columns: 1fr; }
       .sidebar { position: static; }
+      .app.nav-collapsed .brand-copy, .app.nav-collapsed .nav-label, .app.nav-collapsed .side-card, .app.nav-collapsed .nav-toggle-label { display: block; }
+      .app.nav-collapsed .nav button { justify-content: flex-start; padding: 0 12px; }
       header { height: auto; padding: 18px; align-items: flex-start; gap: 14px; flex-direction: column; }
       .content { padding: 18px; }
       .stats, .grid, .check-grid { grid-template-columns: 1fr; }
@@ -4278,30 +4292,38 @@ const adminHTML = `<!doctype html>
   </style>
 </head>
 <body>
-  <div class="app">
+  <div id="appShell" class="app">
     <aside class="sidebar">
       <div class="brand">
         <div class="brand-mark">G</div>
-        <div>
+        <div class="brand-copy">
           <div class="brand-title">Glider</div>
-          <div class="brand-sub">Control Plane</div>
+          <div class="brand-sub" data-i18n="brand.subtitle">控制面板</div>
         </div>
       </div>
+      <button id="navToggle" class="nav-toggle" type="button" onclick="toggleNav()"><span class="nav-toggle-label" data-i18n="nav.collapse">折叠导航</span><span class="nav-toggle-icon">‹</span></button>
       <nav class="nav">
-        <button id="tabBtnOverview" class="active" onclick="showTab('overview')">Overview</button>
-        <button id="tabBtnUsers" onclick="showTab('users')">Users</button>
-        <button id="tabBtnRules" onclick="showTab('rules')">Rules</button>
-	        <button id="tabBtnChecks" onclick="showTab('checks')">Connectivity</button>
-	        <button id="tabBtnNodes" onclick="showTab('nodes')">Nodes</button>
-	        <button id="tabBtnServers" onclick="showTab('servers')">Servers</button>
-	        <button id="tabBtnCerts" onclick="showTab('certs')">Domains</button>
+        <button id="tabBtnOverview" class="active" onclick="showTab('overview')"><span class="nav-icon">O</span><span class="nav-label" data-i18n="nav.overview">总览</span></button>
+        <button id="tabBtnUsers" onclick="showTab('users')"><span class="nav-icon">U</span><span class="nav-label" data-i18n="nav.users">用户</span></button>
+        <button id="tabBtnRules" onclick="showTab('rules')"><span class="nav-icon">R</span><span class="nav-label" data-i18n="nav.rules">规则</span></button>
+	        <button id="tabBtnChecks" onclick="showTab('checks')"><span class="nav-icon">C</span><span class="nav-label" data-i18n="nav.checks">连通性</span></button>
+	        <button id="tabBtnNodes" onclick="showTab('nodes')"><span class="nav-icon">N</span><span class="nav-label" data-i18n="nav.nodes">节点</span></button>
+	        <button id="tabBtnServers" onclick="showTab('servers')"><span class="nav-icon">S</span><span class="nav-label" data-i18n="nav.servers">服务器</span></button>
+	        <button id="tabBtnCerts" onclick="showTab('certs')"><span class="nav-icon">D</span><span class="nav-label" data-i18n="nav.domains">域名</span></button>
       </nav>
       <div class="side-card">
-        <label for="adminToken">Admin token</label>
-        <input id="adminToken" type="password" autocomplete="current-password" placeholder="Bearer token">
+        <label for="adminToken" data-i18n="auth.token">管理员令牌</label>
+        <input id="adminToken" type="password" autocomplete="current-password" placeholder="Bearer token" data-i18n-placeholder="placeholder.adminToken">
         <div class="side-actions">
-          <button id="saveTokenBtn" type="button" onclick="saveToken()">Save</button>
-          <button type="button" onclick="clearToken()">Clear</button>
+          <button id="saveTokenBtn" type="button" onclick="saveToken()" data-i18n="action.save">保存</button>
+          <button type="button" onclick="clearToken()" data-i18n="action.clear">清除</button>
+        </div>
+        <div class="language-row">
+          <label for="languageSelect" data-i18n="language.label">语言</label>
+          <select id="languageSelect" onchange="setLanguage(this.value)">
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+          </select>
         </div>
       </div>
     </aside>
@@ -4309,13 +4331,13 @@ const adminHTML = `<!doctype html>
     <main class="main">
       <header>
         <div>
-          <h1 id="pageTitle">Overview</h1>
-          <div class="header-meta" id="pageSubtitle">Centralized users, routing rules, nodes, and live checks.</div>
+          <h1 id="pageTitle">总览</h1>
+          <div class="header-meta" id="pageSubtitle">集中管理用户、路由规则、节点和实时检测。</div>
         </div>
         <div class="toolbar">
           <span id="authStatus" class="toast"></span>
-          <button onclick="refreshAll()">Refresh</button>
-          <button class="primary" onclick="reloadConfig()">Reload</button>
+          <button onclick="refreshAll()" data-i18n="action.refresh">刷新</button>
+          <button class="primary" onclick="reloadConfig()" data-i18n="action.reload">重载</button>
           <span id="reloadStatus" class="pill">idle</span>
         </div>
       </header>
@@ -4323,25 +4345,25 @@ const adminHTML = `<!doctype html>
       <div class="content">
         <section id="tabOverview" class="tabs active">
           <div class="stats">
-            <div class="stat"><div class="stat-label">Users</div><div class="stat-value" id="statUsers">0</div></div>
-            <div class="stat"><div class="stat-label">Active users</div><div class="stat-value" id="statActiveUsers">0</div></div>
-            <div class="stat"><div class="stat-label">Rules</div><div class="stat-value" id="statRules">0</div></div>
-            <div class="stat"><div class="stat-label">Healthy rules</div><div class="stat-value" id="statHealthyRules">-</div></div>
-            <div class="stat"><div class="stat-label">Nodes online</div><div class="stat-value" id="statNodesOnline">0</div></div>
-            <div class="stat"><div class="stat-label">Config version</div><div class="stat-value mono" id="statConfigVersion">-</div></div>
-            <div class="stat"><div class="stat-label">Nodes synced</div><div class="stat-value" id="statNodesSynced">-</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="stat.users">用户</div><div class="stat-value" id="statUsers">0</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="stat.activeUsers">活跃用户</div><div class="stat-value" id="statActiveUsers">0</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="stat.rules">规则</div><div class="stat-value" id="statRules">0</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="stat.healthyRules">健康规则</div><div class="stat-value" id="statHealthyRules">-</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="stat.nodesOnline">在线节点</div><div class="stat-value" id="statNodesOnline">0</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="stat.configVersion">配置版本</div><div class="stat-value mono" id="statConfigVersion">-</div></div>
+            <div class="stat"><div class="stat-label" data-i18n="stat.nodesSynced">已同步节点</div><div class="stat-value" id="statNodesSynced">-</div></div>
           </div>
           <div class="panel">
-            <div class="panel-head"><div class="panel-title">Quick IP Info Check</div><span class="pill">ipinfo.io</span></div>
+            <div class="panel-head"><div class="panel-title" data-i18n="overview.quickCheck">快速出口 IP 检测</div><span class="pill">ipinfo.io</span></div>
             <div class="panel-body">
               <div class="check-grid">
-                <div><label>Route type</label><select id="quickCheckType"><option value="default">Default route</option><option value="rule">Rule route</option><option value="user">User route</option></select></div>
-                <div><label>Name</label><input id="quickCheckName" placeholder="rule or username"></div>
-                <div><label>Target URL</label><input id="quickCheckTarget" value="https://ipinfo.io/json"></div>
-                <div><label>Timeout</label><input id="quickCheckTimeout" value="8s"></div>
+                <div><label data-i18n="field.routeType">路由类型</label><select id="quickCheckType"><option value="default" data-i18n="option.defaultRoute">默认路由</option><option value="rule" data-i18n="option.ruleRoute">规则路由</option><option value="user" data-i18n="option.userRoute">用户路由</option></select></div>
+                <div><label data-i18n="field.name">名称</label><input id="quickCheckName" placeholder="rule or username" data-i18n-placeholder="placeholder.ruleOrUsername"></div>
+                <div><label data-i18n="field.targetURL">目标 URL</label><input id="quickCheckTarget" value="https://ipinfo.io/json"></div>
+                <div><label data-i18n="field.timeout">超时</label><input id="quickCheckTimeout" value="8s"></div>
               </div>
-              <div class="actions"><button class="primary" onclick="runQuickCheck()">Run Check</button></div>
-              <div id="quickCheckResult" class="result">No check has run yet.</div>
+              <div class="actions"><button class="primary" onclick="runQuickCheck()" data-i18n="action.runCheck">运行检测</button></div>
+              <div id="quickCheckResult" class="result" data-i18n="result.noCheck">还没有运行检测。</div>
             </div>
           </div>
         </section>
@@ -4349,26 +4371,26 @@ const adminHTML = `<!doctype html>
         <section id="tabUsers" class="tabs">
           <div class="grid">
             <div class="panel">
-              <div class="panel-head"><div class="panel-title">Users</div><span id="usersCount" class="pill">0</span></div>
-              <div class="search-row"><input id="userSearch" placeholder="Search users, rules, status" oninput="renderUsers()"></div>
+              <div class="panel-head"><div class="panel-title" data-i18n="panel.users">用户</div><span id="usersCount" class="pill">0</span></div>
+              <div class="search-row"><input id="userSearch" placeholder="Search users, rules, status" data-i18n-placeholder="placeholder.userSearch" oninput="renderUsers()"></div>
               <div id="usersList" class="list"></div>
             </div>
             <div class="panel">
-              <div class="panel-head"><div class="panel-title">User Editor</div><span id="selectedUserStatus" class="pill">new</span></div>
+              <div class="panel-head"><div class="panel-title" data-i18n="panel.userEditor">用户编辑器</div><span id="selectedUserStatus" class="pill">new</span></div>
               <div class="panel-body">
                 <div class="form-grid">
-                  <div><label>Username</label><input id="userName" placeholder="username"></div>
-                  <div><label>Password</label><input id="userPass" placeholder="password"></div>
-                  <div><label>Rule</label><select id="userRule"></select></div>
-                  <div><label>Expires at</label><input id="userExpires" type="datetime-local"></div>
-                  <div class="checkbox-row"><input id="userEnabled" type="checkbox" checked><label for="userEnabled">Enabled</label></div>
+                  <div><label data-i18n="field.username">用户名</label><input id="userName" placeholder="username" data-i18n-placeholder="placeholder.username"></div>
+                  <div><label data-i18n="field.password">密码</label><input id="userPass" placeholder="password" data-i18n-placeholder="placeholder.password"></div>
+                  <div><label data-i18n="field.rule">规则</label><select id="userRule"></select></div>
+                  <div><label data-i18n="field.expiresAt">过期时间</label><input id="userExpires" type="datetime-local"></div>
+                  <div class="checkbox-row"><input id="userEnabled" type="checkbox" checked><label for="userEnabled" data-i18n="field.enabled">启用</label></div>
                 </div>
                 <div class="actions">
-                  <button class="primary" onclick="saveUser()">Save User</button>
-                  <button class="danger" onclick="deleteUser()">Delete User</button>
-                  <button onclick="checkSelectedUser()">Check IP Info</button>
+                  <button class="primary" onclick="saveUser()" data-i18n="action.saveUser">保存用户</button>
+                  <button class="danger" onclick="deleteUser()" data-i18n="action.deleteUser">删除用户</button>
+                  <button onclick="checkSelectedUser()" data-i18n="action.checkIPInfo">检测 IP 信息</button>
                 </div>
-                <div id="userCheckResult" class="result">Select or save a user, then run a route check.</div>
+                <div id="userCheckResult" class="result" data-i18n="result.userCheckHint">选择或保存用户后运行路由检测。</div>
               </div>
             </div>
           </div>
@@ -4377,23 +4399,23 @@ const adminHTML = `<!doctype html>
         <section id="tabRules" class="tabs">
           <div class="grid">
             <div class="panel">
-              <div class="panel-head"><div class="panel-title">Rules</div><span id="rulesCount" class="pill">0</span></div>
-              <div class="search-row"><input id="ruleSearch" placeholder="Search rules or forward content" oninput="renderRules()"></div>
+              <div class="panel-head"><div class="panel-title" data-i18n="panel.rules">规则</div><span id="rulesCount" class="pill">0</span></div>
+              <div class="search-row"><input id="ruleSearch" placeholder="Search rules or forward content" data-i18n-placeholder="placeholder.ruleSearch" oninput="renderRules()"></div>
               <div id="rulesList" class="list"></div>
             </div>
             <div class="panel">
-              <div class="panel-head"><div class="panel-title">Rule Editor</div><span id="selectedRuleStatus" class="pill">new</span></div>
+              <div class="panel-head"><div class="panel-title" data-i18n="panel.ruleEditor">规则编辑器</div><span id="selectedRuleStatus" class="pill">new</span></div>
               <div class="panel-body">
                 <div class="form-grid">
-                  <div class="wide"><label>Rule name</label><input id="ruleName" placeholder="rule name without .rule"></div>
-                  <div class="wide"><label>Rule content</label><textarea id="ruleContent" placeholder="forward=direct://&#10;domain=example.com"></textarea></div>
+                  <div class="wide"><label data-i18n="field.ruleName">规则名称</label><input id="ruleName" placeholder="rule name without .rule" data-i18n-placeholder="placeholder.ruleName"></div>
+                  <div class="wide"><label data-i18n="field.ruleContent">规则内容</label><textarea id="ruleContent" placeholder="forward=direct://&#10;domain=example.com"></textarea></div>
                 </div>
                 <div class="actions">
-                  <button class="primary" onclick="saveRule()">Save Rule</button>
-                  <button class="danger" onclick="deleteRule()">Delete Rule</button>
-                  <button onclick="checkSelectedRule()">Check IP Info</button>
+                  <button class="primary" onclick="saveRule()" data-i18n="action.saveRule">保存规则</button>
+                  <button class="danger" onclick="deleteRule()" data-i18n="action.deleteRule">删除规则</button>
+                  <button onclick="checkSelectedRule()" data-i18n="action.checkIPInfo">检测 IP 信息</button>
                 </div>
-                <div id="ruleCheckResult" class="result">Select or save a rule, then run a route check.</div>
+                <div id="ruleCheckResult" class="result" data-i18n="result.ruleCheckHint">选择或保存规则后运行路由检测。</div>
               </div>
             </div>
           </div>
@@ -4401,176 +4423,176 @@ const adminHTML = `<!doctype html>
 
         <section id="tabChecks" class="tabs">
           <div class="panel">
-            <div class="panel-head"><div class="panel-title">Connectivity Lab</div><span class="pill">route exit IP</span></div>
+            <div class="panel-head"><div class="panel-title" data-i18n="panel.connectivityLab">连通性实验室</div><span class="pill" data-i18n="pill.routeExitIP">路由出口 IP</span></div>
             <div class="panel-body">
               <div class="check-grid">
-                <div><label>Type</label><select id="checkType"><option value="default">Default</option><option value="rule">Rule</option><option value="user">User</option></select></div>
-                <div><label>Name</label><input id="checkName" placeholder="rule name or username"></div>
-                <div><label>Target URL</label><input id="checkTarget" value="https://ipinfo.io/json"></div>
-                <div><label>Timeout</label><input id="checkTimeout" value="8s"></div>
+                <div><label data-i18n="field.type">类型</label><select id="checkType"><option value="default" data-i18n="option.default">默认</option><option value="rule" data-i18n="option.rule">规则</option><option value="user" data-i18n="option.user">用户</option></select></div>
+                <div><label data-i18n="field.name">名称</label><input id="checkName" placeholder="rule name or username" data-i18n-placeholder="placeholder.ruleOrUsername"></div>
+                <div><label data-i18n="field.targetURL">目标 URL</label><input id="checkTarget" value="https://ipinfo.io/json"></div>
+                <div><label data-i18n="field.timeout">超时</label><input id="checkTimeout" value="8s"></div>
               </div>
-              <div class="actions"><button class="primary" onclick="runCheckFromForm()">Run Check</button></div>
-              <div id="checkResult" class="result">Checks run through the currently loaded local proxy runtime.</div>
+              <div class="actions"><button class="primary" onclick="runCheckFromForm()" data-i18n="action.runCheck">运行检测</button></div>
+              <div id="checkResult" class="result" data-i18n="result.checkRuntime">检测会通过当前加载的本地代理运行时执行。</div>
             </div>
           </div>
           <div class="panel">
-            <div class="panel-head"><div class="panel-title">Rules Health</div><span id="rulesHealthStatus" class="pill">idle</span></div>
+            <div class="panel-head"><div class="panel-title" data-i18n="panel.rulesHealth">规则健康度</div><span id="rulesHealthStatus" class="pill">idle</span></div>
             <div class="panel-body">
               <div class="check-grid">
-                <div><label>Target URL</label><input id="healthTarget" value="https://ipinfo.io/json"></div>
-                <div><label>Timeout</label><input id="healthTimeout" value="8s"></div>
-                <div><label>Interval seconds</label><input id="healthInterval" type="number" min="15" value="60"></div>
-                <div><label>&nbsp;</label><span class="inline-check"><input id="healthAuto" type="checkbox" onchange="toggleHealthAuto()"> auto</span></div>
+                <div><label data-i18n="field.targetURL">目标 URL</label><input id="healthTarget" value="https://ipinfo.io/json"></div>
+                <div><label data-i18n="field.timeout">超时</label><input id="healthTimeout" value="8s"></div>
+                <div><label data-i18n="field.intervalSeconds">间隔秒数</label><input id="healthInterval" type="number" min="15" value="60"></div>
+                <div><label>&nbsp;</label><span class="inline-check"><input id="healthAuto" type="checkbox" onchange="toggleHealthAuto()"> <span data-i18n="field.auto">自动</span></span></div>
               </div>
-              <div class="actions"><button class="primary" onclick="runRulesHealth()">Check All Rules</button></div>
-              <div id="rulesHealthTable" class="table-wrap result">No health check has run yet.</div>
+              <div class="actions"><button class="primary" onclick="runRulesHealth()" data-i18n="action.checkAllRules">检测全部规则</button></div>
+              <div id="rulesHealthTable" class="table-wrap result" data-i18n="result.noHealthCheck">还没有运行健康检测。</div>
             </div>
           </div>
         </section>
 
 	        <section id="tabNodes" class="tabs">
 	          <div class="panel">
-	            <div class="panel-head"><div class="panel-title">Nodes</div><span id="nodesCount" class="pill">0</span></div>
-	            <div class="search-row"><input id="nodeSearch" placeholder="Search nodes, hosts, IPs, versions, errors" oninput="renderNodes()"></div>
-	            <div class="panel-body">
-	              <div id="nodesTable" class="table-wrap">No nodes have reported yet.</div>
-	            </div>
-	          </div>
-	        </section>
+		            <div class="panel-head"><div class="panel-title" data-i18n="panel.nodes">节点</div><span id="nodesCount" class="pill">0</span></div>
+		            <div class="search-row"><input id="nodeSearch" placeholder="Search nodes, hosts, IPs, versions, errors" data-i18n-placeholder="placeholder.nodeSearch" oninput="renderNodes()"></div>
+		            <div class="panel-body">
+		              <div id="nodesTable" class="table-wrap" data-i18n="result.noNodes">还没有节点上报。</div>
+		            </div>
+		          </div>
+		        </section>
 
 	        <section id="tabServers" class="tabs">
 	          <div class="grid">
 	            <div class="panel">
-	              <div class="panel-head"><div class="panel-title">Servers</div><span id="serversCount" class="pill">0</span></div>
-	              <div class="search-row"><input id="serverSearch" placeholder="Search servers, hosts, nodes" oninput="renderServers()"></div>
+		              <div class="panel-head"><div class="panel-title" data-i18n="panel.servers">服务器</div><span id="serversCount" class="pill">0</span></div>
+		              <div class="search-row"><input id="serverSearch" placeholder="Search servers, hosts, nodes" data-i18n-placeholder="placeholder.serverSearch" oninput="renderServers()"></div>
 	              <div id="serversList" class="list"></div>
 	            </div>
 	            <div class="panel">
-	              <div class="panel-head"><div class="panel-title">Server Provisioning</div><span id="selectedServerStatus" class="pill">new</span></div>
+		              <div class="panel-head"><div class="panel-title" data-i18n="panel.serverProvisioning">服务器部署</div><span id="selectedServerStatus" class="pill">new</span></div>
 	              <div class="panel-body">
 	                <div class="form-grid">
-	                  <div><label>Server ID</label><input id="serverID" placeholder="zgo"></div>
-	                  <div><label>Node ID</label><input id="serverNodeID" placeholder="zgo"></div>
-	                  <div><label>Name</label><input id="serverName" placeholder="friendly name"></div>
-	                  <div><label>Host</label><input id="serverHost" placeholder="203.0.113.10"></div>
-	                  <div><label>SSH port</label><input id="serverSSHPort" type="number" min="1" value="22"></div>
-	                  <div><label>SSH user</label><input id="serverSSHUser" value="root"></div>
-	                  <div><label>Auth type</label><select id="serverAuthType"><option value="auto">Auto</option><option value="password">Password</option><option value="private_key">Private key</option></select></div>
-	                  <div><label>Deploy dir</label><input id="serverDeployDir" value="/root/data/docker_data/glider"></div>
-	                  <div class="wide"><label>Image</label><input id="serverImage" value="ghcr.io/ferryboatseranade/glider:latest"></div>
-	                  <div><label>Proxy ports</label><input id="serverProxyPorts" value="443:443,8443:8443"></div>
-	                  <div><label>Traffic iface</label><input id="serverTrafficIface" value="eth0"></div>
-	                  <div><label>Password</label><input id="serverPassword" type="password" autocomplete="new-password" placeholder="leave blank to keep"></div>
-	                  <div><label>Key passphrase</label><input id="serverPassphrase" type="password" autocomplete="new-password" placeholder="optional"></div>
-	                  <div class="wide"><label>Private key</label><textarea id="serverPrivateKey" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></div>
-	                  <div><label>Central URL</label><input id="deployCentralURL" placeholder="http://15.204.95.51:8444"></div>
-	                  <div><label>Node token</label><input id="deployNodeToken" type="password" autocomplete="new-password" placeholder="manual deploy only"></div>
-	                  <div><label>Sync interval</label><input id="deploySyncInterval" value="30s"></div>
-	                  <div><label>Wait heartbeat seconds</label><input id="deployWaitHeartbeat" type="number" min="15" value="120"></div>
-	                  <div><label>Upgrade image</label><input id="upgradeImage" placeholder="ghcr.io/ferryboatseranade/glider:v..."></div>
-	                  <div class="checkbox-row"><input id="deployInstallDocker" type="checkbox" checked><label for="deployInstallDocker">Install Docker if missing</label></div>
-	                </div>
-	                <div class="actions">
-	                  <button class="primary" onclick="saveServer()">Save Server</button>
-	                  <button onclick="testServerSSH()">Test SSH</button>
-	                  <button onclick="preflightServerNode()">Preflight</button>
-	                  <button onclick="inspectServerNode()">Inspect Node</button>
-	                  <button class="primary" onclick="onboardServerNode()">Onboard Node</button>
-	                  <button onclick="deployServerNode()">Deploy Node</button>
-	                  <button onclick="restartServerNode()">Restart Node</button>
-	                  <button onclick="upgradeServerNode()">Upgrade Node</button>
-	                  <button onclick="rollbackServerNode()">Rollback Node</button>
-	                  <button class="danger" onclick="deleteServer()">Delete</button>
-	                </div>
-	                <div id="serverResult" class="result">Save a server, test SSH, then deploy node mode.</div>
-	              </div>
-	            </div>
-	          </div>
-	          <div class="panel">
-	            <div class="panel-head"><div class="panel-title">Provisioning Jobs</div><span id="jobsCount" class="pill">0</span></div>
-	            <div class="panel-body">
-	              <div id="jobsTable" class="table-wrap">No jobs yet.</div>
-	            </div>
-	          </div>
-	          <div class="panel">
-	            <div class="panel-head"><div class="panel-title">Recent Events</div><span id="eventsCount" class="pill">0</span></div>
-	            <div class="panel-body">
-	              <div id="eventsTable" class="table-wrap">No events yet.</div>
-	            </div>
-	          </div>
-	        </section>
+		                  <div><label data-i18n="field.serverID">服务器 ID</label><input id="serverID" placeholder="zgo"></div>
+		                  <div><label data-i18n="field.nodeID">节点 ID</label><input id="serverNodeID" placeholder="zgo"></div>
+		                  <div><label data-i18n="field.friendlyName">名称</label><input id="serverName" placeholder="friendly name" data-i18n-placeholder="placeholder.friendlyName"></div>
+		                  <div><label data-i18n="field.host">主机</label><input id="serverHost" placeholder="203.0.113.10"></div>
+		                  <div><label data-i18n="field.sshPort">SSH 端口</label><input id="serverSSHPort" type="number" min="1" value="22"></div>
+		                  <div><label data-i18n="field.sshUser">SSH 用户</label><input id="serverSSHUser" value="root"></div>
+		                  <div><label data-i18n="field.authType">认证方式</label><select id="serverAuthType"><option value="auto" data-i18n="option.auto">自动</option><option value="password" data-i18n="option.password">密码</option><option value="private_key" data-i18n="option.privateKey">私钥</option></select></div>
+		                  <div><label data-i18n="field.deployDir">部署目录</label><input id="serverDeployDir" value="/root/data/docker_data/glider"></div>
+		                  <div class="wide"><label data-i18n="field.image">镜像</label><input id="serverImage" value="ghcr.io/ferryboatseranade/glider:latest"></div>
+		                  <div><label data-i18n="field.proxyPorts">代理端口</label><input id="serverProxyPorts" value="443:443,8443:8443"></div>
+		                  <div><label data-i18n="field.trafficIface">流量网卡</label><input id="serverTrafficIface" value="eth0"></div>
+		                  <div><label data-i18n="field.password">密码</label><input id="serverPassword" type="password" autocomplete="new-password" placeholder="leave blank to keep" data-i18n-placeholder="placeholder.leaveBlank"></div>
+		                  <div><label data-i18n="field.keyPassphrase">私钥口令</label><input id="serverPassphrase" type="password" autocomplete="new-password" placeholder="optional" data-i18n-placeholder="placeholder.optional"></div>
+		                  <div class="wide"><label data-i18n="field.privateKey">私钥</label><textarea id="serverPrivateKey" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></div>
+		                  <div><label data-i18n="field.centralURL">中枢 URL</label><input id="deployCentralURL" placeholder="http://15.204.95.51:8444"></div>
+		                  <div><label data-i18n="field.nodeToken">节点令牌</label><input id="deployNodeToken" type="password" autocomplete="new-password" placeholder="manual deploy only" data-i18n-placeholder="placeholder.manualDeployOnly"></div>
+		                  <div><label data-i18n="field.syncInterval">同步间隔</label><input id="deploySyncInterval" value="30s"></div>
+		                  <div><label data-i18n="field.waitHeartbeat">等待心跳秒数</label><input id="deployWaitHeartbeat" type="number" min="15" value="120"></div>
+		                  <div><label data-i18n="field.upgradeImage">升级镜像</label><input id="upgradeImage" placeholder="ghcr.io/ferryboatseranade/glider:v..."></div>
+		                  <div class="checkbox-row"><input id="deployInstallDocker" type="checkbox" checked><label for="deployInstallDocker" data-i18n="field.installDocker">缺少 Docker 时安装</label></div>
+		                </div>
+		                <div class="actions">
+		                  <button class="primary" onclick="saveServer()" data-i18n="action.saveServer">保存服务器</button>
+		                  <button onclick="testServerSSH()" data-i18n="action.testSSH">测试 SSH</button>
+		                  <button onclick="preflightServerNode()" data-i18n="action.preflight">预检</button>
+		                  <button onclick="inspectServerNode()" data-i18n="action.inspectNode">检查节点</button>
+		                  <button class="primary" onclick="onboardServerNode()" data-i18n="action.onboardNode">接入节点</button>
+		                  <button onclick="deployServerNode()" data-i18n="action.deployNode">部署节点</button>
+		                  <button onclick="restartServerNode()" data-i18n="action.restartNode">重启节点</button>
+		                  <button onclick="upgradeServerNode()" data-i18n="action.upgradeNode">升级节点</button>
+		                  <button onclick="rollbackServerNode()" data-i18n="action.rollbackNode">回滚节点</button>
+		                  <button class="danger" onclick="deleteServer()" data-i18n="action.delete">删除</button>
+		                </div>
+		                <div id="serverResult" class="result" data-i18n="result.serverHint">保存服务器，测试 SSH，然后部署 node 模式。</div>
+		              </div>
+		            </div>
+		          </div>
+		          <div class="panel">
+		            <div class="panel-head"><div class="panel-title" data-i18n="panel.provisioningJobs">部署任务</div><span id="jobsCount" class="pill">0</span></div>
+		            <div class="panel-body">
+		              <div id="jobsTable" class="table-wrap" data-i18n="result.noJobs">还没有任务。</div>
+		            </div>
+		          </div>
+		          <div class="panel">
+		            <div class="panel-head"><div class="panel-title" data-i18n="panel.recentEvents">最近事件</div><span id="eventsCount" class="pill">0</span></div>
+		            <div class="panel-body">
+		              <div id="eventsTable" class="table-wrap" data-i18n="result.noEvents">还没有事件。</div>
+		            </div>
+		          </div>
+		        </section>
 
-	        <section id="tabCerts" class="tabs">
+		        <section id="tabCerts" class="tabs">
           <div class="panel">
-            <div class="panel-head"><div class="panel-title">Cloudflare Settings</div><span id="cfTokenStatus" class="pill">not configured</span></div>
+            <div class="panel-head"><div class="panel-title" data-i18n="panel.cloudflareSettings">Cloudflare 设置</div><span id="cfTokenStatus" class="pill">not configured</span></div>
             <div class="panel-body">
               <div class="form-grid">
-                <div><label>API token</label><input id="cfAPIToken" type="password" autocomplete="new-password" placeholder="new API token or leave blank"></div>
-                <div><label>Account ID</label><input id="cfAccountID" placeholder="account token only"></div>
-                <div><label>ACME email</label><input id="cfACMEEmail" placeholder="admin@example.com"></div>
-                <div class="wide"><label>ACME directory</label><input id="cfACMEDirectory" placeholder="Let's Encrypt production"></div>
-                <div><label>Zone test domain</label><input id="cfVerifyDomain" placeholder="proxy.example.com"></div>
-                <div class="checkbox-row"><input id="cfDNSEditTest" type="checkbox"><label for="cfDNSEditTest">DNS edit test</label></div>
+                <div><label data-i18n="field.apiToken">API 令牌</label><input id="cfAPIToken" type="password" autocomplete="new-password" placeholder="new API token or leave blank" data-i18n-placeholder="placeholder.newAPIToken"></div>
+                <div><label data-i18n="field.accountID">账户 ID</label><input id="cfAccountID" placeholder="account token only" data-i18n-placeholder="placeholder.accountTokenOnly"></div>
+                <div><label data-i18n="field.acmeEmail">ACME 邮箱</label><input id="cfACMEEmail" placeholder="admin@example.com"></div>
+                <div class="wide"><label data-i18n="field.acmeDirectory">ACME 目录</label><input id="cfACMEDirectory" placeholder="Let's Encrypt production" data-i18n-placeholder="placeholder.letsEncrypt"></div>
+                <div><label data-i18n="field.zoneTestDomain">Zone 测试域名</label><input id="cfVerifyDomain" placeholder="proxy.example.com"></div>
+                <div class="checkbox-row"><input id="cfDNSEditTest" type="checkbox"><label for="cfDNSEditTest" data-i18n="field.dnsEditTest">DNS 编辑测试</label></div>
               </div>
               <div class="actions">
-                <button class="primary" onclick="saveCloudflareSettings()">Save Settings</button>
-                <button onclick="verifyCloudflareToken()">Verify Token</button>
-                <button class="danger" onclick="clearCloudflareToken()">Clear Token</button>
+                <button class="primary" onclick="saveCloudflareSettings()" data-i18n="action.saveSettings">保存设置</button>
+                <button onclick="verifyCloudflareToken()" data-i18n="action.verifyToken">验证令牌</button>
+                <button class="danger" onclick="clearCloudflareToken()" data-i18n="action.clearToken">清除令牌</button>
               </div>
-              <div id="cfSettingsResult" class="result">Cloudflare token is required for DNS sync, failover, and ACME DNS-01.</div>
+              <div id="cfSettingsResult" class="result" data-i18n="result.cloudflareHint">DNS 同步、故障切换和 ACME DNS-01 需要 Cloudflare 令牌。</div>
             </div>
           </div>
           <div class="grid">
             <div class="panel">
-              <div class="panel-head"><div class="panel-title">Domains</div><span id="domainsCount" class="pill">0</span></div>
-              <div class="search-row"><input id="domainSearch" placeholder="Search domains, nodes, DNS status" oninput="renderDomains()"></div>
+              <div class="panel-head"><div class="panel-title" data-i18n="panel.domains">域名</div><span id="domainsCount" class="pill">0</span></div>
+              <div class="search-row"><input id="domainSearch" placeholder="Search domains, nodes, DNS status" data-i18n-placeholder="placeholder.domainSearch" oninput="renderDomains()"></div>
               <div id="domainsList" class="list"></div>
             </div>
             <div class="panel">
-              <div class="panel-head"><div class="panel-title">Domain Editor</div><span id="selectedDomainStatus" class="pill">new</span></div>
+              <div class="panel-head"><div class="panel-title" data-i18n="panel.domainEditor">域名编辑器</div><span id="selectedDomainStatus" class="pill">new</span></div>
               <div class="panel-body">
                 <div class="form-grid">
-                  <div><label>Domain</label><input id="domainName" placeholder="proxy.example.com"></div>
-                  <div><label>Active node</label><select id="domainActiveNode"></select></div>
-                  <div class="wide"><label>Assigned nodes</label><div id="domainNodeList" class="node-select"></div></div>
-                  <div><label>Cloudflare zone ID</label><input id="domainZoneID" placeholder="optional"></div>
-                  <div><label>Record name</label><input id="domainRecordName" placeholder="proxy.example.com"></div>
-                  <div><label>Record type</label><select id="domainRecordType"><option value="">Auto</option><option value="A">A</option><option value="AAAA">AAAA</option></select></div>
-                  <div><label>TTL</label><input id="domainTTL" type="number" min="1" value="1"></div>
-                  <div><label>Renew before days</label><input id="domainRenewBefore" type="number" min="1" value="30"></div>
-                  <div><label>Fail threshold</label><input id="domainFailThreshold" type="number" min="1" value="3"></div>
-                  <div><label>Cooldown seconds</label><input id="domainCooldownSeconds" type="number" min="1" value="300"></div>
-                  <div><label>Primary node</label><select id="domainPrimaryNode"></select></div>
-                  <div class="checkbox-row"><input id="domainEnabled" type="checkbox" checked><label for="domainEnabled">Enabled</label></div>
-                  <div class="checkbox-row"><input id="domainProxied" type="checkbox"><label for="domainProxied">Cloudflare proxied</label></div>
-                  <div class="checkbox-row"><input id="domainFailover" type="checkbox"><label for="domainFailover">Heartbeat failover</label></div>
-                  <div class="checkbox-row"><input id="domainManualLock" type="checkbox"><label for="domainManualLock">Manual lock active node</label></div>
-                  <div class="checkbox-row"><input id="domainAutoFailback" type="checkbox"><label for="domainAutoFailback">Auto failback</label></div>
-                  <div class="checkbox-row"><input id="domainRunIssueCert" type="checkbox" checked><label for="domainRunIssueCert">Run issue cert</label></div>
-                  <div class="checkbox-row"><input id="domainRunWaitCertSync" type="checkbox" checked><label for="domainRunWaitCertSync">Wait cert sync</label></div>
-                  <div class="checkbox-row"><input id="domainRunSyncDNS" type="checkbox" checked><label for="domainRunSyncDNS">Run DNS sync</label></div>
-                  <div class="checkbox-row"><input id="domainRunEnableFailover" type="checkbox"><label for="domainRunEnableFailover">Enable failover in run</label></div>
-                  <div><label>Cert sync wait seconds</label><input id="domainRunWaitCertSyncSeconds" type="number" min="15" value="180"></div>
-                  <div><label>ACME email</label><input id="domainACMEEmail" placeholder="admin@example.com"></div>
-                  <div><label>ACME directory</label><input id="domainACMEDirectory" placeholder="Let's Encrypt production"></div>
-                  <div class="wide"><label>Import fullchain PEM</label><textarea id="domainImportFullchain" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
-                  <div class="wide"><label>Import private key PEM</label><textarea id="domainImportKey" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
+                  <div><label data-i18n="field.domain">域名</label><input id="domainName" placeholder="proxy.example.com"></div>
+                  <div><label data-i18n="field.activeNode">当前节点</label><select id="domainActiveNode"></select></div>
+                  <div class="wide"><label data-i18n="field.assignedNodes">分配节点</label><div id="domainNodeList" class="node-select"></div></div>
+                  <div><label data-i18n="field.cloudflareZoneID">Cloudflare Zone ID</label><input id="domainZoneID" placeholder="optional" data-i18n-placeholder="placeholder.optional"></div>
+                  <div><label data-i18n="field.recordName">记录名</label><input id="domainRecordName" placeholder="proxy.example.com"></div>
+                  <div><label data-i18n="field.recordType">记录类型</label><select id="domainRecordType"><option value="" data-i18n="option.auto">自动</option><option value="A">A</option><option value="AAAA">AAAA</option></select></div>
+                  <div><label data-i18n="field.ttl">TTL</label><input id="domainTTL" type="number" min="1" value="1"></div>
+                  <div><label data-i18n="field.renewBeforeDays">提前续期天数</label><input id="domainRenewBefore" type="number" min="1" value="30"></div>
+                  <div><label data-i18n="field.failThreshold">失败阈值</label><input id="domainFailThreshold" type="number" min="1" value="3"></div>
+                  <div><label data-i18n="field.cooldownSeconds">冷却秒数</label><input id="domainCooldownSeconds" type="number" min="1" value="300"></div>
+                  <div><label data-i18n="field.primaryNode">主节点</label><select id="domainPrimaryNode"></select></div>
+                  <div class="checkbox-row"><input id="domainEnabled" type="checkbox" checked><label for="domainEnabled" data-i18n="field.enabled">启用</label></div>
+                  <div class="checkbox-row"><input id="domainProxied" type="checkbox"><label for="domainProxied" data-i18n="field.cloudflareProxied">Cloudflare 代理</label></div>
+                  <div class="checkbox-row"><input id="domainFailover" type="checkbox"><label for="domainFailover" data-i18n="field.heartbeatFailover">心跳故障切换</label></div>
+                  <div class="checkbox-row"><input id="domainManualLock" type="checkbox"><label for="domainManualLock" data-i18n="field.manualLockActiveNode">手动锁定当前节点</label></div>
+                  <div class="checkbox-row"><input id="domainAutoFailback" type="checkbox"><label for="domainAutoFailback" data-i18n="field.autoFailback">自动切回</label></div>
+                  <div class="checkbox-row"><input id="domainRunIssueCert" type="checkbox" checked><label for="domainRunIssueCert" data-i18n="field.runIssueCert">执行证书申请</label></div>
+                  <div class="checkbox-row"><input id="domainRunWaitCertSync" type="checkbox" checked><label for="domainRunWaitCertSync" data-i18n="field.waitCertSync">等待证书同步</label></div>
+                  <div class="checkbox-row"><input id="domainRunSyncDNS" type="checkbox" checked><label for="domainRunSyncDNS" data-i18n="field.runDNSSync">执行 DNS 同步</label></div>
+                  <div class="checkbox-row"><input id="domainRunEnableFailover" type="checkbox"><label for="domainRunEnableFailover" data-i18n="field.enableFailoverInRun">接入时启用故障切换</label></div>
+                  <div><label data-i18n="field.certSyncWaitSeconds">证书同步等待秒数</label><input id="domainRunWaitCertSyncSeconds" type="number" min="15" value="180"></div>
+                  <div><label data-i18n="field.acmeEmail">ACME 邮箱</label><input id="domainACMEEmail" placeholder="admin@example.com"></div>
+                  <div><label data-i18n="field.acmeDirectory">ACME 目录</label><input id="domainACMEDirectory" placeholder="Let's Encrypt production" data-i18n-placeholder="placeholder.letsEncrypt"></div>
+                  <div class="wide"><label data-i18n="field.importFullchainPEM">导入 fullchain PEM</label><textarea id="domainImportFullchain" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+                  <div class="wide"><label data-i18n="field.importPrivateKeyPEM">导入私钥 PEM</label><textarea id="domainImportKey" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
                 </div>
                 <div class="actions">
-                  <button class="primary" onclick="saveDomain()">Save Domain</button>
-                  <button onclick="checkDomainOnboarding()">Onboarding Check</button>
-                  <button onclick="runDomainOnboarding()">Run Onboarding</button>
-                  <button onclick="previewDomainDNS()">Preview DNS</button>
-                  <button onclick="syncDomainDNS()">Sync DNS</button>
-                  <button onclick="previewDomainFailover()">Preview Failover</button>
-                  <button onclick="runDomainFailover()">Run Failover</button>
-                  <button onclick="resetDomainFailover()">Reset Failover</button>
-                  <button onclick="previewDomainCert()">Preview Cert</button>
-                  <button onclick="issueDomainCert()">Issue Cert</button>
-                  <button onclick="importDomainCert()">Import Cert</button>
-                  <button class="danger" onclick="deleteDomain()">Delete</button>
+                  <button class="primary" onclick="saveDomain()" data-i18n="action.saveDomain">保存域名</button>
+                  <button onclick="checkDomainOnboarding()" data-i18n="action.onboardingCheck">接入检查</button>
+                  <button onclick="runDomainOnboarding()" data-i18n="action.runOnboarding">执行接入</button>
+                  <button onclick="previewDomainDNS()" data-i18n="action.previewDNS">预览 DNS</button>
+                  <button onclick="syncDomainDNS()" data-i18n="action.syncDNS">同步 DNS</button>
+                  <button onclick="previewDomainFailover()" data-i18n="action.previewFailover">预览故障切换</button>
+                  <button onclick="runDomainFailover()" data-i18n="action.runFailover">执行故障切换</button>
+                  <button onclick="resetDomainFailover()" data-i18n="action.resetFailover">重置故障切换</button>
+                  <button onclick="previewDomainCert()" data-i18n="action.previewCert">预览证书</button>
+                  <button onclick="issueDomainCert()" data-i18n="action.issueCert">申请证书</button>
+                  <button onclick="importDomainCert()" data-i18n="action.importCert">导入证书</button>
+                  <button class="danger" onclick="deleteDomain()" data-i18n="action.delete">删除</button>
                 </div>
-                <div id="domainResult" class="result">Select or save a domain. Cloudflare and ACME credentials stay on the admin server.</div>
+                <div id="domainResult" class="result" data-i18n="result.domainHint">选择或保存域名。Cloudflare 和 ACME 凭据保存在 admin 服务器。</div>
               </div>
             </div>
           </div>
@@ -4593,26 +4615,509 @@ let cloudflareSettings = null;
 let rulesHealthCache = null;
 let lastCheck = null;
 let healthTimer = null;
+let currentLanguage = loadStoredLanguage();
+let navCollapsed = loadStoredNavCollapsed();
 
-const titles = {
-  overview: ['Overview', 'Centralized users, routing rules, nodes, and live checks.'],
-  users: ['Users', 'Manage dynamic credentials and user-bound routes.'],
-  rules: ['Rules', 'Edit forwarding rules stored in MongoDB.'],
-  checks: ['Connectivity', 'Probe route exit IPs and rule health.'],
-  nodes: ['Nodes', 'Heartbeat, config version, traffic, and node errors.'],
-  servers: ['Servers', 'SSH inventory, remote provisioning, and node deployment jobs.'],
-  certs: ['Domains', 'Cloudflare DNS, node assignment, and certificate bundles.']
+	const i18n = {
+	  zh: {
+	    'brand.subtitle': '控制面板',
+	    'nav.collapse': '折叠导航',
+	    'nav.expand': '展开导航',
+    'nav.overview': '总览',
+    'nav.users': '用户',
+    'nav.rules': '规则',
+    'nav.checks': '连通性',
+    'nav.nodes': '节点',
+    'nav.servers': '服务器',
+    'nav.domains': '域名',
+    'auth.token': '管理员令牌',
+    'language.label': '语言',
+    'action.save': '保存',
+    'action.clear': '清除',
+    'action.refresh': '刷新',
+    'action.reload': '重载',
+    'status.checkingToken': '正在通过 /api/auth/check 检查令牌...',
+    'status.clearingToken': '正在清除令牌...',
+    'status.tokenSaved': '令牌已保存',
+    'status.tokenPageOnly': '令牌在当前页面可用；浏览器存储不可用',
+	    'status.tokenCleared': '令牌已清除',
+	    'status.tokenNotSaved': '令牌未保存：',
+	    'placeholder.adminToken': 'Bearer 令牌',
+	    'placeholder.ruleOrUsername': '规则名或用户名',
+	    'placeholder.userSearch': '搜索用户、规则、状态',
+	    'placeholder.username': '用户名',
+	    'placeholder.password': '密码',
+	    'placeholder.ruleSearch': '搜索规则或 forward 内容',
+	    'placeholder.ruleName': '不含 .rule 的规则名',
+	    'placeholder.nodeSearch': '搜索节点、主机、IP、版本、错误',
+	    'placeholder.serverSearch': '搜索服务器、主机、节点',
+	    'placeholder.friendlyName': '易识别名称',
+	    'placeholder.leaveBlank': '留空则保持不变',
+	    'placeholder.optional': '可选',
+	    'placeholder.manualDeployOnly': '仅手动部署需要',
+	    'placeholder.newAPIToken': '新 API 令牌，留空则保持不变',
+	    'placeholder.accountTokenOnly': '仅 Account API Token 需要',
+	    'placeholder.letsEncrypt': 'Let\u0027s Encrypt 生产环境',
+	    'placeholder.domainSearch': '搜索域名、节点、DNS 状态',
+	    'stat.users': '用户',
+	    'stat.activeUsers': '活跃用户',
+	    'stat.rules': '规则',
+	    'stat.healthyRules': '健康规则',
+	    'stat.nodesOnline': '在线节点',
+	    'stat.configVersion': '配置版本',
+	    'stat.nodesSynced': '已同步节点',
+	    'overview.quickCheck': '快速出口 IP 检测',
+	    'panel.users': '用户',
+	    'panel.userEditor': '用户编辑器',
+	    'panel.rules': '规则',
+	    'panel.ruleEditor': '规则编辑器',
+	    'panel.connectivityLab': '连通性实验室',
+	    'panel.rulesHealth': '规则健康度',
+	    'panel.nodes': '节点',
+	    'panel.servers': '服务器',
+	    'panel.serverProvisioning': '服务器部署',
+	    'panel.provisioningJobs': '部署任务',
+	    'panel.recentEvents': '最近事件',
+	    'panel.cloudflareSettings': 'Cloudflare 设置',
+	    'panel.domains': '域名',
+	    'panel.domainEditor': '域名编辑器',
+	    'field.routeType': '路由类型',
+	    'field.name': '名称',
+	    'field.targetURL': '目标 URL',
+	    'field.timeout': '超时',
+	    'field.username': '用户名',
+	    'field.password': '密码',
+	    'field.rule': '规则',
+	    'field.expiresAt': '过期时间',
+	    'field.enabled': '启用',
+	    'field.ruleName': '规则名称',
+	    'field.ruleContent': '规则内容',
+	    'field.type': '类型',
+	    'field.intervalSeconds': '间隔秒数',
+	    'field.auto': '自动',
+	    'field.serverID': '服务器 ID',
+	    'field.nodeID': '节点 ID',
+	    'field.friendlyName': '名称',
+	    'field.host': '主机',
+	    'field.sshPort': 'SSH 端口',
+	    'field.sshUser': 'SSH 用户',
+	    'field.authType': '认证方式',
+	    'field.deployDir': '部署目录',
+	    'field.image': '镜像',
+	    'field.proxyPorts': '代理端口',
+	    'field.trafficIface': '流量网卡',
+	    'field.keyPassphrase': '私钥口令',
+	    'field.privateKey': '私钥',
+	    'field.centralURL': '中枢 URL',
+	    'field.nodeToken': '节点令牌',
+	    'field.syncInterval': '同步间隔',
+	    'field.waitHeartbeat': '等待心跳秒数',
+	    'field.upgradeImage': '升级镜像',
+	    'field.installDocker': '缺少 Docker 时安装',
+	    'field.apiToken': 'API 令牌',
+	    'field.accountID': '账户 ID',
+	    'field.acmeEmail': 'ACME 邮箱',
+	    'field.acmeDirectory': 'ACME 目录',
+	    'field.zoneTestDomain': 'Zone 测试域名',
+	    'field.dnsEditTest': 'DNS 编辑测试',
+	    'field.domain': '域名',
+	    'field.activeNode': '当前节点',
+	    'field.assignedNodes': '分配节点',
+	    'field.cloudflareZoneID': 'Cloudflare Zone ID',
+	    'field.recordName': '记录名',
+	    'field.recordType': '记录类型',
+	    'field.ttl': 'TTL',
+	    'field.renewBeforeDays': '提前续期天数',
+	    'field.failThreshold': '失败阈值',
+	    'field.cooldownSeconds': '冷却秒数',
+	    'field.primaryNode': '主节点',
+	    'field.cloudflareProxied': 'Cloudflare 代理',
+	    'field.heartbeatFailover': '心跳故障切换',
+	    'field.manualLockActiveNode': '手动锁定当前节点',
+	    'field.autoFailback': '自动切回',
+	    'field.runIssueCert': '执行证书申请',
+	    'field.waitCertSync': '等待证书同步',
+	    'field.runDNSSync': '执行 DNS 同步',
+	    'field.enableFailoverInRun': '接入时启用故障切换',
+	    'field.certSyncWaitSeconds': '证书同步等待秒数',
+	    'field.importFullchainPEM': '导入 fullchain PEM',
+	    'field.importPrivateKeyPEM': '导入私钥 PEM',
+	    'option.defaultRoute': '默认路由',
+	    'option.ruleRoute': '规则路由',
+	    'option.userRoute': '用户路由',
+	    'option.default': '默认',
+	    'option.rule': '规则',
+	    'option.user': '用户',
+	    'option.auto': '自动',
+	    'option.selectNode': '选择节点',
+	    'option.firstAssignedNode': '第一个分配节点',
+	    'option.password': '密码',
+	    'option.privateKey': '私钥',
+	    'action.runCheck': '运行检测',
+	    'action.saveUser': '保存用户',
+	    'action.deleteUser': '删除用户',
+	    'action.checkIPInfo': '检测 IP 信息',
+	    'action.saveRule': '保存规则',
+	    'action.deleteRule': '删除规则',
+	    'action.checkAllRules': '检测全部规则',
+	    'action.saveServer': '保存服务器',
+	    'action.testSSH': '测试 SSH',
+	    'action.preflight': '预检',
+	    'action.inspectNode': '检查节点',
+	    'action.onboardNode': '接入节点',
+	    'action.deployNode': '部署节点',
+	    'action.restartNode': '重启节点',
+	    'action.upgradeNode': '升级节点',
+	    'action.rollbackNode': '回滚节点',
+	    'action.delete': '删除',
+	    'action.saveSettings': '保存设置',
+	    'action.verifyToken': '验证令牌',
+	    'action.clearToken': '清除令牌',
+	    'action.saveDomain': '保存域名',
+	    'action.onboardingCheck': '接入检查',
+	    'action.runOnboarding': '执行接入',
+	    'action.previewDNS': '预览 DNS',
+	    'action.syncDNS': '同步 DNS',
+	    'action.previewFailover': '预览故障切换',
+	    'action.runFailover': '执行故障切换',
+	    'action.resetFailover': '重置故障切换',
+	    'action.previewCert': '预览证书',
+	    'action.issueCert': '申请证书',
+	    'action.importCert': '导入证书',
+	    'pill.routeExitIP': '路由出口 IP',
+	    'result.noCheck': '还没有运行检测。',
+	    'result.userCheckHint': '选择或保存用户后运行路由检测。',
+	    'result.ruleCheckHint': '选择或保存规则后运行路由检测。',
+	    'result.checkRuntime': '检测会通过当前加载的本地代理运行时执行。',
+	    'result.noHealthCheck': '还没有运行健康检测。',
+	    'result.noNodes': '还没有节点上报。',
+	    'result.noJobs': '还没有任务。',
+	    'result.noEvents': '还没有事件。',
+	    'result.serverHint': '保存服务器，测试 SSH，然后部署 node 模式。',
+	    'result.cloudflareHint': 'DNS 同步、故障切换和 ACME DNS-01 需要 Cloudflare 令牌。',
+	    'result.domainHint': '选择或保存域名。Cloudflare 和 ACME 凭据保存在 admin 服务器。',
+	    'empty.noMatchingRules': '没有匹配的规则。',
+	    'empty.noMatchingUsers': '没有匹配的用户。',
+	    'empty.noMatchingNodes': '没有匹配的节点。',
+	    'empty.noNodes': '还没有节点上报。',
+	    'empty.noMatchingServers': '没有匹配的服务器。',
+	    'empty.noJobs': '还没有任务。',
+	    'empty.noEvents': '还没有事件。',
+	    'empty.noMatchingDomains': '没有匹配的域名。',
+	    'empty.noRuleHealthResults': '没有规则健康结果。',
+	    'empty.noSavedRuleHealth': '还没有保存的规则健康检测。',
+	    'table.node': '节点',
+	    'table.status': '状态',
+	    'table.publicIP': '公网 IP',
+	    'table.token': '令牌',
+	    'table.versions': '版本',
+	    'table.traffic': '流量',
+	    'table.topUsers': '用户排行',
+	    'table.topRules': '规则排行',
+	    'table.topDialers': '线路排行',
+	    'table.uptime': '运行时间',
+	    'table.lastHeartbeat': '最后心跳',
+	    'table.error': '错误',
+	    'table.actions': '操作',
+	    'table.job': '任务',
+	    'table.target': '目标',
+	    'table.created': '创建时间',
+	    'table.finished': '完成时间',
+	    'table.logs': '日志',
+	    'table.time': '时间',
+	    'table.event': '事件',
+	    'table.message': '消息',
+	    'table.metadata': '元数据',
+	    'table.rule': '规则',
+	    'table.exitIP': '出口 IP',
+	    'table.org': '组织',
+	    'table.location': '位置',
+	    'table.dialer': '线路',
+	    'table.latency': '延迟',
+	    'button.ipInfo': 'IP 信息',
+	    'button.deploy': '部署',
+	    'button.setToken': '设置令牌',
+	    'button.clearToken': '清除令牌',
+	    'button.cancel': '取消',
+	    'confirm.cancelJob': '取消任务',
+	    'confirm.deleteServer': '删除服务器',
+	    'confirm.deleteNode': '删除节点',
+	    'confirm.clearNodeToken': '清除此节点的专用令牌',
+	    'prompt.newNodeToken': '节点新令牌（至少 16 个字符）：',
+	    'status.nodeWillReappear': '如果节点仍在运行，它会在下一次心跳后重新出现。',
+	    'status.nodeTokenFallback': '节点会回退到共享节点令牌。',
+	    'status.jobCancellationRequested': '已请求取消任务',
+	    'title.overview': '总览',
+    'subtitle.overview': '集中管理用户、路由规则、节点和实时检测。',
+    'title.users': '用户',
+    'subtitle.users': '管理动态凭据和用户绑定路由。',
+    'title.rules': '规则',
+    'subtitle.rules': '编辑存储在 MongoDB 中的转发规则。',
+    'title.checks': '连通性',
+    'subtitle.checks': '检测路由出口 IP 和规则健康度。',
+    'title.nodes': '节点',
+    'subtitle.nodes': '查看心跳、配置版本、流量和节点错误。',
+    'title.servers': '服务器',
+    'subtitle.servers': '管理 SSH 资产、远程预检和节点部署任务。',
+    'title.certs': '域名',
+    'subtitle.certs': '管理 Cloudflare DNS、节点分配和证书包。'
+  },
+  en: {
+    'brand.subtitle': 'Control Plane',
+    'nav.collapse': 'Collapse nav',
+    'nav.expand': 'Expand nav',
+    'nav.overview': 'Overview',
+    'nav.users': 'Users',
+    'nav.rules': 'Rules',
+    'nav.checks': 'Connectivity',
+    'nav.nodes': 'Nodes',
+    'nav.servers': 'Servers',
+    'nav.domains': 'Domains',
+    'auth.token': 'Admin token',
+    'language.label': 'Language',
+    'action.save': 'Save',
+    'action.clear': 'Clear',
+    'action.refresh': 'Refresh',
+    'action.reload': 'Reload',
+    'status.checkingToken': 'Checking token via /api/auth/check...',
+    'status.clearingToken': 'Clearing token...',
+    'status.tokenSaved': 'Token saved',
+    'status.tokenPageOnly': 'Token works for this page; browser storage is unavailable',
+	    'status.tokenCleared': 'Token cleared',
+	    'status.tokenNotSaved': 'Token not saved: ',
+	    'placeholder.adminToken': 'Bearer token',
+	    'placeholder.ruleOrUsername': 'rule or username',
+	    'placeholder.userSearch': 'Search users, rules, status',
+	    'placeholder.username': 'username',
+	    'placeholder.password': 'password',
+	    'placeholder.ruleSearch': 'Search rules or forward content',
+	    'placeholder.ruleName': 'rule name without .rule',
+	    'placeholder.nodeSearch': 'Search nodes, hosts, IPs, versions, errors',
+	    'placeholder.serverSearch': 'Search servers, hosts, nodes',
+	    'placeholder.friendlyName': 'friendly name',
+	    'placeholder.leaveBlank': 'leave blank to keep',
+	    'placeholder.optional': 'optional',
+	    'placeholder.manualDeployOnly': 'manual deploy only',
+	    'placeholder.newAPIToken': 'new API token or leave blank',
+	    'placeholder.accountTokenOnly': 'account token only',
+	    'placeholder.letsEncrypt': 'Let\u0027s Encrypt production',
+	    'placeholder.domainSearch': 'Search domains, nodes, DNS status',
+	    'stat.users': 'Users',
+	    'stat.activeUsers': 'Active users',
+	    'stat.rules': 'Rules',
+	    'stat.healthyRules': 'Healthy rules',
+	    'stat.nodesOnline': 'Nodes online',
+	    'stat.configVersion': 'Config version',
+	    'stat.nodesSynced': 'Nodes synced',
+	    'overview.quickCheck': 'Quick IP Info Check',
+	    'panel.users': 'Users',
+	    'panel.userEditor': 'User Editor',
+	    'panel.rules': 'Rules',
+	    'panel.ruleEditor': 'Rule Editor',
+	    'panel.connectivityLab': 'Connectivity Lab',
+	    'panel.rulesHealth': 'Rules Health',
+	    'panel.nodes': 'Nodes',
+	    'panel.servers': 'Servers',
+	    'panel.serverProvisioning': 'Server Provisioning',
+	    'panel.provisioningJobs': 'Provisioning Jobs',
+	    'panel.recentEvents': 'Recent Events',
+	    'panel.cloudflareSettings': 'Cloudflare Settings',
+	    'panel.domains': 'Domains',
+	    'panel.domainEditor': 'Domain Editor',
+	    'field.routeType': 'Route type',
+	    'field.name': 'Name',
+	    'field.targetURL': 'Target URL',
+	    'field.timeout': 'Timeout',
+	    'field.username': 'Username',
+	    'field.password': 'Password',
+	    'field.rule': 'Rule',
+	    'field.expiresAt': 'Expires at',
+	    'field.enabled': 'Enabled',
+	    'field.ruleName': 'Rule name',
+	    'field.ruleContent': 'Rule content',
+	    'field.type': 'Type',
+	    'field.intervalSeconds': 'Interval seconds',
+	    'field.auto': 'auto',
+	    'field.serverID': 'Server ID',
+	    'field.nodeID': 'Node ID',
+	    'field.friendlyName': 'Name',
+	    'field.host': 'Host',
+	    'field.sshPort': 'SSH port',
+	    'field.sshUser': 'SSH user',
+	    'field.authType': 'Auth type',
+	    'field.deployDir': 'Deploy dir',
+	    'field.image': 'Image',
+	    'field.proxyPorts': 'Proxy ports',
+	    'field.trafficIface': 'Traffic iface',
+	    'field.keyPassphrase': 'Key passphrase',
+	    'field.privateKey': 'Private key',
+	    'field.centralURL': 'Central URL',
+	    'field.nodeToken': 'Node token',
+	    'field.syncInterval': 'Sync interval',
+	    'field.waitHeartbeat': 'Wait heartbeat seconds',
+	    'field.upgradeImage': 'Upgrade image',
+	    'field.installDocker': 'Install Docker if missing',
+	    'field.apiToken': 'API token',
+	    'field.accountID': 'Account ID',
+	    'field.acmeEmail': 'ACME email',
+	    'field.acmeDirectory': 'ACME directory',
+	    'field.zoneTestDomain': 'Zone test domain',
+	    'field.dnsEditTest': 'DNS edit test',
+	    'field.domain': 'Domain',
+	    'field.activeNode': 'Active node',
+	    'field.assignedNodes': 'Assigned nodes',
+	    'field.cloudflareZoneID': 'Cloudflare zone ID',
+	    'field.recordName': 'Record name',
+	    'field.recordType': 'Record type',
+	    'field.ttl': 'TTL',
+	    'field.renewBeforeDays': 'Renew before days',
+	    'field.failThreshold': 'Fail threshold',
+	    'field.cooldownSeconds': 'Cooldown seconds',
+	    'field.primaryNode': 'Primary node',
+	    'field.cloudflareProxied': 'Cloudflare proxied',
+	    'field.heartbeatFailover': 'Heartbeat failover',
+	    'field.manualLockActiveNode': 'Manual lock active node',
+	    'field.autoFailback': 'Auto failback',
+	    'field.runIssueCert': 'Run issue cert',
+	    'field.waitCertSync': 'Wait cert sync',
+	    'field.runDNSSync': 'Run DNS sync',
+	    'field.enableFailoverInRun': 'Enable failover in run',
+	    'field.certSyncWaitSeconds': 'Cert sync wait seconds',
+	    'field.importFullchainPEM': 'Import fullchain PEM',
+	    'field.importPrivateKeyPEM': 'Import private key PEM',
+	    'option.defaultRoute': 'Default route',
+	    'option.ruleRoute': 'Rule route',
+	    'option.userRoute': 'User route',
+	    'option.default': 'Default',
+	    'option.rule': 'Rule',
+	    'option.user': 'User',
+	    'option.auto': 'Auto',
+	    'option.selectNode': 'Select node',
+	    'option.firstAssignedNode': 'First assigned node',
+	    'option.password': 'Password',
+	    'option.privateKey': 'Private key',
+	    'action.runCheck': 'Run Check',
+	    'action.saveUser': 'Save User',
+	    'action.deleteUser': 'Delete User',
+	    'action.checkIPInfo': 'Check IP Info',
+	    'action.saveRule': 'Save Rule',
+	    'action.deleteRule': 'Delete Rule',
+	    'action.checkAllRules': 'Check All Rules',
+	    'action.saveServer': 'Save Server',
+	    'action.testSSH': 'Test SSH',
+	    'action.preflight': 'Preflight',
+	    'action.inspectNode': 'Inspect Node',
+	    'action.onboardNode': 'Onboard Node',
+	    'action.deployNode': 'Deploy Node',
+	    'action.restartNode': 'Restart Node',
+	    'action.upgradeNode': 'Upgrade Node',
+	    'action.rollbackNode': 'Rollback Node',
+	    'action.delete': 'Delete',
+	    'action.saveSettings': 'Save Settings',
+	    'action.verifyToken': 'Verify Token',
+	    'action.clearToken': 'Clear Token',
+	    'action.saveDomain': 'Save Domain',
+	    'action.onboardingCheck': 'Onboarding Check',
+	    'action.runOnboarding': 'Run Onboarding',
+	    'action.previewDNS': 'Preview DNS',
+	    'action.syncDNS': 'Sync DNS',
+	    'action.previewFailover': 'Preview Failover',
+	    'action.runFailover': 'Run Failover',
+	    'action.resetFailover': 'Reset Failover',
+	    'action.previewCert': 'Preview Cert',
+	    'action.issueCert': 'Issue Cert',
+	    'action.importCert': 'Import Cert',
+	    'pill.routeExitIP': 'Route exit IP',
+	    'result.noCheck': 'No check has run yet.',
+	    'result.userCheckHint': 'Select or save a user, then run a route check.',
+	    'result.ruleCheckHint': 'Select or save a rule, then run a route check.',
+	    'result.checkRuntime': 'Checks run through the currently loaded local proxy runtime.',
+	    'result.noHealthCheck': 'No health check has run yet.',
+	    'result.noNodes': 'No nodes have reported yet.',
+	    'result.noJobs': 'No jobs yet.',
+	    'result.noEvents': 'No events yet.',
+	    'result.serverHint': 'Save a server, test SSH, then deploy node mode.',
+	    'result.cloudflareHint': 'Cloudflare token is required for DNS sync, failover, and ACME DNS-01.',
+	    'result.domainHint': 'Select or save a domain. Cloudflare and ACME credentials stay on the admin server.',
+	    'empty.noMatchingRules': 'No matching rules.',
+	    'empty.noMatchingUsers': 'No matching users.',
+	    'empty.noMatchingNodes': 'No matching nodes.',
+	    'empty.noNodes': 'No nodes have reported yet.',
+	    'empty.noMatchingServers': 'No matching servers.',
+	    'empty.noJobs': 'No jobs yet.',
+	    'empty.noEvents': 'No events yet.',
+	    'empty.noMatchingDomains': 'No matching domains.',
+	    'empty.noRuleHealthResults': 'No rule health results.',
+	    'empty.noSavedRuleHealth': 'No saved rule health check yet.',
+	    'table.node': 'Node',
+	    'table.status': 'Status',
+	    'table.publicIP': 'Public IP',
+	    'table.token': 'Token',
+	    'table.versions': 'Versions',
+	    'table.traffic': 'Traffic',
+	    'table.topUsers': 'Top Users',
+	    'table.topRules': 'Top Rules',
+	    'table.topDialers': 'Top Dialers',
+	    'table.uptime': 'Uptime',
+	    'table.lastHeartbeat': 'Last heartbeat',
+	    'table.error': 'Error',
+	    'table.actions': 'Actions',
+	    'table.job': 'Job',
+	    'table.target': 'Target',
+	    'table.created': 'Created',
+	    'table.finished': 'Finished',
+	    'table.logs': 'Logs',
+	    'table.time': 'Time',
+	    'table.event': 'Event',
+	    'table.message': 'Message',
+	    'table.metadata': 'Metadata',
+	    'table.rule': 'Rule',
+	    'table.exitIP': 'Exit IP',
+	    'table.org': 'Org',
+	    'table.location': 'Location',
+	    'table.dialer': 'Dialer',
+	    'table.latency': 'Latency',
+	    'button.ipInfo': 'IP Info',
+	    'button.deploy': 'Deploy',
+	    'button.setToken': 'Set Token',
+	    'button.clearToken': 'Clear Token',
+	    'button.cancel': 'Cancel',
+	    'confirm.cancelJob': 'Cancel job',
+	    'confirm.deleteServer': 'Delete server',
+	    'confirm.deleteNode': 'Delete node',
+	    'confirm.clearNodeToken': 'Clear dedicated token for node',
+	    'prompt.newNodeToken': 'New token for node (at least 16 characters):',
+	    'status.nodeWillReappear': 'It will reappear on the next heartbeat if still running.',
+	    'status.nodeTokenFallback': 'It will fall back to the shared node token.',
+	    'status.jobCancellationRequested': 'Job cancellation requested',
+	    'title.overview': 'Overview',
+    'subtitle.overview': 'Centralized users, routing rules, nodes, and live checks.',
+    'title.users': 'Users',
+    'subtitle.users': 'Manage dynamic credentials and user-bound routes.',
+    'title.rules': 'Rules',
+    'subtitle.rules': 'Edit forwarding rules stored in MongoDB.',
+    'title.checks': 'Connectivity',
+    'subtitle.checks': 'Probe route exit IPs and rule health.',
+    'title.nodes': 'Nodes',
+    'subtitle.nodes': 'Heartbeat, config version, traffic, and node errors.',
+    'title.servers': 'Servers',
+    'subtitle.servers': 'SSH inventory, remote provisioning, and node deployment jobs.',
+    'title.certs': 'Domains',
+    'subtitle.certs': 'Cloudflare DNS, node assignment, and certificate bundles.'
+  }
 };
 
 function $(id) { return document.getElementById(id); }
+function tr(key) { return (i18n[currentLanguage] && i18n[currentLanguage][key]) || i18n.en[key] || key; }
+function th(key) { return '<th>' + escapeHTML(tr(key)) + '</th>'; }
 
 function showTab(name) {
   ['overview','users','rules','checks','nodes','servers','certs'].forEach(tab => {
     $('tab' + cap(tab)).classList.toggle('active', tab === name);
     $('tabBtn' + cap(tab)).classList.toggle('active', tab === name);
   });
-  $('pageTitle').textContent = titles[name][0];
-  $('pageSubtitle').textContent = titles[name][1];
+  $('pageTitle').textContent = tr('title.' + name);
+  $('pageSubtitle').textContent = tr('subtitle.' + name);
   if (name === 'nodes') {
     loadConfigStatus();
     loadNodes();
@@ -4629,6 +5134,72 @@ function showTab(name) {
 }
 
 function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+function applyLanguage() {
+  document.documentElement.lang = currentLanguage === 'zh' ? 'zh-CN' : 'en';
+  document.title = currentLanguage === 'zh' ? 'Glider 控制面板' : 'Glider Control Plane';
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    el.textContent = tr(el.getAttribute('data-i18n'));
+  });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    el.placeholder = tr(el.getAttribute('data-i18n-placeholder'));
+  });
+  const sel = $('languageSelect');
+  if (sel) sel.value = currentLanguage;
+  updateNavToggle();
+  const active = document.querySelector('.nav button.active');
+  const tab = active ? active.id.replace(/^tabBtn/, '').toLowerCase() : 'overview';
+  if ($('pageTitle')) {
+    $('pageTitle').textContent = tr('title.' + tab);
+    $('pageSubtitle').textContent = tr('subtitle.' + tab);
+  }
+}
+
+function setLanguage(lang) {
+  currentLanguage = lang === 'en' ? 'en' : 'zh';
+  try { localStorage.setItem('gliderAdminLanguage', currentLanguage); } catch (e) {}
+  applyLanguage();
+  renderCachedViews();
+}
+
+function loadStoredLanguage() {
+  try {
+    const value = localStorage.getItem('gliderAdminLanguage');
+    return value === 'en' ? 'en' : 'zh';
+  } catch (e) {
+    return 'zh';
+  }
+}
+
+function loadStoredNavCollapsed() {
+  try {
+    return localStorage.getItem('gliderNavCollapsed') === '1';
+  } catch (e) {
+    return false;
+  }
+}
+
+function applyNavCollapsed() {
+  const app = $('appShell');
+  if (app) app.classList.toggle('nav-collapsed', navCollapsed);
+  updateNavToggle();
+}
+
+function updateNavToggle() {
+  const btn = $('navToggle');
+  if (!btn) return;
+  btn.title = navCollapsed ? tr('nav.expand') : tr('nav.collapse');
+  const label = btn.querySelector('.nav-toggle-label');
+  if (label) label.textContent = navCollapsed ? tr('nav.expand') : tr('nav.collapse');
+  const icon = btn.querySelector('.nav-toggle-icon');
+  if (icon) icon.textContent = navCollapsed ? '›' : '‹';
+}
+
+function toggleNav() {
+  navCollapsed = !navCollapsed;
+  try { localStorage.setItem('gliderNavCollapsed', navCollapsed ? '1' : '0'); } catch (e) {}
+  applyNavCollapsed();
+}
 
 function setStatus(message, tone) {
   const el = $('authStatus');
@@ -4738,17 +5309,17 @@ async function saveToken() {
   $('adminToken').value = token;
   const btn = $('saveTokenBtn');
   if (btn) btn.disabled = true;
-  setStatus(token ? 'Checking token via /api/auth/check...' : 'Clearing token...');
+  setStatus(token ? tr('status.checkingToken') : tr('status.clearingToken'));
   try {
     if (token) await verifyAdminToken(token);
     adminToken = token;
     const persisted = persistAdminToken(token);
-    setStatus(token ? (persisted ? 'Token saved' : 'Token works for this page; browser storage is unavailable') : 'Token cleared', persisted ? '' : 'warn');
+    setStatus(token ? (persisted ? tr('status.tokenSaved') : tr('status.tokenPageOnly')) : tr('status.tokenCleared'), persisted ? '' : 'warn');
     if (token) await refreshAll({ preserveStatus: true });
   } catch (e) {
     adminToken = previous;
     $('adminToken').value = previous;
-    setStatus('Token not saved: ' + e.message, 'err');
+    setStatus(tr('status.tokenNotSaved') + e.message, 'err');
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -4758,7 +5329,21 @@ function clearToken() {
   adminToken = '';
   $('adminToken').value = '';
   persistAdminToken('');
-  setStatus('Token cleared');
+  setStatus(tr('status.tokenCleared'));
+}
+
+function renderCachedViews() {
+  renderRules();
+  renderUsers();
+  renderNodes();
+  renderServers();
+  renderJobs();
+  renderEvents();
+  renderDomains();
+  renderDomainNodeControls();
+  if (cloudflareSettings) renderCloudflareSettings();
+  if (rulesHealthCache) renderRulesHealth();
+  renderStats();
 }
 
 async function refreshAll(opts) {
@@ -4961,12 +5546,12 @@ function renderRules() {
   const sel = $('userRule');
   const visible = visibleRules();
   list.innerHTML = '';
-  sel.innerHTML = '<option value="">(default)</option>';
-  if (!visible.length) list.innerHTML = '<div class="empty">No matching rules.</div>';
+  sel.innerHTML = '<option value="">(' + escapeHTML(tr('option.default')) + ')</option>';
+  if (!visible.length) list.innerHTML = '<div class="empty">' + escapeHTML(tr('empty.noMatchingRules')) + '</div>';
   visible.forEach(r => {
     const item = document.createElement('div');
     item.className = 'item';
-    item.innerHTML = '<div class="item-main"><div class="item-title">' + escapeHTML(r.name) + '</div><div class="item-sub">updated ' + formatDate(r.updated_at) + '</div></div><div class="item-actions"><button>IP Info</button></div>';
+    item.innerHTML = '<div class="item-main"><div class="item-title">' + escapeHTML(r.name) + '</div><div class="item-sub">updated ' + formatDate(r.updated_at) + '</div></div><div class="item-actions"><button>' + escapeHTML(tr('button.ipInfo')) + '</button></div>';
     item.querySelector('.item-main').onclick = () => selectRule(r.name);
     item.querySelector('button').onclick = () => runCheck({ type: 'rule', name: r.name, target: ipInfoTarget(), timeout: $('checkTimeout').value || '8s', resultId: 'ruleCheckResult', probe: 'ipinfo' });
     list.appendChild(item);
@@ -4984,12 +5569,12 @@ function renderUsers() {
   const list = $('usersList');
   const visible = visibleUsers();
   list.innerHTML = '';
-  if (!visible.length) list.innerHTML = '<div class="empty">No matching users.</div>';
+  if (!visible.length) list.innerHTML = '<div class="empty">' + escapeHTML(tr('empty.noMatchingUsers')) + '</div>';
   visible.forEach(u => {
     const status = userStatus(u);
     const item = document.createElement('div');
     item.className = 'item';
-    item.innerHTML = '<div class="item-main"><div class="item-title">' + escapeHTML(u.username) + '</div><div class="item-sub">' + escapeHTML(u.rule || '(default)') + ' · ' + escapeHTML(status) + '</div></div><div class="item-actions">' + statusPill(status) + '<button>IP Info</button></div>';
+    item.innerHTML = '<div class="item-main"><div class="item-title">' + escapeHTML(u.username) + '</div><div class="item-sub">' + escapeHTML(u.rule || '(' + tr('option.default') + ')') + ' · ' + escapeHTML(status) + '</div></div><div class="item-actions">' + statusPill(status) + '<button>' + escapeHTML(tr('button.ipInfo')) + '</button></div>';
     item.querySelector('.item-main').onclick = () => selectUser(u);
     item.querySelector('button').onclick = () => runCheck({ type: 'user', name: u.username, target: ipInfoTarget(), timeout: $('checkTimeout').value || '8s', resultId: 'userCheckResult', probe: 'ipinfo' });
     list.appendChild(item);
@@ -5001,11 +5586,11 @@ function renderNodes(nowValue) {
   const wrap = $('nodesTable');
   const visible = visibleNodes();
   if (!visible.length) {
-    wrap.innerHTML = '<div class="empty">' + (nodesCache.length ? 'No matching nodes.' : 'No nodes have reported yet.') + '</div>';
+    wrap.innerHTML = '<div class="empty">' + escapeHTML(nodesCache.length ? tr('empty.noMatchingNodes') : tr('empty.noNodes')) + '</div>';
     renderStats();
     return;
   }
-  wrap.innerHTML = '<table><thead><tr><th>Node</th><th>Status</th><th>Public IP</th><th>Token</th><th>Versions</th><th>Traffic</th><th>Top Users</th><th>Top Rules</th><th>Top Dialers</th><th>Uptime</th><th>Last heartbeat</th><th>Error</th><th>Actions</th></tr></thead><tbody>' + visible.map(n => {
+  wrap.innerHTML = '<table><thead><tr>' + [th('table.node'), th('table.status'), th('table.publicIP'), th('table.token'), th('table.versions'), th('table.traffic'), th('table.topUsers'), th('table.topRules'), th('table.topDialers'), th('table.uptime'), th('table.lastHeartbeat'), th('table.error'), th('table.actions')].join('') + '</tr></thead><tbody>' + visible.map(n => {
     const status = nodeStatus(n);
     const configSync = configSyncStatus(n);
     return '<tr>' +
@@ -5021,7 +5606,7 @@ function renderNodes(nowValue) {
       '<td>' + escapeHTML(formatDuration(n.uptime || 0)) + '</td>' +
       '<td>' + escapeHTML(formatDate(n.updated_at)) + '</td>' +
       '<td>' + escapeHTML(n.error || '-') + (n.cert_error ? '<div class="compact">cert ' + escapeHTML(n.cert_error) + '</div>' : '') + '</td>' +
-      '<td><button data-node-action="set-token" data-node-id="' + escapeHTML(n.node_id) + '">Set Token</button><button data-node-action="clear-token" data-node-id="' + escapeHTML(n.node_id) + '">Clear Token</button><button class="danger" data-node-action="delete" data-node-id="' + escapeHTML(n.node_id) + '">Delete</button></td>' +
+      '<td><button data-node-action="set-token" data-node-id="' + escapeHTML(n.node_id) + '">' + escapeHTML(tr('button.setToken')) + '</button><button data-node-action="clear-token" data-node-id="' + escapeHTML(n.node_id) + '">' + escapeHTML(tr('button.clearToken')) + '</button><button class="danger" data-node-action="delete" data-node-id="' + escapeHTML(n.node_id) + '">' + escapeHTML(tr('action.delete')) + '</button></td>' +
       '</tr>';
   }).join('') + '</tbody></table>';
   document.querySelectorAll('[data-node-action]').forEach(btn => {
@@ -5041,12 +5626,12 @@ function renderServers() {
   if (!list) return;
   const visible = visibleServers();
   list.innerHTML = '';
-  if (!visible.length) list.innerHTML = '<div class="empty">No matching servers.</div>';
+  if (!visible.length) list.innerHTML = '<div class="empty">' + escapeHTML(tr('empty.noMatchingServers')) + '</div>';
   visible.forEach(s => {
     const item = document.createElement('div');
     item.className = 'item';
     const status = s.status || 'saved';
-    item.innerHTML = '<div class="item-main"><div class="item-title">' + escapeHTML(s.server_id) + '</div><div class="item-sub">' + escapeHTML(s.host || '-') + ' · node ' + escapeHTML(s.node_id || '-') + ' · ' + escapeHTML(status) + '</div></div><div class="item-actions">' + statusPill(serverStatusTone(status)) + '<button>Deploy</button></div>';
+    item.innerHTML = '<div class="item-main"><div class="item-title">' + escapeHTML(s.server_id) + '</div><div class="item-sub">' + escapeHTML(s.host || '-') + ' · node ' + escapeHTML(s.node_id || '-') + ' · ' + escapeHTML(status) + '</div></div><div class="item-actions">' + statusPill(serverStatusTone(status)) + '<button>' + escapeHTML(tr('button.deploy')) + '</button></div>';
     item.querySelector('.item-main').onclick = () => selectServer(s.server_id);
     item.querySelector('button').onclick = () => {
       selectServerIntoForm(s);
@@ -5080,14 +5665,14 @@ function renderJobs() {
   const wrap = $('jobsTable');
   if (!wrap) return;
   if (!jobsCache.length) {
-    wrap.innerHTML = '<div class="empty">No jobs yet.</div>';
+    wrap.innerHTML = '<div class="empty">' + escapeHTML(tr('empty.noJobs')) + '</div>';
     renderStats();
     return;
   }
-  wrap.innerHTML = '<table><thead><tr><th>Job</th><th>Status</th><th>Target</th><th>Created</th><th>Finished</th><th>Error</th><th>Logs</th><th>Actions</th></tr></thead><tbody>' + jobsCache.map(job => {
+  wrap.innerHTML = '<table><thead><tr>' + [th('table.job'), th('table.status'), th('table.target'), th('table.created'), th('table.finished'), th('table.error'), th('table.logs'), th('table.actions')].join('') + '</tr></thead><tbody>' + jobsCache.map(job => {
     const logs = (job.logs || []).slice(-4).map(l => '<div class="compact">' + escapeHTML(formatDate(l.at)) + ' ' + escapeHTML(l.message) + '</div>').join('');
     const steps = jobStepsSummary(job);
-    const actions = isJobActive(job) ? '<button class="danger" data-job-cancel="' + escapeHTML(job.job_id || '') + '">Cancel</button>' : '<span class="compact">-</span>';
+    const actions = isJobActive(job) ? '<button class="danger" data-job-cancel="' + escapeHTML(job.job_id || '') + '">' + escapeHTML(tr('button.cancel')) + '</button>' : '<span class="compact">-</span>';
     return '<tr>' +
       '<td><strong>' + escapeHTML(job.type || '-') + '</strong><div class="compact mono">' + escapeHTML(job.job_id || '-') + '</div></td>' +
       '<td>' + statusPill(job.status || 'unknown') + '</td>' +
@@ -5117,10 +5702,10 @@ function isJobTerminal(status) {
 
 async function cancelJob(jobID, resultID) {
   if (!jobID) return null;
-  if (!confirm('Cancel job ' + jobID + '?')) return null;
+  if (!confirm(tr('confirm.cancelJob') + ' ' + jobID + '?')) return null;
   const job = await fetchJSON('/api/jobs/' + encodeURIComponent(jobID) + '/cancel', { method: 'POST' });
   if (resultID && $(resultID)) $(resultID).innerHTML = renderJobDetail(job);
-  setStatus('Job cancellation requested', 'ok');
+  setStatus(tr('status.jobCancellationRequested'), 'ok');
   await Promise.all([loadJobs(), loadEvents()]);
   return job;
 }
@@ -5140,11 +5725,11 @@ function renderEvents() {
   const wrap = $('eventsTable');
   if (!wrap) return;
   if (!eventsCache.length) {
-    wrap.innerHTML = '<div class="empty">No events yet.</div>';
+    wrap.innerHTML = '<div class="empty">' + escapeHTML(tr('empty.noEvents')) + '</div>';
     renderStats();
     return;
   }
-  wrap.innerHTML = '<table><thead><tr><th>Time</th><th>Event</th><th>Target</th><th>Message</th><th>Metadata</th></tr></thead><tbody>' + eventsCache.map(event => {
+  wrap.innerHTML = '<table><thead><tr>' + [th('table.time'), th('table.event'), th('table.target'), th('table.message'), th('table.metadata')].join('') + '</tr></thead><tbody>' + eventsCache.map(event => {
     return '<tr>' +
       '<td>' + escapeHTML(formatDate(event.created_at)) + '</td>' +
       '<td>' + statusPill(event.severity || 'info') + '<div class="compact mono">' + escapeHTML(event.type || '-') + '</div></td>' +
@@ -5269,7 +5854,7 @@ async function saveServer() {
 async function deleteServer() {
   const serverID = $('serverID').value.trim();
   if (!serverID) return;
-  if (!confirm('Delete server ' + serverID + '?')) return;
+  if (!confirm(tr('confirm.deleteServer') + ' ' + serverID + '?')) return;
   await fetchJSON('/api/servers/' + encodeURIComponent(serverID), { method: 'DELETE' });
   clearServerForm();
   await loadServers();
@@ -5289,7 +5874,7 @@ function clearServerForm() {
   $('deployWaitHeartbeat').value = 120;
   $('deployInstallDocker').checked = true;
   $('selectedServerStatus').textContent = 'new';
-  $('serverResult').textContent = 'Save a server, test SSH, then deploy node mode.';
+  $('serverResult').textContent = tr('result.serverHint');
 }
 
 async function testServerSSH() {
@@ -5453,7 +6038,7 @@ function trafficSummary(items) {
 
 async function deleteNode(nodeID) {
   if (!nodeID) return;
-  if (!confirm('Delete node ' + nodeID + '? It will reappear on the next heartbeat if still running.')) return;
+  if (!confirm(tr('confirm.deleteNode') + ' ' + nodeID + '? ' + tr('status.nodeWillReappear'))) return;
   await fetchJSON('/api/nodes/' + encodeURIComponent(nodeID), { method: 'DELETE' });
   await loadNodes();
   renderDomainNodeControls();
@@ -5461,7 +6046,7 @@ async function deleteNode(nodeID) {
 
 async function setNodeToken(nodeID) {
   if (!nodeID) return;
-  const token = prompt('New token for node ' + nodeID + ' (at least 16 characters)');
+  const token = prompt(tr('prompt.newNodeToken') + ' ' + nodeID);
   if (token === null) return;
   const trimmed = token.trim();
   if (!trimmed) return;
@@ -5471,7 +6056,7 @@ async function setNodeToken(nodeID) {
 
 async function clearNodeToken(nodeID) {
   if (!nodeID) return;
-  if (!confirm('Clear dedicated token for node ' + nodeID + '? It will fall back to the shared node token.')) return;
+  if (!confirm(tr('confirm.clearNodeToken') + ' ' + nodeID + '? ' + tr('status.nodeTokenFallback'))) return;
   await fetchJSON('/api/nodes/' + encodeURIComponent(nodeID) + '/token', { method: 'DELETE' });
   await loadNodes();
 }
@@ -5481,7 +6066,7 @@ function renderDomains() {
   if (!list) return;
   const visible = visibleDomains();
   list.innerHTML = '';
-  if (!visible.length) list.innerHTML = '<div class="empty">No matching domains.</div>';
+  if (!visible.length) list.innerHTML = '<div class="empty">' + escapeHTML(tr('empty.noMatchingDomains')) + '</div>';
   visible.forEach(d => {
     const item = document.createElement('div');
     item.className = 'item';
@@ -5504,8 +6089,8 @@ function renderDomainNodeControls() {
   const selectedActive = active.value;
   const selectedPrimary = primary ? primary.value : '';
   const selectedNodes = selectedDomainNodes();
-  active.innerHTML = '<option value="">Select node</option>';
-  if (primary) primary.innerHTML = '<option value="">First assigned node</option>';
+  active.innerHTML = '<option value="">' + escapeHTML(tr('option.selectNode')) + '</option>';
+  if (primary) primary.innerHTML = '<option value="">' + escapeHTML(tr('option.firstAssignedNode')) + '</option>';
   list.innerHTML = '';
   nodesCache.forEach(n => {
     const opt = document.createElement('option');
@@ -6022,7 +6607,7 @@ function clearDomainForm() {
   $('domainActiveNode').value = '';
   Array.from($('domainNodeList').querySelectorAll('input[type=checkbox]')).forEach(i => { i.checked = false; });
   $('selectedDomainStatus').textContent = 'new';
-  $('domainResult').textContent = 'Select or save a domain. Cloudflare and ACME credentials stay on the admin server.';
+  $('domainResult').textContent = tr('result.domainHint');
 }
 
 async function syncDomainDNS() {
@@ -6334,10 +6919,10 @@ function renderRulesHealth() {
   const results = (rulesHealthCache && rulesHealthCache.results) || [];
   if (!results.length) {
     const checked = rulesHealthCache && rulesHealthCache.checked_at;
-    wrap.innerHTML = '<div class="empty">' + (checked ? 'No rule health results.' : 'No saved rule health check yet.') + '</div>';
+    wrap.innerHTML = '<div class="empty">' + escapeHTML(checked ? tr('empty.noRuleHealthResults') : tr('empty.noSavedRuleHealth')) + '</div>';
     return;
   }
-  wrap.innerHTML = '<table><thead><tr><th>Rule</th><th>Status</th><th>Exit IP</th><th>Org</th><th>Location</th><th>Dialer</th><th>Latency</th><th>Error</th></tr></thead><tbody>' + results.map(r => {
+  wrap.innerHTML = '<table><thead><tr>' + [th('table.rule'), th('table.status'), th('table.exitIP'), th('table.org'), th('table.location'), th('table.dialer'), th('table.latency'), th('table.error')].join('') + '</tr></thead><tbody>' + results.map(r => {
     const info = r.ip_info || {};
     return '<tr>' +
       '<td><strong>' + escapeHTML(r.name || '-') + '</strong></td>' +
@@ -6366,6 +6951,8 @@ function toggleHealthAuto() {
 
 $('adminToken').value = adminToken;
 $('deployCentralURL').value = defaultCentralURL();
+applyLanguage();
+applyNavCollapsed();
 $('adminToken').addEventListener('keydown', e => {
   if (e.key === 'Enter') {
     e.preventDefault();
