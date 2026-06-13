@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -33,6 +34,7 @@ const (
 	jobStatusRunning   = "running"
 	jobStatusSucceeded = "succeeded"
 	jobStatusFailed    = "failed"
+	jobStatusCancelled = "cancelled"
 )
 
 type serverUpsertPayload struct {
@@ -284,10 +286,71 @@ func firstNonEmptySlice(values ...[]string) []string {
 	return nil
 }
 
+func (s *adminServer) beginJobRun(jobID string) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	if s != nil {
+		s.jobsMu.Lock()
+		if s.jobCancels == nil {
+			s.jobCancels = make(map[string]context.CancelFunc)
+		}
+		s.jobCancels[jobID] = cancel
+		s.jobsMu.Unlock()
+	}
+	return ctx, func() {
+		if s != nil {
+			s.jobsMu.Lock()
+			delete(s.jobCancels, jobID)
+			s.jobsMu.Unlock()
+		}
+		cancel()
+	}
+}
+
+func (s *adminServer) cancelRunningJob(jobID string) bool {
+	if s == nil {
+		return false
+	}
+	s.jobsMu.Lock()
+	cancel := s.jobCancels[jobID]
+	s.jobsMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func (s *adminServer) jobAlreadyCancelled(ctx context.Context, jobID string) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	if s == nil || s.store == nil || strings.TrimSpace(jobID) == "" {
+		return false
+	}
+	cctx, cancel := withTimeout(context.Background())
+	defer cancel()
+	job, err := s.store.GetJob(cctx, jobID)
+	return err == nil && job.Status == jobStatusCancelled
+}
+
+func (s *adminServer) finishJobSucceeded(ctx context.Context, jobID, serverID, nodeID, domain string) bool {
+	if s.jobAlreadyCancelled(ctx, jobID) {
+		s.finishCancelledJob(jobID, serverID, nodeID, domain)
+		return false
+	}
+	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
+	return true
+}
+
 func (s *adminServer) runSSHTestJob(jobID, serverID string) {
-	ctx := context.Background()
+	ctx, finishRun := s.beginJobRun(jobID)
+	defer finishRun()
 	_ = s.store.StartJob(ctx, jobID)
-	logger := jobLogger{store: s.store, jobID: jobID}
+	logger := jobLogger{store: s.store, jobID: jobID, ctx: ctx}
+	if s.jobAlreadyCancelled(ctx, jobID) {
+		s.finishCancelledJob(jobID, serverID, "", "")
+		return
+	}
 	var server *dbServer
 	if err := logger.Step("load-server", fmt.Sprintf("load server %s", serverID), func() error {
 		var err error
@@ -317,9 +380,11 @@ func (s *adminServer) runSSHTestJob(jobID, serverID string) {
 		return
 	}
 	logger.Log("%s", strings.TrimSpace(out))
+	if !s.finishJobSucceeded(ctx, jobID, serverID, server.NodeID, "") {
+		return
+	}
 	now := time.Now().UTC()
 	_ = s.store.UpdateServerStatus(context.Background(), serverID, "ssh_ok", "", &now, nil, "")
-	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
 	s.recordEvent(dbEvent{
 		Type:     "server.ssh_test_succeeded",
 		Message:  "ssh test succeeded",
@@ -330,9 +395,14 @@ func (s *adminServer) runSSHTestJob(jobID, serverID string) {
 }
 
 func (s *adminServer) runInspectNodeJob(jobID, serverID string) {
-	ctx := context.Background()
+	ctx, finishRun := s.beginJobRun(jobID)
+	defer finishRun()
 	_ = s.store.StartJob(ctx, jobID)
-	logger := jobLogger{store: s.store, jobID: jobID}
+	logger := jobLogger{store: s.store, jobID: jobID, ctx: ctx}
+	if s.jobAlreadyCancelled(ctx, jobID) {
+		s.finishCancelledJob(jobID, serverID, "", "")
+		return
+	}
 	var job *dbJob
 	if err := logger.Step("load-job", "load inspect job", func() error {
 		var err error
@@ -383,8 +453,10 @@ func (s *adminServer) runInspectNodeJob(jobID, serverID string) {
 	} else if runtime.ContainerStatus != "running" {
 		status = "container_" + strings.ReplaceAll(runtime.ContainerStatus, " ", "_")
 	}
+	if !s.finishJobSucceeded(ctx, jobID, serverID, server.NodeID, "") {
+		return
+	}
 	_ = s.store.UpdateServerRuntime(context.Background(), serverID, runtime, status, "", jobID)
-	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
 	s.recordEvent(dbEvent{
 		Type:     "server.inspect_succeeded",
 		Message:  "node runtime inspected",
@@ -401,9 +473,14 @@ func (s *adminServer) runInspectNodeJob(jobID, serverID string) {
 }
 
 func (s *adminServer) runPreflightNodeJob(jobID, serverID string) {
-	ctx := context.Background()
+	ctx, finishRun := s.beginJobRun(jobID)
+	defer finishRun()
 	_ = s.store.StartJob(ctx, jobID)
-	logger := jobLogger{store: s.store, jobID: jobID}
+	logger := jobLogger{store: s.store, jobID: jobID, ctx: ctx}
+	if s.jobAlreadyCancelled(ctx, jobID) {
+		s.finishCancelledJob(jobID, serverID, "", "")
+		return
+	}
 	var job *dbJob
 	if err := logger.Step("load-job", "load provisioning job", func() error {
 		var err error
@@ -445,9 +522,11 @@ func (s *adminServer) runPreflightNodeJob(jobID, serverID string) {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "preflight_failed", err)
 		return
 	}
+	if !s.finishJobSucceeded(ctx, jobID, serverID, server.NodeID, "") {
+		return
+	}
 	now := time.Now().UTC()
 	_ = s.store.UpdateServerStatus(context.Background(), serverID, "preflight_ok", "", &now, nil, jobID)
-	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
 	s.recordEvent(dbEvent{
 		Type:     "server.preflight_succeeded",
 		Message:  "node preflight succeeded",
@@ -459,9 +538,14 @@ func (s *adminServer) runPreflightNodeJob(jobID, serverID string) {
 }
 
 func (s *adminServer) runDeployNodeJob(jobID, serverID, nodeToken string) {
-	ctx := context.Background()
+	ctx, finishRun := s.beginJobRun(jobID)
+	defer finishRun()
 	_ = s.store.StartJob(ctx, jobID)
-	logger := jobLogger{store: s.store, jobID: jobID}
+	logger := jobLogger{store: s.store, jobID: jobID, ctx: ctx}
+	if s.jobAlreadyCancelled(ctx, jobID) {
+		s.finishCancelledJob(jobID, serverID, "", "")
+		return
+	}
 	var job *dbJob
 	if err := logger.Step("load-job", "load deployment job", func() error {
 		var err error
@@ -524,9 +608,11 @@ func (s *adminServer) runDeployNodeJob(jobID, serverID, nodeToken string) {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "error", err)
 		return
 	}
+	if !s.finishJobSucceeded(ctx, jobID, serverID, server.NodeID, "") {
+		return
+	}
 	now := time.Now().UTC()
 	_ = s.store.UpdateServerStatus(context.Background(), serverID, "deployed", "", nil, &now, jobID)
-	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
 	s.recordEvent(dbEvent{
 		Type:     "server.deploy_succeeded",
 		Message:  "node deploy succeeded",
@@ -538,9 +624,14 @@ func (s *adminServer) runDeployNodeJob(jobID, serverID, nodeToken string) {
 }
 
 func (s *adminServer) runOnboardNodeJob(jobID, serverID string) {
-	ctx := context.Background()
+	ctx, finishRun := s.beginJobRun(jobID)
+	defer finishRun()
 	_ = s.store.StartJob(ctx, jobID)
-	logger := jobLogger{store: s.store, jobID: jobID}
+	logger := jobLogger{store: s.store, jobID: jobID, ctx: ctx}
+	if s.jobAlreadyCancelled(ctx, jobID) {
+		s.finishCancelledJob(jobID, serverID, "", "")
+		return
+	}
 	var job *dbJob
 	if err := logger.Step("load-job", "load onboarding job", func() error {
 		var err error
@@ -619,9 +710,11 @@ func (s *adminServer) runOnboardNodeJob(jobID, serverID string) {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "heartbeat_pending", err)
 		return
 	}
+	if !s.finishJobSucceeded(ctx, jobID, serverID, server.NodeID, "") {
+		return
+	}
 	now := time.Now().UTC()
 	_ = s.store.UpdateServerStatus(context.Background(), serverID, "onboarded", "", &now, &now, jobID)
-	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
 	s.recordEvent(dbEvent{
 		Type:     "server.onboard_succeeded",
 		Message:  "node onboarding succeeded",
@@ -633,9 +726,14 @@ func (s *adminServer) runOnboardNodeJob(jobID, serverID string) {
 }
 
 func (s *adminServer) runNodeOperationJob(jobID, serverID string) {
-	ctx := context.Background()
+	ctx, finishRun := s.beginJobRun(jobID)
+	defer finishRun()
 	_ = s.store.StartJob(ctx, jobID)
-	logger := jobLogger{store: s.store, jobID: jobID}
+	logger := jobLogger{store: s.store, jobID: jobID, ctx: ctx}
+	if s.jobAlreadyCancelled(ctx, jobID) {
+		s.finishCancelledJob(jobID, serverID, "", "")
+		return
+	}
 	var job *dbJob
 	if err := logger.Step("load-job", "load node operation job", func() error {
 		var err error
@@ -702,8 +800,10 @@ func (s *adminServer) runNodeOperationJob(jobID, serverID string) {
 		eventType = "server.rollback_succeeded"
 		_ = s.store.UpdateServerImages(context.Background(), serverID, req.Image, server.Image)
 	}
+	if !s.finishJobSucceeded(ctx, jobID, serverID, server.NodeID, "") {
+		return
+	}
 	_ = s.store.UpdateServerStatus(context.Background(), serverID, status, "", nil, &now, jobID)
-	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
 	s.recordEvent(dbEvent{
 		Type:     eventType,
 		Message:  "node operation succeeded",
@@ -715,9 +815,14 @@ func (s *adminServer) runNodeOperationJob(jobID, serverID string) {
 }
 
 func (s *adminServer) runDomainOnboardingJob(jobID, domain string) {
-	ctx := context.Background()
+	ctx, finishRun := s.beginJobRun(jobID)
+	defer finishRun()
 	_ = s.store.StartJob(ctx, jobID)
-	logger := jobLogger{store: s.store, jobID: jobID}
+	logger := jobLogger{store: s.store, jobID: jobID, ctx: ctx}
+	if s.jobAlreadyCancelled(ctx, jobID) {
+		s.finishCancelledDomainJob(jobID, domain, "")
+		return
+	}
 	var job *dbJob
 	if err := logger.Step("load-job", "load domain onboarding job", func() error {
 		var err error
@@ -931,7 +1036,9 @@ func (s *adminServer) runDomainOnboardingJob(jobID, domain string) {
 		return
 	}
 
-	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
+	if !s.finishJobSucceeded(ctx, jobID, "", req.NodeID, domain) {
+		return
+	}
 	s.recordEvent(dbEvent{
 		Type:    "domain.onboarding_succeeded",
 		Message: "domain onboarding succeeded",
@@ -949,6 +1056,10 @@ func (s *adminServer) runDomainOnboardingJob(jobID, domain string) {
 }
 
 func (s *adminServer) finishProvisionJob(jobID, serverID, nodeID, serverStatus string, err error) {
+	if errors.Is(err, context.Canceled) || s.jobAlreadyCancelled(context.Background(), jobID) {
+		s.finishCancelledJob(jobID, serverID, nodeID, "")
+		return
+	}
 	errText := ""
 	if err != nil {
 		errText = err.Error()
@@ -978,6 +1089,10 @@ func (s *adminServer) finishProvisionJob(jobID, serverID, nodeID, serverStatus s
 }
 
 func (s *adminServer) finishDomainJob(jobID, domain, nodeID string, err error) {
+	if errors.Is(err, context.Canceled) || s.jobAlreadyCancelled(context.Background(), jobID) {
+		s.finishCancelledDomainJob(jobID, domain, nodeID)
+		return
+	}
 	errText := ""
 	if err != nil {
 		errText = err.Error()
@@ -998,9 +1113,27 @@ func (s *adminServer) finishDomainJob(jobID, domain, nodeID string, err error) {
 	})
 }
 
+func (s *adminServer) finishCancelledJob(jobID, serverID, nodeID, domain string) {
+	_ = s.store.FinishJob(context.Background(), jobID, jobStatusCancelled, "cancelled by admin")
+	s.recordEvent(dbEvent{
+		Type:     "job.cancelled",
+		Severity: "warn",
+		Message:  "job cancelled",
+		ServerID: serverID,
+		NodeID:   nodeID,
+		Domain:   domain,
+		JobID:    jobID,
+	})
+}
+
+func (s *adminServer) finishCancelledDomainJob(jobID, domain, nodeID string) {
+	s.finishCancelledJob(jobID, "", nodeID, domain)
+}
+
 type jobLogger struct {
 	store *mongoStore
 	jobID string
+	ctx   context.Context
 }
 
 func (l jobLogger) Log(format string, args ...any) {
@@ -1018,6 +1151,9 @@ func (l jobLogger) Step(name, message string, fn func() error) error {
 	if message == "" {
 		message = name
 	}
+	if l.ctx != nil && l.ctx.Err() != nil {
+		return l.ctx.Err()
+	}
 	l.Log("step %s started: %s", name, message)
 	if l.store != nil && l.jobID != "" {
 		_ = l.store.StartJobStep(context.Background(), l.jobID, name, message)
@@ -1028,6 +1164,9 @@ func (l jobLogger) Step(name, message string, fn func() error) error {
 	if err != nil {
 		status = jobStatusFailed
 		errText = err.Error()
+		if errors.Is(err, context.Canceled) {
+			status = jobStatusCancelled
+		}
 	}
 	if l.store != nil && l.jobID != "" {
 		_ = l.store.FinishJobStep(context.Background(), l.jobID, name, status, errText)

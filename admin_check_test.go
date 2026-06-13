@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -254,6 +255,11 @@ func TestAdminHTMLSmoke(t *testing.T) {
 		"jobStepsSummary",
 		"steps:",
 		"step.status",
+		"cancelJob",
+		"isJobActive",
+		"isJobTerminal",
+		"/cancel",
+		"cancelled",
 		"Recent Events",
 		"renderEvents",
 		"pollJob",
@@ -317,6 +323,22 @@ func TestAdminHTMLScriptSyntax(t *testing.T) {
 	cmd := exec.Command(node, "--check", path)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("admin HTML script syntax invalid: %v\n%s", err, out)
+	}
+}
+
+func TestJobLoggerStepHonorsCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ran := false
+	err := (jobLogger{ctx: ctx}).Step("cancelled", "cancelled", func() error {
+		ran = true
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Step error = %v, want context.Canceled", err)
+	}
+	if ran {
+		t.Fatalf("Step ran callback after context cancellation")
 	}
 }
 

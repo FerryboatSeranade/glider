@@ -905,13 +905,59 @@ func (s *mongoStore) GetJob(ctx context.Context, jobID string) (*dbJob, error) {
 
 func (s *mongoStore) StartJob(ctx context.Context, jobID string) error {
 	now := time.Now().UTC()
-	_, err := s.db.Collection(jobsCollection).UpdateOne(ctx, bson.M{"job_id": jobID}, bson.M{
+	_, err := s.db.Collection(jobsCollection).UpdateOne(ctx, bson.M{
+		"job_id": jobID,
+		"status": bson.M{"$ne": jobStatusCancelled},
+	}, bson.M{
 		"$set": bson.M{
 			"status":     "running",
 			"started_at": now,
 		},
 	})
 	return err
+}
+
+func (s *mongoStore) CancelJob(ctx context.Context, jobID, reason string) (*dbJob, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return nil, fmt.Errorf("job_id required")
+	}
+	now := time.Now().UTC()
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "cancelled by admin"
+	}
+	var job dbJob
+	err := s.db.Collection(jobsCollection).FindOneAndUpdate(
+		ctx,
+		bson.M{"job_id": jobID, "status": bson.M{"$in": []string{jobStatusQueued, jobStatusRunning}}},
+		bson.M{
+			"$set": bson.M{
+				"status":      jobStatusCancelled,
+				"error":       reason,
+				"finished_at": now,
+			},
+			"$push": bson.M{"logs": dbJobLog{
+				At:      now,
+				Message: reason,
+			}},
+		},
+		options.FindOneAndUpdate().SetReturnDocument(options.After),
+	).Decode(&job)
+	if err == nil {
+		return &job, nil
+	}
+	if err != mongo.ErrNoDocuments {
+		return nil, err
+	}
+	existing, getErr := s.GetJob(ctx, jobID)
+	if getErr != nil {
+		return nil, getErr
+	}
+	if existing.Status == jobStatusCancelled {
+		return existing, nil
+	}
+	return nil, fmt.Errorf("job is not cancellable in status %s", existing.Status)
 }
 
 func (s *mongoStore) AppendJobLog(ctx context.Context, jobID, message string) error {
@@ -979,7 +1025,10 @@ func (s *mongoStore) FinishJob(ctx context.Context, jobID, status, errText strin
 	if status == "" {
 		status = "succeeded"
 	}
-	_, err := s.db.Collection(jobsCollection).UpdateOne(ctx, bson.M{"job_id": jobID}, bson.M{
+	_, err := s.db.Collection(jobsCollection).UpdateOne(ctx, bson.M{
+		"job_id": jobID,
+		"status": bson.M{"$ne": jobStatusCancelled},
+	}, bson.M{
 		"$set": bson.M{
 			"status":      status,
 			"error":       strings.TrimSpace(errText),

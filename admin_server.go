@@ -72,6 +72,8 @@ type adminServer struct {
 	reloadMu   sync.Mutex
 	lastReload time.Time
 	healthMu   sync.Mutex
+	jobsMu     sync.Mutex
+	jobCancels map[string]context.CancelFunc
 }
 
 func startAdminServer(conf *Config, pxySw *proxy.Switcher, applier *ConfigApplier) {
@@ -130,6 +132,7 @@ func startAdminServer(conf *Config, pxySw *proxy.Switcher, applier *ConfigApplie
 		nodeToken:         nodeToken,
 		adminNets:         adminNets,
 		trustProxyHeaders: trustProxyHeaders,
+		jobCancels:        make(map[string]context.CancelFunc),
 	}
 	if srv.applier != nil {
 		ctxInit, cancelInit := withTimeout(context.Background())
@@ -2676,16 +2679,42 @@ func (s *adminServer) handleJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *adminServer) handleJobAction(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	if !s.requireToken(w, r) {
 		return
 	}
-	jobID, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/jobs/"))
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/jobs/"), "/"), "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid job id"))
+		return
+	}
+	jobID, err := url.PathUnescape(parts[0])
 	if err != nil || strings.TrimSpace(jobID) == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid job id"))
+		return
+	}
+	action := ""
+	if len(parts) > 1 {
+		action = strings.TrimSpace(parts[1])
+	}
+	if len(parts) > 2 {
+		writeError(w, http.StatusNotFound, fmt.Errorf("unknown job action"))
+		return
+	}
+
+	if action == "cancel" {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleJobCancel(w, r, strings.TrimSpace(jobID))
+		return
+	}
+	if action != "" {
+		writeError(w, http.StatusNotFound, fmt.Errorf("unknown job action"))
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 	ctx, cancel := withTimeout(r.Context())
@@ -2695,6 +2724,28 @@ func (s *adminServer) handleJobAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *adminServer) handleJobCancel(w http.ResponseWriter, r *http.Request, jobID string) {
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	job, err := s.store.CancelJob(ctx, jobID, "cancelled by admin")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	runningCancelled := s.cancelRunningJob(jobID)
+	s.recordEvent(dbEvent{
+		Type:     "job.cancel_requested",
+		Severity: "warn",
+		Message:  "job cancellation requested",
+		ServerID: job.ServerID,
+		NodeID:   job.NodeID,
+		Domain:   job.Domain,
+		JobID:    job.JobID,
+		Metadata: map[string]any{"running_cancelled": runningCancelled},
+	})
 	writeJSON(w, http.StatusOK, job)
 }
 
@@ -4629,7 +4680,7 @@ function userStatus(u) {
 }
 
 function statusPill(status) {
-  const cls = status === 'active' || status === 'ok' || status === 'online' || status === 'synced' ? 'ok' : status === 'disabled' || status === 'stale' || status === 'unknown' ? 'warn' : status === 'expired' || status === 'error' || status === 'offline' ? 'err' : '';
+  const cls = status === 'active' || status === 'ok' || status === 'online' || status === 'synced' || status === 'succeeded' ? 'ok' : status === 'disabled' || status === 'stale' || status === 'unknown' || status === 'queued' || status === 'running' || status === 'cancelled' ? 'warn' : status === 'expired' || status === 'error' || status === 'offline' || status === 'failed' ? 'err' : '';
   return '<span class="pill ' + cls + '">' + escapeHTML(status) + '</span>';
 }
 
@@ -5033,9 +5084,10 @@ function renderJobs() {
     renderStats();
     return;
   }
-  wrap.innerHTML = '<table><thead><tr><th>Job</th><th>Status</th><th>Target</th><th>Created</th><th>Finished</th><th>Error</th><th>Logs</th></tr></thead><tbody>' + jobsCache.map(job => {
+  wrap.innerHTML = '<table><thead><tr><th>Job</th><th>Status</th><th>Target</th><th>Created</th><th>Finished</th><th>Error</th><th>Logs</th><th>Actions</th></tr></thead><tbody>' + jobsCache.map(job => {
     const logs = (job.logs || []).slice(-4).map(l => '<div class="compact">' + escapeHTML(formatDate(l.at)) + ' ' + escapeHTML(l.message) + '</div>').join('');
     const steps = jobStepsSummary(job);
+    const actions = isJobActive(job) ? '<button class="danger" data-job-cancel="' + escapeHTML(job.job_id || '') + '">Cancel</button>' : '<span class="compact">-</span>';
     return '<tr>' +
       '<td><strong>' + escapeHTML(job.type || '-') + '</strong><div class="compact mono">' + escapeHTML(job.job_id || '-') + '</div></td>' +
       '<td>' + statusPill(job.status || 'unknown') + '</td>' +
@@ -5044,9 +5096,33 @@ function renderJobs() {
       '<td>' + escapeHTML(formatDate(job.finished_at)) + '</td>' +
       '<td>' + escapeHTML(job.error || '-') + '</td>' +
       '<td>' + steps + (logs || '<span class="compact">-</span>') + '</td>' +
+      '<td>' + actions + '</td>' +
       '</tr>';
   }).join('') + '</tbody></table>';
+  document.querySelectorAll('[data-job-cancel]').forEach(btn => {
+    btn.onclick = () => cancelJob(btn.getAttribute('data-job-cancel') || '');
+  });
   renderStats();
+}
+
+function isJobActive(job) {
+  const status = String((job && job.status) || '');
+  return status === 'queued' || status === 'running';
+}
+
+function isJobTerminal(status) {
+  status = String(status || '');
+  return status === 'succeeded' || status === 'failed' || status === 'cancelled';
+}
+
+async function cancelJob(jobID, resultID) {
+  if (!jobID) return null;
+  if (!confirm('Cancel job ' + jobID + '?')) return null;
+  const job = await fetchJSON('/api/jobs/' + encodeURIComponent(jobID) + '/cancel', { method: 'POST' });
+  if (resultID && $(resultID)) $(resultID).innerHTML = renderJobDetail(job);
+  setStatus('Job cancellation requested', 'ok');
+  await Promise.all([loadJobs(), loadEvents()]);
+  return job;
 }
 
 function jobStepsSummary(job) {
@@ -5328,7 +5404,7 @@ async function pollJob(jobID, resultID) {
     const job = await fetchJSON('/api/jobs/' + encodeURIComponent(jobID));
     el.innerHTML = renderJobDetail(job);
     await Promise.all([loadJobs({ preserveStatus: true }), loadEvents({ preserveStatus: true })]);
-    if (job.status === 'succeeded' || job.status === 'failed') return job;
+    if (isJobTerminal(job.status)) return job;
     await sleep(2000);
   }
   return null;
