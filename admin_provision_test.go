@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -65,6 +67,35 @@ func TestHostPortFromMapping(t *testing.T) {
 		if got := hostPortFromMapping(input); got != want {
 			t.Fatalf("hostPortFromMapping(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestGenerateNodeToken(t *testing.T) {
+	token := generateNodeToken()
+	if !strings.HasPrefix(token, "node-") {
+		t.Fatalf("token prefix = %q", token)
+	}
+	if len(token) < 16 {
+		t.Fatalf("token too short: %q", token)
+	}
+	if token == generateNodeToken() {
+		t.Fatalf("generateNodeToken returned duplicate values")
+	}
+}
+
+func TestDefaultCentralURL(t *testing.T) {
+	t.Setenv("GLIDER_PUBLIC_ADMIN_URL", "")
+	req := httptest.NewRequest(http.MethodPost, "http://15.204.95.51:8444/api/servers/zgo/onboard-node", nil)
+	if got := defaultCentralURL(req); got != "http://15.204.95.51:8444" {
+		t.Fatalf("defaultCentralURL() = %q", got)
+	}
+	req.Header.Set("X-Forwarded-Proto", "https")
+	if got := defaultCentralURL(req); got != "https://15.204.95.51:8444" {
+		t.Fatalf("forwarded defaultCentralURL() = %q", got)
+	}
+	t.Setenv("GLIDER_PUBLIC_ADMIN_URL", "https://central.example.com")
+	if got := defaultCentralURL(req); got != "https://central.example.com" {
+		t.Fatalf("env defaultCentralURL() = %q", got)
 	}
 }
 

@@ -28,27 +28,33 @@ import (
 )
 
 const (
-	mongoURLEnv                  = "GLIDER_MONGO_URI"
-	mongoDBEnv                   = "GLIDER_MONGO_DB"
-	adminTokenEnv                = "GLIDER_ADMIN_TOKEN"
-	adminAllowedCIDRsEnv         = "GLIDER_ADMIN_ALLOWED_CIDRS"
-	adminTrustProxyHeadersEnv    = "GLIDER_ADMIN_TRUST_PROXY_HEADERS"
-	nodeTokenEnv                 = "GLIDER_NODE_TOKEN"
-	acmeEmailEnv                 = "GLIDER_ACME_EMAIL"
-	acmeDirectoryURLEnv          = "GLIDER_ACME_DIRECTORY_URL"
-	cloudflareAccountIDEnv       = "GLIDER_CLOUDFLARE_ACCOUNT_ID"
-	domainReconcileIntervalEnv   = "GLIDER_DOMAIN_RECONCILE_INTERVAL"
-	certificateRenewIntervalEnv  = "GLIDER_CERT_RENEW_INTERVAL"
-	rulesHealthIntervalEnv       = "GLIDER_RULES_HEALTH_INTERVAL"
-	rulesHealthTargetEnv         = "GLIDER_RULES_HEALTH_TARGET"
-	rulesHealthTimeoutEnv        = "GLIDER_RULES_HEALTH_TIMEOUT"
-	defaultDomainReconcilePeriod = 60 * time.Second
-	defaultCertRenewPeriod       = 12 * time.Hour
-	defaultRulesHealthPeriod     = 5 * time.Minute
-	defaultRulesHealthTarget     = "https://ipinfo.io/json"
-	defaultRulesHealthTimeout    = "8s"
-	nodeAuthModeShared           = "shared"
-	nodeAuthModeDedicated        = "dedicated"
+	mongoURLEnv                   = "GLIDER_MONGO_URI"
+	mongoDBEnv                    = "GLIDER_MONGO_DB"
+	adminTokenEnv                 = "GLIDER_ADMIN_TOKEN"
+	adminAllowedCIDRsEnv          = "GLIDER_ADMIN_ALLOWED_CIDRS"
+	adminTrustProxyHeadersEnv     = "GLIDER_ADMIN_TRUST_PROXY_HEADERS"
+	nodeTokenEnv                  = "GLIDER_NODE_TOKEN"
+	acmeEmailEnv                  = "GLIDER_ACME_EMAIL"
+	acmeDirectoryURLEnv           = "GLIDER_ACME_DIRECTORY_URL"
+	cloudflareAccountIDEnv        = "GLIDER_CLOUDFLARE_ACCOUNT_ID"
+	domainReconcileIntervalEnv    = "GLIDER_DOMAIN_RECONCILE_INTERVAL"
+	certificateRenewIntervalEnv   = "GLIDER_CERT_RENEW_INTERVAL"
+	rulesHealthIntervalEnv        = "GLIDER_RULES_HEALTH_INTERVAL"
+	rulesHealthTargetEnv          = "GLIDER_RULES_HEALTH_TARGET"
+	rulesHealthTimeoutEnv         = "GLIDER_RULES_HEALTH_TIMEOUT"
+	nodeProxyHealthIntervalEnv    = "GLIDER_NODE_PROXY_HEALTH_INTERVAL"
+	nodeProxyHealthTargetEnv      = "GLIDER_NODE_PROXY_HEALTH_TARGET"
+	nodeProxyHealthTimeoutEnv     = "GLIDER_NODE_PROXY_HEALTH_TIMEOUT"
+	defaultDomainReconcilePeriod  = 60 * time.Second
+	defaultCertRenewPeriod        = 12 * time.Hour
+	defaultRulesHealthPeriod      = 5 * time.Minute
+	defaultRulesHealthTarget      = "https://ipinfo.io/json"
+	defaultRulesHealthTimeout     = "8s"
+	defaultNodeProxyHealthPeriod  = 60 * time.Second
+	defaultNodeProxyHealthTarget  = "https://ipinfo.io/json"
+	defaultNodeProxyHealthTimeout = "8s"
+	nodeAuthModeShared            = "shared"
+	nodeAuthModeDedicated         = "dedicated"
 )
 
 type adminServer struct {
@@ -1015,16 +1021,21 @@ type domainRuntimeStatus struct {
 }
 
 type domainNodeCertSync struct {
-	NodeID        string     `json:"node_id"`
-	Online        bool       `json:"online"`
-	PublicIP      string     `json:"public_ip,omitempty"`
-	CertSynced    bool       `json:"cert_synced"`
-	FailoverReady bool       `json:"failover_ready"`
-	CertVersion   string     `json:"cert_version,omitempty"`
-	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
-	LastSeenAt    *time.Time `json:"last_seen_at,omitempty"`
-	Error         string     `json:"error,omitempty"`
-	CertError     string     `json:"cert_error,omitempty"`
+	NodeID         string     `json:"node_id"`
+	Online         bool       `json:"online"`
+	PublicIP       string     `json:"public_ip,omitempty"`
+	ProxyStatus    string     `json:"proxy_status,omitempty"`
+	ProxyCheckedAt *time.Time `json:"proxy_checked_at,omitempty"`
+	ProxyExitIP    string     `json:"proxy_exit_ip,omitempty"`
+	ProxyOrg       string     `json:"proxy_org,omitempty"`
+	ProxyError     string     `json:"proxy_error,omitempty"`
+	CertSynced     bool       `json:"cert_synced"`
+	FailoverReady  bool       `json:"failover_ready"`
+	CertVersion    string     `json:"cert_version,omitempty"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
+	LastSeenAt     *time.Time `json:"last_seen_at,omitempty"`
+	Error          string     `json:"error,omitempty"`
+	CertError      string     `json:"cert_error,omitempty"`
 }
 
 func newDomainResponse(d dbDomain, nodes map[string]NodeHeartbeat, now time.Time) domainResponse {
@@ -1159,11 +1170,16 @@ func domainFailoverBlockedReason(d dbDomain, ready int) string {
 
 func domainNodeCertState(d dbDomain, nodeID string, node NodeHeartbeat, now time.Time) domainNodeCertSync {
 	state := domainNodeCertSync{
-		NodeID:    nodeID,
-		Online:    isNodeHealthy(node),
-		PublicIP:  node.PublicIP,
-		Error:     node.Error,
-		CertError: node.CertError,
+		NodeID:         nodeID,
+		Online:         isNodeHealthy(node),
+		PublicIP:       node.PublicIP,
+		ProxyStatus:    node.ProxyStatus,
+		ProxyCheckedAt: node.ProxyCheckedAt,
+		ProxyExitIP:    node.ProxyExitIP,
+		ProxyOrg:       node.ProxyOrg,
+		ProxyError:     node.ProxyError,
+		Error:          node.Error,
+		CertError:      node.CertError,
 	}
 	if state.NodeID == "" {
 		state.NodeID = node.NodeID
@@ -1832,6 +1848,31 @@ func (s *adminServer) handleServerAction(w http.ResponseWriter, r *http.Request)
 			Metadata: map[string]any{"image": job.Request.Image, "deploy_dir": job.Request.DeployDir},
 		})
 		writeJSON(w, http.StatusAccepted, job)
+	case action == "onboard-node" && r.Method == http.MethodPost:
+		var payload deployNodePayload
+		if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		if payload.CentralURL == "" {
+			payload.CentralURL = defaultCentralURL(r)
+		}
+		job, err := s.createOnboardNodeJob(ctx, serverID, payload)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.recordEvent(dbEvent{
+			Type:     "server.onboard_queued",
+			Message:  "node onboarding queued",
+			ServerID: serverID,
+			NodeID:   job.NodeID,
+			JobID:    job.JobID,
+			Metadata: map[string]any{"image": job.Request.Image, "deploy_dir": job.Request.DeployDir, "central_url": job.Request.CentralURL},
+		})
+		writeJSON(w, http.StatusAccepted, job)
 	case action == "restart-node" && r.Method == http.MethodPost:
 		ctx, cancel := withTimeout(r.Context())
 		defer cancel()
@@ -2031,6 +2072,7 @@ func (s *adminServer) startAdminWorkers(ctx context.Context) {
 	reconcileInterval := envDuration(domainReconcileIntervalEnv, defaultDomainReconcilePeriod)
 	certInterval := envDuration(certificateRenewIntervalEnv, defaultCertRenewPeriod)
 	rulesHealthInterval := envDuration(rulesHealthIntervalEnv, defaultRulesHealthPeriod)
+	nodeProxyHealthInterval := envDuration(nodeProxyHealthIntervalEnv, defaultNodeProxyHealthPeriod)
 	if reconcileInterval > 0 {
 		go s.domainReconcileLoop(ctx, reconcileInterval)
 	}
@@ -2039,6 +2081,9 @@ func (s *adminServer) startAdminWorkers(ctx context.Context) {
 	}
 	if rulesHealthInterval > 0 {
 		go s.rulesHealthLoop(ctx, rulesHealthInterval)
+	}
+	if nodeProxyHealthInterval > 0 {
+		go s.nodeProxyHealthLoop(ctx, nodeProxyHealthInterval)
 	}
 }
 
@@ -2074,6 +2119,204 @@ func (s *adminServer) rulesHealthLoop(ctx context.Context, interval time.Duratio
 			timer.Reset(interval)
 		}
 	}
+}
+
+func (s *adminServer) nodeProxyHealthLoop(ctx context.Context, interval time.Duration) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			target := firstNonEmpty(os.Getenv(nodeProxyHealthTargetEnv), defaultNodeProxyHealthTarget)
+			timeoutValue := firstNonEmpty(os.Getenv(nodeProxyHealthTimeoutEnv), defaultNodeProxyHealthTimeout)
+			if err := s.checkAndSaveNodeProxyHealth(ctx, target, timeoutValue); err != nil {
+				log.Printf("[admin] node proxy health check failed: %v", err)
+			}
+			timer.Reset(interval)
+		}
+	}
+}
+
+type NodeProxyProbe struct {
+	Status     string    `json:"status"`
+	CheckedAt  time.Time `json:"checked_at"`
+	ExitIP     string    `json:"exit_ip,omitempty"`
+	Org        string    `json:"org,omitempty"`
+	HTTPStatus int       `json:"http_status,omitempty"`
+	DurationMS int64     `json:"duration_ms,omitempty"`
+	Error      string    `json:"error,omitempty"`
+}
+
+func (s *adminServer) checkAndSaveNodeProxyHealth(ctx context.Context, target, timeoutValue string) error {
+	storeCtx, cancelStore := withTimeout(ctx)
+	defer cancelStore()
+	nodes, err := s.store.Nodes(storeCtx)
+	if err != nil {
+		return err
+	}
+	users, err := s.store.Users(storeCtx)
+	if err != nil {
+		return err
+	}
+	servers, err := s.store.Servers(storeCtx)
+	if err != nil {
+		return err
+	}
+	user, ok := firstProbeUser(users, time.Now().UTC())
+	if !ok {
+		return fmt.Errorf("no enabled user is available for node proxy health checks")
+	}
+	serverByNode := make(map[string]dbServer, len(servers))
+	for _, server := range servers {
+		if strings.TrimSpace(server.NodeID) != "" {
+			serverByNode[server.NodeID] = server
+		}
+	}
+	for _, node := range nodes {
+		if !nodeHeartbeatFresh(node, time.Now().UTC()) || publicIPString(node.PublicIP) == "" {
+			continue
+		}
+		server := serverByNode[node.NodeID]
+		probe := probeNodeProxy(ctx, node, server, user, target, timeoutValue)
+		saveCtx, cancelSave := withTimeout(context.Background())
+		if err := s.store.UpdateNodeProxyProbe(saveCtx, node.NodeID, probe); err != nil {
+			cancelSave()
+			return err
+		}
+		cancelSave()
+	}
+	return nil
+}
+
+func firstProbeUser(users []dbUser, now time.Time) (dbUser, bool) {
+	sort.Slice(users, func(i, j int) bool { return users[i].Username < users[j].Username })
+	for _, user := range users {
+		if strings.TrimSpace(user.Username) == "" || strings.TrimSpace(user.Password) == "" {
+			continue
+		}
+		if user.Enabled != nil && !*user.Enabled {
+			continue
+		}
+		if user.ExpiresAt != nil && !user.ExpiresAt.After(now) {
+			continue
+		}
+		return user, true
+	}
+	return dbUser{}, false
+}
+
+func probeNodeProxy(ctx context.Context, node NodeHeartbeat, server dbServer, user dbUser, target, timeoutValue string) NodeProxyProbe {
+	target = firstNonEmpty(target, os.Getenv(nodeProxyHealthTargetEnv), defaultNodeProxyHealthTarget)
+	timeout := 8 * time.Second
+	if parsed, err := time.ParseDuration(firstNonEmpty(timeoutValue, os.Getenv(nodeProxyHealthTimeoutEnv), defaultNodeProxyHealthTimeout)); err == nil && parsed > 0 {
+		timeout = parsed
+	}
+	checkedAt := time.Now().UTC()
+	result := NodeProxyProbe{
+		Status:    "error",
+		CheckedAt: checkedAt,
+	}
+	if !looksLikeHTTPURL(target) {
+		target = "https://" + target
+	}
+	parsedTarget, err := url.Parse(target)
+	if err != nil || parsedTarget.Scheme == "" || parsedTarget.Host == "" {
+		result.Error = fmt.Sprintf("invalid probe url %q", target)
+		return result
+	}
+	host := publicIPString(node.PublicIP)
+	if host == "" {
+		result.Error = "node public_ip is not public"
+		return result
+	}
+	proxyURL := url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(host, nodeProxyProbePort(server)),
+		User:   url.UserPassword(user.Username, user.Password),
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	transport := &http.Transport{
+		Proxy:                 http.ProxyURL(&proxyURL),
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          1,
+		IdleConnTimeout:       timeout,
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, parsedTarget.String(), nil)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "glider-node-proxy-health/"+version)
+	start := time.Now()
+	resp, err := client.Do(req)
+	result.DurationMS = time.Since(start).Milliseconds()
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	defer resp.Body.Close()
+	result.HTTPStatus = resp.StatusCode
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		result.Error = resp.Status
+		return result
+	}
+	var info ipInfoPayload
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&info); err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	result.Status = "ok"
+	result.ExitIP = info.IP
+	result.Org = info.Org
+	result.Error = ""
+	return result
+}
+
+func nodeProxyProbePort(server dbServer) string {
+	for _, mapping := range server.ProxyPorts {
+		containerPort := containerPortFromMapping(mapping)
+		if containerPort == "8443" || containerPort == "" && strings.TrimSpace(mapping) == "8443" {
+			if hostPort := hostPortFromMapping(mapping); hostPort != "" {
+				return hostPort
+			}
+		}
+	}
+	for _, mapping := range server.ProxyPorts {
+		if hostPort := hostPortFromMapping(mapping); hostPort != "" && hostPort != "443" {
+			return hostPort
+		}
+	}
+	return "8443"
+}
+
+func containerPortFromMapping(mapping string) string {
+	mapping = strings.TrimSpace(strings.Trim(mapping, `"'`))
+	if mapping == "" {
+		return ""
+	}
+	if strings.Contains(mapping, "/") {
+		mapping = strings.SplitN(mapping, "/", 2)[0]
+	}
+	parts := strings.Split(mapping, ":")
+	if len(parts) == 0 {
+		return ""
+	}
+	candidate := strings.Trim(parts[len(parts)-1], "[] ")
+	if _, err := strconv.Atoi(candidate); err == nil {
+		return candidate
+	}
+	return ""
 }
 
 func (s *adminServer) certificateRenewLoop(ctx context.Context, interval time.Duration) {
@@ -2220,6 +2463,19 @@ func nodeHealthyAt(node NodeHeartbeat, now time.Time) bool {
 	if node.UpdatedAt.IsZero() {
 		return false
 	}
+	if now.Sub(node.UpdatedAt) > 90*time.Second {
+		return false
+	}
+	if strings.EqualFold(node.ProxyStatus, "error") && node.ProxyCheckedAt != nil && now.Sub(*node.ProxyCheckedAt) <= 3*time.Minute {
+		return false
+	}
+	return true
+}
+
+func nodeHeartbeatFresh(node NodeHeartbeat, now time.Time) bool {
+	if node.NodeID == "" || node.Error != "" || node.UpdatedAt.IsZero() {
+		return false
+	}
 	return now.Sub(node.UpdatedAt) <= 90*time.Second
 }
 
@@ -2294,7 +2550,7 @@ func evaluateDomainFailover(d dbDomain, nodes map[string]NodeHeartbeat, now time
 	}
 	state.ActiveFailureCount++
 	state.LastFailureAt = &now
-	state.LastReason = activeFailureReason(d.ActiveNodeID, active)
+	state.LastReason = activeFailureReasonAt(d.ActiveNodeID, active, now)
 	decision.StateChanged = true
 
 	if policy.ManualLock {
@@ -2358,6 +2614,13 @@ func failoverPolicyWithDefaults(policy domainFailoverPolicy) domainFailoverPolic
 }
 
 func activeFailureReason(activeNodeID string, active NodeHeartbeat) string {
+	return activeFailureReasonAt(activeNodeID, active, time.Now().UTC())
+}
+
+func activeFailureReasonAt(activeNodeID string, active NodeHeartbeat, now time.Time) string {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	if strings.TrimSpace(activeNodeID) == "" {
 		return "active node not selected"
 	}
@@ -2366,6 +2629,12 @@ func activeFailureReason(activeNodeID string, active NodeHeartbeat) string {
 	}
 	if strings.TrimSpace(active.Error) != "" {
 		return "active node error: " + active.Error
+	}
+	if strings.EqualFold(active.ProxyStatus, "error") && active.ProxyCheckedAt != nil && now.Sub(*active.ProxyCheckedAt) <= 3*time.Minute {
+		if strings.TrimSpace(active.ProxyError) != "" {
+			return "active node proxy error: " + active.ProxyError
+		}
+		return "active node proxy error"
 	}
 	return "active node heartbeat stale"
 }
@@ -3311,6 +3580,7 @@ const adminHTML = `<!doctype html>
 	        <section id="tabNodes" class="tabs">
 	          <div class="panel">
 	            <div class="panel-head"><div class="panel-title">Nodes</div><span id="nodesCount" class="pill">0</span></div>
+	            <div class="search-row"><input id="nodeSearch" placeholder="Search nodes, hosts, IPs, versions, errors" oninput="renderNodes()"></div>
 	            <div class="panel-body">
 	              <div id="nodesTable" class="table-wrap">No nodes have reported yet.</div>
 	            </div>
@@ -3343,8 +3613,9 @@ const adminHTML = `<!doctype html>
 	                  <div><label>Key passphrase</label><input id="serverPassphrase" type="password" autocomplete="new-password" placeholder="optional"></div>
 	                  <div class="wide"><label>Private key</label><textarea id="serverPrivateKey" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></div>
 	                  <div><label>Central URL</label><input id="deployCentralURL" placeholder="http://15.204.95.51:8444"></div>
-	                  <div><label>Node token</label><input id="deployNodeToken" type="password" autocomplete="new-password" placeholder="at least 16 characters"></div>
+	                  <div><label>Node token</label><input id="deployNodeToken" type="password" autocomplete="new-password" placeholder="manual deploy only"></div>
 	                  <div><label>Sync interval</label><input id="deploySyncInterval" value="30s"></div>
+	                  <div><label>Wait heartbeat seconds</label><input id="deployWaitHeartbeat" type="number" min="15" value="120"></div>
 	                  <div><label>Upgrade image</label><input id="upgradeImage" placeholder="ghcr.io/ferryboatseranade/glider:v..."></div>
 	                  <div class="checkbox-row"><input id="deployInstallDocker" type="checkbox" checked><label for="deployInstallDocker">Install Docker if missing</label></div>
 	                </div>
@@ -3352,6 +3623,7 @@ const adminHTML = `<!doctype html>
 	                  <button class="primary" onclick="saveServer()">Save Server</button>
 	                  <button onclick="testServerSSH()">Test SSH</button>
 	                  <button onclick="preflightServerNode()">Preflight</button>
+	                  <button class="primary" onclick="onboardServerNode()">Onboard Node</button>
 	                  <button onclick="deployServerNode()">Deploy Node</button>
 	                  <button onclick="restartServerNode()">Restart Node</button>
 	                  <button onclick="upgradeServerNode()">Upgrade Node</button>
@@ -3768,7 +4040,7 @@ function renderStats() {
   $('statNodesSynced').textContent = synced;
   $('usersCount').textContent = visibleUsers().length + '/' + usersCache.length;
   $('rulesCount').textContent = visibleRules().length + '/' + rulesCache.length;
-  $('nodesCount').textContent = nodesCache.length;
+  $('nodesCount').textContent = visibleNodes().length + '/' + nodesCache.length;
   if ($('serversCount')) $('serversCount').textContent = visibleServers().length + '/' + serversCache.length;
   if ($('jobsCount')) $('jobsCount').textContent = jobsCache.length;
   if ($('eventsCount')) $('eventsCount').textContent = eventsCache.length;
@@ -3797,6 +4069,28 @@ function visibleServers() {
   const q = (($('serverSearch') && $('serverSearch').value) || '').toLowerCase().trim();
   if (!q) return serversCache;
   return serversCache.filter(s => [s.server_id, s.name, s.node_id, s.host, s.status, s.image].join(' ').toLowerCase().includes(q));
+}
+
+function visibleNodes() {
+  const q = (($('nodeSearch') && $('nodeSearch').value) || '').toLowerCase().trim();
+  if (!q) return nodesCache;
+  return nodesCache.filter(n => [
+    n.node_id,
+    n.hostname,
+    n.public_ip,
+    n.glider_version,
+    n.config_version,
+    n.cert_version,
+    n.error,
+    n.cert_error,
+    n.proxy_status,
+    n.proxy_exit_ip,
+    n.proxy_org,
+    n.proxy_error,
+    n.auth_mode,
+    nodeStatus(n),
+    configSyncStatus(n)
+  ].join(' ').toLowerCase().includes(q));
 }
 
 function renderRules() {
@@ -3842,18 +4136,19 @@ function renderUsers() {
 
 function renderNodes(nowValue) {
   const wrap = $('nodesTable');
-  if (!nodesCache.length) {
-    wrap.innerHTML = '<div class="empty">No nodes have reported yet.</div>';
+  const visible = visibleNodes();
+  if (!visible.length) {
+    wrap.innerHTML = '<div class="empty">' + (nodesCache.length ? 'No matching nodes.' : 'No nodes have reported yet.') + '</div>';
     renderStats();
     return;
   }
-  wrap.innerHTML = '<table><thead><tr><th>Node</th><th>Status</th><th>Public IP</th><th>Token</th><th>Versions</th><th>Traffic</th><th>Top Users</th><th>Top Rules</th><th>Top Dialers</th><th>Uptime</th><th>Last heartbeat</th><th>Error</th><th>Actions</th></tr></thead><tbody>' + nodesCache.map(n => {
+  wrap.innerHTML = '<table><thead><tr><th>Node</th><th>Status</th><th>Public IP</th><th>Token</th><th>Versions</th><th>Traffic</th><th>Top Users</th><th>Top Rules</th><th>Top Dialers</th><th>Uptime</th><th>Last heartbeat</th><th>Error</th><th>Actions</th></tr></thead><tbody>' + visible.map(n => {
     const status = nodeStatus(n);
     const configSync = configSyncStatus(n);
     return '<tr>' +
       '<td><strong>' + escapeHTML(n.node_id) + '</strong><div class="compact">' + escapeHTML(n.hostname || '-') + '</div></td>' +
       '<td>' + statusPill(status) + '</td>' +
-      '<td class="mono">' + escapeHTML(n.public_ip || '-') + '</td>' +
+      '<td class="mono">' + escapeHTML(n.public_ip || '-') + proxyProbeSummary(n) + '</td>' +
       '<td>' + statusPill(n.has_token ? 'dedicated' : 'shared') + '<div class="compact">last auth ' + escapeHTML(n.auth_mode || '-') + '</div>' + (n.token_set_at ? '<div class="compact">' + escapeHTML(formatDate(n.token_set_at)) + '</div>' : '') + '</td>' +
       '<td class="mono">config ' + escapeHTML(shortHash(n.config_version)) + ' ' + statusPill(configSync) + '<div class="compact mono">central ' + escapeHTML(shortHash(configStatus.config_version)) + '</div><div class="compact mono">cert ' + escapeHTML(shortHash(n.cert_version)) + '</div></td>' +
       '<td>' + escapeHTML(formatBytes((n.rx_bytes || 0) + (n.tx_bytes || 0))) + '<div class="compact">rx ' + escapeHTML(formatBytes(n.rx_bytes || 0)) + ' / tx ' + escapeHTML(formatBytes(n.tx_bytes || 0)) + '</div></td>' +
@@ -3901,9 +4196,20 @@ function renderServers() {
 
 function serverStatusTone(status) {
   status = String(status || '').toLowerCase();
-  if (status === 'ssh_ok' || status === 'preflight_ok' || status === 'deployed' || status === 'restarted' || status === 'upgraded') return 'ok';
+  if (status === 'ssh_ok' || status === 'preflight_ok' || status === 'deployed' || status === 'onboarded' || status === 'restarted' || status === 'upgraded') return 'ok';
+  if (status === 'heartbeat_pending') return 'warn';
   if (status === 'unreachable' || status === 'preflight_failed' || status === 'error') return 'error';
   return status || 'saved';
+}
+
+function proxyProbeSummary(n) {
+  const status = n.proxy_status || '';
+  if (!status) return '';
+  const cls = status === 'ok' ? 'ok' : 'err';
+  const lines = ['<div class="compact">' + statusPill(status) + ' proxy ' + escapeHTML(formatDate(n.proxy_checked_at)) + '</div>'];
+  if (n.proxy_exit_ip || n.proxy_org) lines.push('<div class="compact mono">exit ' + escapeHTML(n.proxy_exit_ip || '-') + ' ' + escapeHTML(n.proxy_org || '') + '</div>');
+  if (n.proxy_error) lines.push('<div class="compact">' + escapeHTML(n.proxy_error) + '</div>');
+  return lines.join('');
 }
 
 function renderJobs() {
@@ -3978,6 +4284,7 @@ function selectServerIntoForm(s) {
   $('upgradeImage').value = s.image || '';
   $('serverProxyPorts').value = (s.proxy_ports || ['443:443','8443:8443']).join(',');
   $('serverTrafficIface').value = s.traffic_iface || 'eth0';
+  if (!$('deployCentralURL').value) $('deployCentralURL').value = defaultCentralURL();
   $('serverPassword').value = '';
   $('serverPrivateKey').value = '';
   $('serverPassphrase').value = '';
@@ -4045,7 +4352,8 @@ async function deleteServer() {
 }
 
 function clearServerForm() {
-  ['serverID','serverNodeID','serverName','serverHost','serverPassword','serverPrivateKey','serverPassphrase','deployCentralURL','deployNodeToken','upgradeImage'].forEach(id => { $(id).value = ''; });
+  ['serverID','serverNodeID','serverName','serverHost','serverPassword','serverPrivateKey','serverPassphrase','deployNodeToken','upgradeImage'].forEach(id => { $(id).value = ''; });
+  $('deployCentralURL').value = defaultCentralURL();
   $('serverSSHPort').value = 22;
   $('serverSSHUser').value = 'root';
   $('serverAuthType').value = 'auto';
@@ -4054,6 +4362,7 @@ function clearServerForm() {
   $('serverProxyPorts').value = '443:443,8443:8443';
   $('serverTrafficIface').value = 'eth0';
   $('deploySyncInterval').value = '30s';
+  $('deployWaitHeartbeat').value = 120;
   $('deployInstallDocker').checked = true;
   $('selectedServerStatus').textContent = 'new';
   $('serverResult').textContent = 'Save a server, test SSH, then deploy node mode.';
@@ -4082,12 +4391,31 @@ async function deployServerNode() {
     deploy_dir: $('serverDeployDir').value.trim(),
     proxy_ports: splitCSV($('serverProxyPorts').value),
     sync_interval: $('deploySyncInterval').value.trim() || '30s',
-    install_docker: $('deployInstallDocker').checked
+    install_docker: $('deployInstallDocker').checked,
+    wait_heartbeat_seconds: Number($('deployWaitHeartbeat').value || 120)
   };
   $('serverResult').textContent = 'Queued node deployment...';
   const job = await fetchJSON('/api/servers/' + encodeURIComponent(saved.server_id) + '/deploy-node', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   await pollJob(job.job_id, 'serverResult');
   await Promise.all([loadServers(), loadJobs(), loadNodes()]);
+}
+
+async function onboardServerNode() {
+  const saved = await fetchJSON('/api/servers', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(serverPayload()) });
+  selectServerIntoForm(saved);
+  const payload = {
+    central_url: $('deployCentralURL').value.trim() || defaultCentralURL(),
+    image: $('serverImage').value.trim(),
+    deploy_dir: $('serverDeployDir').value.trim(),
+    proxy_ports: splitCSV($('serverProxyPorts').value),
+    sync_interval: $('deploySyncInterval').value.trim() || '30s',
+    install_docker: $('deployInstallDocker').checked,
+    wait_heartbeat_seconds: Number($('deployWaitHeartbeat').value || 120)
+  };
+  $('serverResult').textContent = 'Queued node onboarding...';
+  const job = await fetchJSON('/api/servers/' + encodeURIComponent(saved.server_id) + '/onboard-node', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  await pollJob(job.job_id, 'serverResult');
+  await Promise.all([loadServers(), loadJobs(), loadEvents(), loadNodes()]);
 }
 
 async function preflightServerNode() {
@@ -4700,6 +5028,10 @@ function shortHash(value) {
   return value.length > 12 ? value.slice(0, 12) : value;
 }
 
+function defaultCentralURL() {
+  return window.location.origin || '';
+}
+
 async function selectRule(name) {
   const rule = await fetchJSON('/api/rules/' + encodeURIComponent(name));
   $('ruleName').value = rule.name;
@@ -4904,6 +5236,7 @@ function toggleHealthAuto() {
 }
 
 $('adminToken').value = adminToken;
+$('deployCentralURL').value = defaultCentralURL();
 $('adminToken').addEventListener('keydown', e => {
   if (e.key === 'Enter') {
     e.preventDefault();

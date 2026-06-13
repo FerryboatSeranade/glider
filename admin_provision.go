@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -21,6 +22,7 @@ const (
 	jobTypeSSHTest     = "ssh_test"
 	jobTypePreflight   = "preflight_node"
 	jobTypeDeployNode  = "deploy_node"
+	jobTypeOnboardNode = "onboard_node"
 	jobTypeRestartNode = "restart_node"
 	jobTypeUpgradeNode = "upgrade_node"
 
@@ -52,13 +54,14 @@ type serverUpsertPayload struct {
 }
 
 type deployNodePayload struct {
-	CentralURL    string   `json:"central_url"`
-	NodeToken     string   `json:"node_token"`
-	Image         string   `json:"image"`
-	DeployDir     string   `json:"deploy_dir"`
-	ProxyPorts    []string `json:"proxy_ports"`
-	InstallDocker bool     `json:"install_docker"`
-	SyncInterval  string   `json:"sync_interval"`
+	CentralURL           string   `json:"central_url"`
+	NodeToken            string   `json:"node_token"`
+	Image                string   `json:"image"`
+	DeployDir            string   `json:"deploy_dir"`
+	ProxyPorts           []string `json:"proxy_ports"`
+	InstallDocker        bool     `json:"install_docker"`
+	SyncInterval         string   `json:"sync_interval"`
+	WaitHeartbeatSeconds int      `json:"wait_heartbeat_seconds"`
 }
 
 type nodeOperationPayload struct {
@@ -101,7 +104,8 @@ func (s *adminServer) createDeployNodeJob(ctx context.Context, serverID string, 
 	if err != nil {
 		return dbJob{}, err
 	}
-	if strings.TrimSpace(payload.CentralURL) == "" {
+	centralURL := firstNonEmpty(payload.CentralURL, defaultCentralURL(nil))
+	if strings.TrimSpace(centralURL) == "" {
 		return dbJob{}, fmt.Errorf("central_url required")
 	}
 	if strings.TrimSpace(payload.NodeToken) == "" {
@@ -111,12 +115,13 @@ func (s *adminServer) createDeployNodeJob(ctx context.Context, serverID string, 
 		return dbJob{}, fmt.Errorf("node_token must be at least 16 characters")
 	}
 	req := dbJobRequest{
-		CentralURL:    strings.TrimSpace(payload.CentralURL),
-		Image:         firstNonEmpty(payload.Image, server.Image, "ghcr.io/ferryboatseranade/glider:latest"),
-		DeployDir:     firstNonEmpty(payload.DeployDir, server.DeployDir, "/root/data/docker_data/glider"),
-		ProxyPorts:    normalizeStringList(append([]string(nil), firstNonEmptySlice(payload.ProxyPorts, server.ProxyPorts)...)),
-		InstallDocker: payload.InstallDocker,
-		SyncInterval:  firstNonEmpty(payload.SyncInterval, "30s"),
+		CentralURL:           strings.TrimSpace(centralURL),
+		Image:                firstNonEmpty(payload.Image, server.Image, "ghcr.io/ferryboatseranade/glider:latest"),
+		DeployDir:            firstNonEmpty(payload.DeployDir, server.DeployDir, "/root/data/docker_data/glider"),
+		ProxyPorts:           normalizeStringList(append([]string(nil), firstNonEmptySlice(payload.ProxyPorts, server.ProxyPorts)...)),
+		InstallDocker:        payload.InstallDocker,
+		SyncInterval:         firstNonEmpty(payload.SyncInterval, "30s"),
+		WaitHeartbeatSeconds: payload.WaitHeartbeatSeconds,
 	}
 	if len(req.ProxyPorts) == 0 {
 		req.ProxyPorts = []string{"443:443", "8443:8443"}
@@ -126,6 +131,38 @@ func (s *adminServer) createDeployNodeJob(ctx context.Context, serverID string, 
 		return dbJob{}, err
 	}
 	go s.runDeployNodeJob(job.JobID, serverID, payload.NodeToken)
+	return job, nil
+}
+
+func (s *adminServer) createOnboardNodeJob(ctx context.Context, serverID string, payload deployNodePayload) (dbJob, error) {
+	server, err := s.store.GetServer(ctx, serverID)
+	if err != nil {
+		return dbJob{}, err
+	}
+	centralURL := firstNonEmpty(payload.CentralURL, defaultCentralURL(nil))
+	if strings.TrimSpace(centralURL) == "" {
+		return dbJob{}, fmt.Errorf("central_url required")
+	}
+	req := dbJobRequest{
+		CentralURL:           strings.TrimSpace(centralURL),
+		Image:                firstNonEmpty(payload.Image, server.Image, "ghcr.io/ferryboatseranade/glider:latest"),
+		DeployDir:            firstNonEmpty(payload.DeployDir, server.DeployDir, "/root/data/docker_data/glider"),
+		ProxyPorts:           normalizeStringList(append([]string(nil), firstNonEmptySlice(payload.ProxyPorts, server.ProxyPorts)...)),
+		InstallDocker:        payload.InstallDocker,
+		SyncInterval:         firstNonEmpty(payload.SyncInterval, "30s"),
+		WaitHeartbeatSeconds: payload.WaitHeartbeatSeconds,
+	}
+	if len(req.ProxyPorts) == 0 {
+		req.ProxyPorts = []string{"443:443", "8443:8443"}
+	}
+	if req.WaitHeartbeatSeconds <= 0 {
+		req.WaitHeartbeatSeconds = 120
+	}
+	job := newJob(jobTypeOnboardNode, serverID, server.NodeID, req)
+	if err := s.store.CreateJob(ctx, job); err != nil {
+		return dbJob{}, err
+	}
+	go s.runOnboardNodeJob(job.JobID, serverID)
 	return job, nil
 }
 
@@ -297,13 +334,16 @@ func (s *adminServer) runDeployNodeJob(jobID, serverID, nodeToken string) {
 			return
 		}
 	}
-	if err := deployNodeOverSSH(ctx, runner, logger, *server, req, nodeToken); err != nil {
+	if err := deployNodeOverSSH(ctx, runner, logger, *server, req, nodeToken, func() error {
+		tokenHash := hashNodeToken(nodeToken)
+		if err := s.store.SetNodeTokenHash(context.Background(), server.NodeID, tokenHash); err != nil {
+			return fmt.Errorf("save dedicated node token hash: %w", err)
+		}
+		logger.Log("dedicated token hash saved for node %s", server.NodeID)
+		return nil
+	}); err != nil {
 		s.finishProvisionJob(jobID, serverID, server.NodeID, "error", err)
 		return
-	}
-	tokenHash := hashNodeToken(nodeToken)
-	if err := s.store.SetNodeTokenHash(context.Background(), server.NodeID, tokenHash); err != nil {
-		logger.Log("warning: could not save dedicated node token hash: %v", err)
 	}
 	now := time.Now().UTC()
 	_ = s.store.UpdateServerStatus(context.Background(), serverID, "deployed", "", nil, &now, jobID)
@@ -315,6 +355,83 @@ func (s *adminServer) runDeployNodeJob(jobID, serverID, nodeToken string) {
 		NodeID:   server.NodeID,
 		JobID:    jobID,
 		Metadata: map[string]any{"image": req.Image, "deploy_dir": req.DeployDir},
+	})
+}
+
+func (s *adminServer) runOnboardNodeJob(jobID, serverID string) {
+	ctx := context.Background()
+	_ = s.store.StartJob(ctx, jobID)
+	logger := jobLogger{store: s.store, jobID: jobID}
+	job, err := s.store.GetJob(ctx, jobID)
+	if err != nil {
+		s.finishProvisionJob(jobID, serverID, "", "error", err)
+		return
+	}
+	server, err := s.store.GetServer(ctx, serverID)
+	if err != nil {
+		s.finishProvisionJob(jobID, serverID, "", "error", err)
+		return
+	}
+	runner, err := connectSSH(ctx, *server, logger)
+	if err != nil {
+		s.finishProvisionJob(jobID, serverID, server.NodeID, "unreachable", err)
+		return
+	}
+	defer runner.Close()
+
+	req := job.Request
+	if req.DeployDir == "" {
+		req.DeployDir = firstNonEmpty(server.DeployDir, "/root/data/docker_data/glider")
+	}
+	if req.Image == "" {
+		req.Image = firstNonEmpty(server.Image, "ghcr.io/ferryboatseranade/glider:latest")
+	}
+	if req.SyncInterval == "" {
+		req.SyncInterval = "30s"
+	}
+	if len(req.ProxyPorts) == 0 {
+		req.ProxyPorts = firstNonEmptySlice(server.ProxyPorts, []string{"443:443", "8443:8443"})
+	}
+	if req.WaitHeartbeatSeconds <= 0 {
+		req.WaitHeartbeatSeconds = 120
+	}
+
+	logger.Log("starting node onboarding for %s", server.NodeID)
+	if err := preflightNodeOverSSH(ctx, runner, logger, *server, req); err != nil {
+		s.finishProvisionJob(jobID, serverID, server.NodeID, "preflight_failed", err)
+		return
+	}
+	if req.InstallDocker {
+		if err := ensureDocker(ctx, runner, logger); err != nil {
+			s.finishProvisionJob(jobID, serverID, server.NodeID, "error", err)
+			return
+		}
+	}
+	nodeToken := generateNodeToken()
+	if err := deployNodeOverSSH(ctx, runner, logger, *server, req, nodeToken, func() error {
+		if err := s.store.SetNodeTokenHash(context.Background(), server.NodeID, hashNodeToken(nodeToken)); err != nil {
+			return fmt.Errorf("save dedicated node token hash: %w", err)
+		}
+		logger.Log("dedicated token generated and saved for node %s", server.NodeID)
+		return nil
+	}); err != nil {
+		s.finishProvisionJob(jobID, serverID, server.NodeID, "error", err)
+		return
+	}
+	if err := s.waitForNodeHeartbeat(ctx, logger, server.NodeID, time.Duration(req.WaitHeartbeatSeconds)*time.Second); err != nil {
+		s.finishProvisionJob(jobID, serverID, server.NodeID, "heartbeat_pending", err)
+		return
+	}
+	now := time.Now().UTC()
+	_ = s.store.UpdateServerStatus(context.Background(), serverID, "onboarded", "", &now, &now, jobID)
+	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
+	s.recordEvent(dbEvent{
+		Type:     "server.onboard_succeeded",
+		Message:  "node onboarding succeeded",
+		ServerID: serverID,
+		NodeID:   server.NodeID,
+		JobID:    jobID,
+		Metadata: map[string]any{"image": req.Image, "deploy_dir": req.DeployDir, "central_url": req.CentralURL},
 	})
 }
 
@@ -636,7 +753,7 @@ func hostPortFromMapping(mapping string) string {
 	return ""
 }
 
-func deployNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger, server dbServer, req dbJobRequest, nodeToken string) error {
+func deployNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger, server dbServer, req dbJobRequest, nodeToken string, beforeStart func() error) error {
 	deployDir := firstNonEmpty(req.DeployDir, server.DeployDir, "/root/data/docker_data/glider")
 	nodeID := firstNonEmpty(server.NodeID, server.ServerID)
 	cacheDir := "/etc/glider-cache"
@@ -665,8 +782,21 @@ func deployNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger,
 		}
 	}
 	logger.Log("pulling image %s", req.Image)
-	cmd := "cd " + shellQuote(deployDir) + " && docker compose pull && docker compose up -d"
-	out, err := runner.Run(ctx, cmd)
+	pullCmd := "cd " + shellQuote(deployDir) + " && docker compose pull"
+	out, err := runner.Run(ctx, pullCmd)
+	if strings.TrimSpace(out) != "" {
+		logger.Log("%s", strings.TrimSpace(out))
+	}
+	if err != nil {
+		return err
+	}
+	if beforeStart != nil {
+		if err := beforeStart(); err != nil {
+			return err
+		}
+	}
+	cmd := "cd " + shellQuote(deployDir) + " && docker compose up -d"
+	out, err = runner.Run(ctx, cmd)
 	if strings.TrimSpace(out) != "" {
 		logger.Log("%s", strings.TrimSpace(out))
 	}
@@ -678,6 +808,48 @@ func deployNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger,
 		logger.Log("%s", strings.TrimSpace(out))
 	}
 	return err
+}
+
+func (s *adminServer) waitForNodeHeartbeat(ctx context.Context, logger jobLogger, nodeID string, timeout time.Duration) error {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return fmt.Errorf("node_id required")
+	}
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	deadline := time.Now().UTC().Add(timeout)
+	logger.Log("waiting up to %s for node %s heartbeat", timeout.Round(time.Second), nodeID)
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		cctx, cancel := withTimeout(ctx)
+		node, err := s.store.GetNode(cctx, nodeID)
+		cancel()
+		if err == nil && nodeHealthyAt(*node, time.Now().UTC()) {
+			logger.Log("node %s heartbeat received from %s with config %s", nodeID, firstNonEmpty(node.PublicIP, node.Hostname, "-"), shortLogVersion(node.ConfigVersion))
+			return nil
+		}
+		if time.Now().UTC().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("node heartbeat not received before timeout: %w", err)
+			}
+			return fmt.Errorf("node heartbeat not healthy before timeout")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func generateNodeToken() string {
+	buf := make([]byte, 24)
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
+		return fmt.Sprintf("node-%d", time.Now().UnixNano())
+	}
+	return "node-" + base64.RawURLEncoding.EncodeToString(buf)
 }
 
 func restartNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger, deployDir string) error {
@@ -834,9 +1006,30 @@ func serverFromPayload(payload serverUpsertPayload) (dbServer, serverSecretUpdat
 	}
 }
 
-func defaultCentralURL(rHost string) string {
+func defaultCentralURL(r *http.Request) string {
 	if value := strings.TrimSpace(os.Getenv("GLIDER_PUBLIC_ADMIN_URL")); value != "" {
 		return value
 	}
+	if r != nil && strings.TrimSpace(r.Host) != "" {
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded == "http" || forwarded == "https" {
+			scheme = forwarded
+		}
+		return scheme + "://" + strings.TrimSpace(r.Host)
+	}
 	return ""
+}
+
+func shortLogVersion(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	if len(value) > 12 {
+		return value[:12]
+	}
+	return value
 }

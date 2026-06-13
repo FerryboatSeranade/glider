@@ -42,24 +42,31 @@ type dbRule struct {
 }
 
 type NodeHeartbeat struct {
-	NodeID        string          `bson:"node_id" json:"node_id"`
-	Hostname      string          `bson:"hostname,omitempty" json:"hostname,omitempty"`
-	PublicIP      string          `bson:"public_ip,omitempty" json:"public_ip,omitempty"`
-	GliderVersion string          `bson:"glider_version,omitempty" json:"glider_version,omitempty"`
-	ConfigVersion string          `bson:"config_version,omitempty" json:"config_version,omitempty"`
-	CertVersion   string          `bson:"cert_version,omitempty" json:"cert_version,omitempty"`
-	CertDomains   []NodeCertState `bson:"cert_domains,omitempty" json:"cert_domains,omitempty"`
-	CertError     string          `bson:"cert_error,omitempty" json:"cert_error,omitempty"`
-	Uptime        int64           `bson:"uptime,omitempty" json:"uptime,omitempty"`
-	RXBytes       uint64          `bson:"rx_bytes,omitempty" json:"rx_bytes,omitempty"`
-	TXBytes       uint64          `bson:"tx_bytes,omitempty" json:"tx_bytes,omitempty"`
-	Traffic       TrafficSnapshot `bson:"traffic,omitempty" json:"traffic,omitempty"`
-	Error         string          `bson:"error,omitempty" json:"error,omitempty"`
-	UpdatedAt     time.Time       `bson:"updated_at" json:"updated_at"`
-	AuthMode      string          `bson:"auth_mode,omitempty" json:"auth_mode,omitempty"`
-	HasToken      bool            `bson:"-" json:"has_token,omitempty"`
-	TokenSetAt    *time.Time      `bson:"token_set_at,omitempty" json:"token_set_at,omitempty"`
-	TokenHash     string          `bson:"token_hash,omitempty" json:"-"`
+	NodeID          string          `bson:"node_id" json:"node_id"`
+	Hostname        string          `bson:"hostname,omitempty" json:"hostname,omitempty"`
+	PublicIP        string          `bson:"public_ip,omitempty" json:"public_ip,omitempty"`
+	GliderVersion   string          `bson:"glider_version,omitempty" json:"glider_version,omitempty"`
+	ConfigVersion   string          `bson:"config_version,omitempty" json:"config_version,omitempty"`
+	CertVersion     string          `bson:"cert_version,omitempty" json:"cert_version,omitempty"`
+	CertDomains     []NodeCertState `bson:"cert_domains,omitempty" json:"cert_domains,omitempty"`
+	CertError       string          `bson:"cert_error,omitempty" json:"cert_error,omitempty"`
+	Uptime          int64           `bson:"uptime,omitempty" json:"uptime,omitempty"`
+	RXBytes         uint64          `bson:"rx_bytes,omitempty" json:"rx_bytes,omitempty"`
+	TXBytes         uint64          `bson:"tx_bytes,omitempty" json:"tx_bytes,omitempty"`
+	Traffic         TrafficSnapshot `bson:"traffic,omitempty" json:"traffic,omitempty"`
+	Error           string          `bson:"error,omitempty" json:"error,omitempty"`
+	ProxyStatus     string          `bson:"proxy_status,omitempty" json:"proxy_status,omitempty"`
+	ProxyCheckedAt  *time.Time      `bson:"proxy_checked_at,omitempty" json:"proxy_checked_at,omitempty"`
+	ProxyExitIP     string          `bson:"proxy_exit_ip,omitempty" json:"proxy_exit_ip,omitempty"`
+	ProxyOrg        string          `bson:"proxy_org,omitempty" json:"proxy_org,omitempty"`
+	ProxyHTTPStatus int             `bson:"proxy_http_status,omitempty" json:"proxy_http_status,omitempty"`
+	ProxyDurationMS int64           `bson:"proxy_duration_ms,omitempty" json:"proxy_duration_ms,omitempty"`
+	ProxyError      string          `bson:"proxy_error,omitempty" json:"proxy_error,omitempty"`
+	UpdatedAt       time.Time       `bson:"updated_at" json:"updated_at"`
+	AuthMode        string          `bson:"auth_mode,omitempty" json:"auth_mode,omitempty"`
+	HasToken        bool            `bson:"-" json:"has_token,omitempty"`
+	TokenSetAt      *time.Time      `bson:"token_set_at,omitempty" json:"token_set_at,omitempty"`
+	TokenHash       string          `bson:"token_hash,omitempty" json:"-"`
 }
 
 type NodeCertState struct {
@@ -128,12 +135,13 @@ type dbJobLog struct {
 }
 
 type dbJobRequest struct {
-	CentralURL    string   `bson:"central_url,omitempty" json:"central_url,omitempty"`
-	Image         string   `bson:"image,omitempty" json:"image,omitempty"`
-	DeployDir     string   `bson:"deploy_dir,omitempty" json:"deploy_dir,omitempty"`
-	ProxyPorts    []string `bson:"proxy_ports,omitempty" json:"proxy_ports,omitempty"`
-	InstallDocker bool     `bson:"install_docker,omitempty" json:"install_docker,omitempty"`
-	SyncInterval  string   `bson:"sync_interval,omitempty" json:"sync_interval,omitempty"`
+	CentralURL           string   `bson:"central_url,omitempty" json:"central_url,omitempty"`
+	Image                string   `bson:"image,omitempty" json:"image,omitempty"`
+	DeployDir            string   `bson:"deploy_dir,omitempty" json:"deploy_dir,omitempty"`
+	ProxyPorts           []string `bson:"proxy_ports,omitempty" json:"proxy_ports,omitempty"`
+	InstallDocker        bool     `bson:"install_docker,omitempty" json:"install_docker,omitempty"`
+	SyncInterval         string   `bson:"sync_interval,omitempty" json:"sync_interval,omitempty"`
+	WaitHeartbeatSeconds int      `bson:"wait_heartbeat_seconds,omitempty" json:"wait_heartbeat_seconds,omitempty"`
 }
 
 type dbEvent struct {
@@ -500,6 +508,28 @@ func (s *mongoStore) ClearNodeTokenHash(ctx context.Context, nodeID string) erro
 			"updated_at": time.Now().UTC(),
 		},
 	})
+	return err
+}
+
+func (s *mongoStore) UpdateNodeProxyProbe(ctx context.Context, nodeID string, probe NodeProxyProbe) error {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return fmt.Errorf("node_id required")
+	}
+	if probe.CheckedAt.IsZero() {
+		probe.CheckedAt = time.Now().UTC()
+	}
+	set := bson.M{
+		"node_id":           nodeID,
+		"proxy_status":      probe.Status,
+		"proxy_checked_at":  probe.CheckedAt,
+		"proxy_exit_ip":     probe.ExitIP,
+		"proxy_org":         probe.Org,
+		"proxy_http_status": probe.HTTPStatus,
+		"proxy_duration_ms": probe.DurationMS,
+		"proxy_error":       probe.Error,
+	}
+	_, err := s.db.Collection(nodesCollection).UpdateOne(ctx, bson.M{"node_id": nodeID}, bson.M{"$set": set})
 	return err
 }
 

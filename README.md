@@ -597,6 +597,9 @@ Nodes view:
 - The panel marks nodes as online, stale, offline, or error from the latest heartbeat, node error field, and heartbeat age.
 - Nodes report config version, certificate version, uptime, total RX/TX counters, public IP, hostname, last successful auth mode, last config/node error, and separate certificate sync error.
 - If a node does not set `GLIDER_PUBLIC_IP`, Admin infers the public IP from the heartbeat request source. If Admin is behind your own trusted reverse proxy, set `GLIDER_ADMIN_TRUST_PROXY_HEADERS=true` to allow headers such as `CF-Connecting-IP`, `X-Real-IP`, and `X-Forwarded-For`. Leave it false when Admin is directly exposed or behind an untrusted proxy.
+- Admin can also run external node proxy health checks. Every `GLIDER_NODE_PROXY_HEALTH_INTERVAL` it picks the first enabled, unexpired user credential, connects through each fresh node heartbeat at the node's published HTTP proxy port, and requests `GLIDER_NODE_PROXY_HEALTH_TARGET` (default `https://ipinfo.io/json`). Results are stored on the node as `proxy_status`, `proxy_checked_at`, `proxy_exit_ip`, `proxy_org`, `proxy_http_status`, `proxy_duration_ms`, and `proxy_error`.
+- Defaults are `GLIDER_NODE_PROXY_HEALTH_INTERVAL=60s`, `GLIDER_NODE_PROXY_HEALTH_TARGET=https://ipinfo.io/json`, and `GLIDER_NODE_PROXY_HEALTH_TIMEOUT=8s`. Set the interval to `0` to disable Admin-side node proxy checks.
+- A fresh proxy health error blocks automatic DNS failover to or from that node even if heartbeat is still fresh. This catches cases where the node process is alive but its public proxy entry point or user authentication path is broken.
 
 Servers and remote provisioning:
 
@@ -604,12 +607,13 @@ Servers and remote provisioning:
 - A server record stores `server_id`, `node_id`, host, SSH port/user, auth type, password or private key, deploy directory, image tag, proxy port mappings, and traffic interface. API responses redact passwords, private keys, and passphrases.
 - Server `auth_type` accepts `auto`, `password`, and `private_key`. For API automation, common private-key aliases such as `key`, `private-key`, `privatekey`, `ssh_key`, and `ssh-key` are normalized to `private_key`.
 - Server credentials use the same `GLIDER_SETTINGS_KEY` secret storage path as Cloudflare settings. If `GLIDER_SETTINGS_KEY` is set, new SSH passwords/private keys are encrypted before they are written to MongoDB.
-- Admin exposes `GET|POST /api/servers`, `GET|PUT|DELETE /api/servers/<server_id>`, `POST /api/servers/<server_id>/test-ssh`, `POST /api/servers/<server_id>/preflight-node`, `POST /api/servers/<server_id>/deploy-node`, `POST /api/servers/<server_id>/restart-node`, `POST /api/servers/<server_id>/upgrade-node`, `GET /api/jobs`, `GET /api/jobs/<job_id>`, and `GET /api/events`.
-- SSH tests, node preflights, deployments, restarts, and upgrades run as asynchronous jobs. The Servers tab shows the latest job status and logs; API clients can poll `/api/jobs/<job_id>`.
+- Admin exposes `GET|POST /api/servers`, `GET|PUT|DELETE /api/servers/<server_id>`, `POST /api/servers/<server_id>/test-ssh`, `POST /api/servers/<server_id>/preflight-node`, `POST /api/servers/<server_id>/onboard-node`, `POST /api/servers/<server_id>/deploy-node`, `POST /api/servers/<server_id>/restart-node`, `POST /api/servers/<server_id>/upgrade-node`, `GET /api/jobs`, `GET /api/jobs/<job_id>`, and `GET /api/events`.
+- SSH tests, node preflights, node onboarding, deployments, restarts, and upgrades run as asynchronous jobs. The Servers tab shows the latest job status and logs; API clients can poll `/api/jobs/<job_id>`.
 - Preflight is non-destructive. It connects over SSH and records host/user/kernel, Docker and Compose availability, deploy directory and compose file presence, current `glider` container state, disk/memory summary, and whether selected host proxy ports appear free or already listening.
+- Onboard Node is the recommended path for a new VPS. Admin saves the server inventory record, runs preflight, optionally installs Docker, generates a dedicated per-node token, stores only its hash in MongoDB before the remote container starts, writes the node deployment files, starts the node, and waits for a healthy heartbeat. If the heartbeat does not arrive before `wait_heartbeat_seconds`, the server is marked `heartbeat_pending` so you can inspect the job logs and node container.
 - Node deployment writes a single deploy directory on the target VPS, defaulting to `/root/data/docker_data/glider`, with `.env`, `compose.yml`, `glider.conf`, `rules.d/`, `cache/`, and `certs/`.
 - The generated node compose uses a fixed registry image, publishes only proxy ports such as `443` and `8443`, mounts `cache/` and `certs/`, and does not publish Admin `8444`.
-- Deployment also stores the node token hash in Admin as a dedicated token for that node, so future node config/cert sync and heartbeat use the token that was pushed to the VPS.
+- Manual Deploy Node is still available when you want to provide the plaintext node token yourself. It uses the same deployment writer and also stores the token hash before the remote container is started, so future node config/cert sync and heartbeat use the token that was pushed to the VPS.
 - The deploy job can optionally install Docker with `get.docker.com` before writing the node compose. Existing Docker installations are reused.
 - Restart jobs run `docker compose restart glider-node` in the server deploy directory.
 - Upgrade jobs replace the compose `image:` line with the selected registry image, then run `docker compose pull && docker compose up -d`.
@@ -693,13 +697,13 @@ python3 deploy/scripts/domain_onboarding_check.py \
 Failover behavior:
 
 - When `failover_enabled` is true, the admin worker checks assigned node heartbeats every `GLIDER_DOMAIN_RECONCILE_INTERVAL`.
-- A node is considered online for failover when its latest heartbeat is within 90 seconds and has no error.
+- A node is considered online for failover when its latest heartbeat is within 90 seconds, has no node error, and does not have a fresh Admin-side proxy health error.
 - Domains have a `failover_policy` with `fail_threshold`, `cooldown_seconds`, `manual_lock`, `auto_failback`, and `primary_node_id`. If `primary_node_id` is empty, Admin treats the first assigned node as the primary.
 - Admin increments `failover_state.active_failure_count` while the active node is unhealthy. DNS changes only happen after the consecutive failure count reaches `fail_threshold`.
 - After a successful DNS switch, Admin resets the failure count and sets `cooldown_until`. The failover worker will not switch that domain again until the cooldown expires.
 - When `manual_lock` is true, automatic switching is blocked and the current `active_node_id` is treated as pinned. You can still manually choose a node and run `Sync DNS`.
 - When `auto_failback` is true, the active node is healthy, the primary node has recovered, the primary node is certificate-ready, and the domain is outside cooldown, Admin switches DNS back to the primary node and starts a new cooldown window.
-- Failover candidates must be assigned to the domain, have a fresh heartbeat, have a public IP, and, when the domain has a certificate version, report the same unexpired certificate version in heartbeat.
+- Failover candidates must be assigned to the domain, have a fresh heartbeat, pass the latest fresh proxy health state, have a public IP, and, when the domain has a certificate version, report the same unexpired certificate version in heartbeat.
 - On a failover, Admin updates the Cloudflare A/AAAA record to the selected node's heartbeat `public_ip` and records the from-node, to-node, switch time, cooldown, and last reason in `failover_state`.
 - The certificate worker checks managed domains every `GLIDER_CERT_RENEW_INTERVAL`. If a certificate is missing or within `renew_before_days`, it renews with ACME DNS-01 and increments the certificate version.
 - Automatic renewal requires a Cloudflare token and ACME email configured either in the Admin panel or through the central `.env` fallback.
@@ -711,7 +715,7 @@ Formal deployment flow:
 2. Run one central Admin deployment from `/root/data/docker_data/glider-admin` with `GLIDER_MODE=admin`, MongoDB, `GLIDER_ADMIN_TOKEN`, `GLIDER_NODE_TOKEN`, and `GLIDER_SETTINGS_KEY`.
 3. Expose only Admin `8444` on the central host, preferably behind VPN, Cloudflare Access, or an authenticated reverse proxy.
 4. In Admin, save Cloudflare settings and verify the token against the target zone.
-5. In `Servers`, add each new VPS SSH credential, test SSH, then deploy node mode from the panel.
+5. In `Servers`, add each new VPS SSH credential, test SSH, then run `Onboard Node`. Use `Deploy Node` only when you need to provide a specific plaintext node token yourself.
 6. Wait for the node heartbeat to appear in `Nodes`; confirm it is online, has the expected public IP, and is synced to the central `config_version`.
 7. In `Domains`, assign a domain to multiple nodes, choose the active node, issue or import the certificate, wait until assigned nodes report the matching `cert_version`, then run `Sync DNS`.
 8. Enable failover with a threshold and cooldown. Use manual lock when you want DNS pinned during maintenance.
@@ -764,6 +768,7 @@ Test plan:
 - DNS failure test: simulate Cloudflare returning an error and verify Admin keeps the previous record metadata while surfacing the new error status.
 - Server inventory test: save a server with SSH password/private-key fields and verify Admin API responses expose only `has_password` / `has_private_key` flags, never plaintext secrets.
 - Provision render test: verify generated node `.env`, `compose.yml`, and `glider.conf` contain `GLIDER_MODE=node`, the selected image tag, proxy ports, cache/cert mounts, and no Admin port.
+- Node proxy health test: publish a working test user, verify Admin stores `proxy_status=ok` with the exit IP/ASN for a reachable node, then break the proxy port and verify a fresh `proxy_status=error` blocks failover until the probe result becomes stale or recovers.
 - Failover debounce test: mark the active node stale and verify no DNS switch happens before `fail_threshold`, then verify the next failed check selects a healthy assigned standby and sets `cooldown_until`.
 - Failover lock test: set `manual_lock=true` and verify automatic failover is blocked even when the active node is unhealthy and a standby is ready.
 

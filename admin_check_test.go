@@ -209,12 +209,16 @@ func TestAdminHTMLSmoke(t *testing.T) {
 		"Server Provisioning",
 		"testServerSSH",
 		"preflightServerNode",
+		"onboardServerNode",
 		"deployServerNode",
 		"restartServerNode",
 		"upgradeServerNode",
+		"/onboard-node",
 		"/preflight-node",
 		"/restart-node",
 		"/upgrade-node",
+		"Wait heartbeat seconds",
+		"nodeSearch",
 		"Provisioning Jobs",
 		"Recent Events",
 		"renderEvents",
@@ -392,6 +396,81 @@ func TestDomainRuntimeReportsFailoverReadiness(t *testing.T) {
 	}
 	if runtime.FailoverBlockedReason != "no assigned healthy node has the current certificate version" {
 		t.Fatalf("blocked reason = %q", runtime.FailoverBlockedReason)
+	}
+}
+
+func TestNodeProxyErrorBlocksFailoverUntilStale(t *testing.T) {
+	now := time.Now().UTC()
+	checked := now.Add(-time.Minute)
+	d := dbDomain{
+		Domain:          "proxy.example.com",
+		Enabled:         true,
+		FailoverEnabled: true,
+		ActiveNodeID:    "active",
+		NodeIDs:         []string{"active", "standby"},
+		FailoverPolicy: domainFailoverPolicy{
+			FailThreshold:   1,
+			CooldownSeconds: 300,
+		},
+	}
+	nodes := map[string]NodeHeartbeat{
+		"active": {
+			NodeID:         "active",
+			UpdatedAt:      now,
+			ProxyStatus:    "error",
+			ProxyCheckedAt: &checked,
+			ProxyError:     "connect refused",
+		},
+		"standby": {
+			NodeID:    "standby",
+			UpdatedAt: now,
+		},
+	}
+	decision := evaluateDomainFailover(d, nodes, now)
+	if !decision.ShouldSwitch || decision.Target.NodeID != "standby" {
+		t.Fatalf("proxy error should trigger failover decision: %#v", decision)
+	}
+	if decision.Reason != "active node unhealthy" || decision.State.LastReason != "active node unhealthy" {
+		t.Fatalf("unexpected failover reason: %#v", decision)
+	}
+	if got := activeFailureReason("active", nodes["active"]); got != "active node proxy error: connect refused" {
+		t.Fatalf("activeFailureReason = %q", got)
+	}
+
+	oldCheck := now.Add(-4 * time.Minute)
+	nodes["active"] = NodeHeartbeat{
+		NodeID:         "active",
+		UpdatedAt:      now,
+		ProxyStatus:    "error",
+		ProxyCheckedAt: &oldCheck,
+		ProxyError:     "old failure",
+	}
+	decision = evaluateDomainFailover(d, nodes, now)
+	if decision.ShouldSwitch {
+		t.Fatalf("stale proxy error should not trigger failover: %#v", decision)
+	}
+}
+
+func TestNodeProxyProbeHelpers(t *testing.T) {
+	enabled := true
+	disabled := false
+	now := time.Now().UTC()
+	expired := now.Add(-time.Minute)
+	future := now.Add(time.Hour)
+	user, ok := firstProbeUser([]dbUser{
+		{Username: "disabled", Password: "pass", Enabled: &disabled},
+		{Username: "expired", Password: "pass", Enabled: &enabled, ExpiresAt: &expired},
+		{Username: "missing-pass", Enabled: &enabled},
+		{Username: "usable", Password: "pass", Enabled: &enabled, ExpiresAt: &future},
+	}, now)
+	if !ok || user.Username != "usable" {
+		t.Fatalf("firstProbeUser = %#v ok=%v", user, ok)
+	}
+	if got := nodeProxyProbePort(dbServer{ProxyPorts: []string{"443:443", "18080:8443"}}); got != "18080" {
+		t.Fatalf("nodeProxyProbePort = %q", got)
+	}
+	if got := containerPortFromMapping("[::1]:9443:8443/tcp"); got != "8443" {
+		t.Fatalf("containerPortFromMapping = %q", got)
 	}
 }
 
