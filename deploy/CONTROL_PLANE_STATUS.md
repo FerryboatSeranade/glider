@@ -8,17 +8,19 @@ This file tracks the current central-admin plus node deployment state used durin
 - Central deploy directory: `/root/data/docker_data/glider-admin`
 - Node host: `zgo`
 - Node deploy directory: `/root/data/docker_data/glider`
-- Runtime image tag under validation: `ghcr.io/ferryboatseranade/glider:v2026.06.13-oncheck1`
+- Runtime image tag under validation: `ghcr.io/ferryboatseranade/glider:v2026.06.13-domainjob1`
 
 The tag above is now published to GHCR and both remote compose files pull it from the registry. The earlier `docker save | ssh docker load` bootstrap path has been retired for the current hosts, and `pull_policy: never` was removed from both remote compose files.
 
-The current tag was published by GitHub Actions run `27459851221` on 2026-06-13. Tests, deploy-script tests, and multi-architecture Docker build/push completed successfully; the Release step was still running during rollout verification. `docker manifest inspect ghcr.io/ferryboatseranade/glider:v2026.06.13-oncheck1` shows amd64 and arm64 images.
+The current tag was published by GitHub Actions run `27460839730` on 2026-06-13. Tests, deploy-script tests, multi-architecture Docker build/push, and Release completed successfully. `docker manifest inspect ghcr.io/ferryboatseranade/glider:v2026.06.13-domainjob1` shows amd64 and arm64 images. The amd64 image digest is `sha256:75ebfb38090063cfef00017ac0b5abab4daeff60446e1f4543f62fc398925a8f`.
+
+The previous deployed tag `v2026.06.13-oncheck1` was published by GitHub Actions run `27459851221` on 2026-06-13. Tests, deploy-script tests, multi-architecture Docker build/push, and Release completed successfully.
 
 The previous deployed tag `v2026.06.13-faildiag1` was published by GitHub Actions run `27459247351` on 2026-06-13. Tests, deploy-script tests, multi-architecture Docker build/push, and Release all completed successfully. `docker manifest inspect ghcr.io/ferryboatseranade/glider:v2026.06.13-faildiag1` shows amd64 and arm64 images under digest `sha256:6a8db88e866ae73e0e0c712b9ecb730b1814376bf3eed5282f3fa4b9edb330d0`.
 
 The earlier baseline tag `v2026.06.08-control56` was published by GitHub Actions run `27106664483`, which completed successfully on 2026-06-08. Remote `docker manifest inspect ghcr.io/ferryboatseranade/glider:v2026.06.08-control56` showed a multi-architecture OCI index.
 
-The control-plane PR was merged into `master` as `d78ae8037ca0dc541590d6cbf211ccd405e7736e`. The follow-up `master` push workflow run `27113588882` completed successfully on 2026-06-08 and published `ghcr.io/ferryboatseranade/glider:master`. On 2026-06-12, `ovh-xboard` verified that `ghcr.io/ferryboatseranade/glider:master` resolves to a multi-architecture OCI index. The current remote deployments are deliberately pinned to the explicit tag `v2026.06.13-oncheck1`; future rollouts should update the compose image tag intentionally.
+The control-plane PR was merged into `master` as `d78ae8037ca0dc541590d6cbf211ccd405e7736e`. The follow-up `master` push workflow run `27113588882` completed successfully on 2026-06-08 and published `ghcr.io/ferryboatseranade/glider:master`. On 2026-06-12, `ovh-xboard` verified that `ghcr.io/ferryboatseranade/glider:master` resolves to a multi-architecture OCI index. The current remote deployments are deliberately pinned to the explicit tag `v2026.06.13-domainjob1`; future rollouts should update the compose image tag intentionally.
 
 ## Registry Publishing
 
@@ -28,16 +30,17 @@ For a one-off local push, log in with a GitHub token that has package write perm
 
 ```bash
 docker login ghcr.io
-docker push ghcr.io/ferryboatseranade/glider:v2026.06.13-oncheck1
+docker push ghcr.io/ferryboatseranade/glider:v2026.06.13-domainjob1
 ```
 
-The current hosts already pull `v2026.06.13-oncheck1` from GHCR. Keep `pull_policy: never` out of normal compose files so future image refreshes use the registry.
+The current hosts already pull `v2026.06.13-domainjob1` from GHCR. Keep `pull_policy: never` out of normal compose files so future image refreshes use the registry.
 
 ## Verified Checks
 
-- `ovh-xboard` runs `glider-admin` on `:8444` with image `ghcr.io/ferryboatseranade/glider:v2026.06.13-oncheck1`.
-- `zgo` runs node mode with image `ghcr.io/ferryboatseranade/glider:v2026.06.13-oncheck1` and publishes proxy ports `443` and `8443`; it still does not publish Admin `8444`.
-- The amd64 `/usr/local/bin/glider` binary SHA256 from the current GHCR image is `667c4f9f1641891ed968b40fc00cfb5410488faf97df10175b0807fe647182bc` on both remote containers.
+- `ovh-xboard` runs `glider-admin` on `:8444` with image `ghcr.io/ferryboatseranade/glider:v2026.06.13-domainjob1`.
+- `zgo` runs node mode with image `ghcr.io/ferryboatseranade/glider:v2026.06.13-domainjob1` and publishes proxy ports `443` and `8443`; it still does not publish Admin `8444`.
+- The amd64 `/usr/local/bin/glider` binary SHA256 from the current GHCR image is `1b3e68ea6854f7bfa8a65cbc58569212b056e8986ba937cca5d0beb7dd42cc09` on both remote containers.
+- The old `ovh-xboard` `/root/data/docker_data/glider` compose project that ran `nadoo/glider` as container `glider` has been stopped. The central host now keeps the new `glider-admin` container for Admin and leaves unrelated Nginx Proxy Manager port `443` untouched.
 - On 2026-06-12, `ovh-xboard` still reported `glider-admin` running image `ghcr.io/ferryboatseranade/glider:v2026.06.08-control56` with binary SHA256 `66223918dc645c40d30aa15db51439f57df01bc459178fbfdac2a8585de9591e`; `/api/settings/cloudflare` returned `configured=false`, and `/api/nodes` showed `zgo` heartbeat, traffic counters, config version `d4aa2e1bd01a91de...`, and `auth_mode=shared`.
 - On 2026-06-12, `zgo` still reported container `glider` running image `ghcr.io/ferryboatseranade/glider:v2026.06.08-control56` with the same binary SHA256, listening on `443` and `8443` only. No `8444` listener was present.
 - On 2026-06-08, both remote containers were rechecked after `docker compose pull` and reported image `ghcr.io/ferryboatseranade/glider:v2026.06.08-control56`, running state, and the expected binary SHA above. `zgo` listened only on `443` and `8443`, and `8444` was not exposed.
@@ -115,13 +118,13 @@ The current hosts already pull `v2026.06.13-oncheck1` from GHCR. Keep `pull_poli
 
 ## Current Provisioning Rollout
 
-- GitHub Actions run `27456616394` completed successfully for `v2026.06.13-onboard3`; tests, deploy-script tests, multi-arch Docker publish, and Release all passed. GitHub Actions run `27458777348` published `ghcr.io/ferryboatseranade/glider:v2026.06.13-rollback1` for amd64 and arm64. GitHub Actions run `27459247351` completed successfully for `v2026.06.13-faildiag1`; tests, deploy-script tests, multi-arch Docker publish, and Release all passed. GitHub Actions run `27459851221` has completed tests, deploy-script tests, and multi-arch Docker publish for `v2026.06.13-oncheck1`; its Release step was still running during rollout verification, but GHCR already published `ghcr.io/ferryboatseranade/glider:v2026.06.13-oncheck1` for amd64 and arm64.
-- `ovh-xboard` is running Admin image `ghcr.io/ferryboatseranade/glider:v2026.06.13-oncheck1` from `/root/data/docker_data/glider-admin`; the container started at `2026-06-13T07:12:28Z`.
-- `zgo` is registered in the Admin `servers` collection with `server_id=zgo`, `node_id=zgo`, host `38.49.59.207`, deploy directory `/root/data/docker_data/glider`, and redacted private-key credentials. The remote compose deployment now runs image `ghcr.io/ferryboatseranade/glider:v2026.06.13-oncheck1`; the container started at `2026-06-13T07:12:32Z`.
+- GitHub Actions run `27456616394` completed successfully for `v2026.06.13-onboard3`; tests, deploy-script tests, multi-arch Docker publish, and Release all passed. GitHub Actions run `27458777348` published `ghcr.io/ferryboatseranade/glider:v2026.06.13-rollback1` for amd64 and arm64. GitHub Actions run `27459247351` completed successfully for `v2026.06.13-faildiag1`; tests, deploy-script tests, multi-arch Docker publish, and Release all passed. GitHub Actions run `27459851221` completed successfully for `v2026.06.13-oncheck1`. GitHub Actions run `27460839730` completed successfully for `v2026.06.13-domainjob1`; tests, deploy-script tests, multi-arch Docker publish, and Release all passed.
+- `ovh-xboard` is running Admin image `ghcr.io/ferryboatseranade/glider:v2026.06.13-domainjob1` from `/root/data/docker_data/glider-admin`; the container started at `2026-06-13T07:59:53Z`.
+- `zgo` is registered in the Admin `servers` collection with `server_id=zgo`, `node_id=zgo`, host `38.49.59.207`, deploy directory `/root/data/docker_data/glider`, and redacted private-key credentials. The remote compose deployment now runs image `ghcr.io/ferryboatseranade/glider:v2026.06.13-domainjob1`; the container started at `2026-06-13T07:59:54Z`.
 - The Admin-side SSH test job `job-kG4nGtsnzpZ07hQK` succeeded from `ovh-xboard` to `zgo` using the stored server credentials.
 - The Admin-side preflight job `job-twvPYHTPqsFvdUUy` succeeded from `ovh-xboard` to `zgo`, reporting Docker `29.1.3`, Docker Compose `2.40.3`, deploy directory and compose file present, container `glider` running, `19G` free disk, `1234MB` available memory, and ports `443`/`8443` listening.
 - The Admin-side upgrade job `job-ybmMWnZ3Ve9A5Z3S` succeeded and upgraded `zgo` to image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision4`.
-- After the latest registry-image upgrade, `zgo` reported container `glider` running, compose image `ghcr.io/ferryboatseranade/glider:v2026.06.13-oncheck1`, published ports `443` and `8443`, and no Admin `8444` listener.
+- After the latest registry-image upgrade, `zgo` reported container `glider` running, compose image `ghcr.io/ferryboatseranade/glider:v2026.06.13-domainjob1`, published ports `443` and `8443`, and no Admin `8444` listener.
 - A proxy check through `zgo` on `127.0.0.1:8443` to `https://ipinfo.io/json` returned exit IP `91.230.73.88` (`AS50131 Spartan Host Ltd`, Dallas, Texas, US), confirming the data plane stayed functional after the Admin-driven upgrade.
 - Admin `/api/servers` now reports `zgo` status `inspect_ok`, `has_private_key=true`, image metadata from the latest Admin-driven inspection/upgrade flow, previous image metadata, and last inspect job `job-xhj1yE67T8ncP-Z2`.
 - Admin `/api/nodes` reports `zgo` heartbeat with public IP `38.49.59.207`, config version `d4aa2e1bd01a91de...`, cert version `e3b0c44298fc1c14...`, user/rule/dialer traffic stats, and no config or certificate sync error.
@@ -137,3 +140,5 @@ The current hosts already pull `v2026.06.13-oncheck1` from GHCR. Keep `pull_poli
 - On `v2026.06.13-faildiag1`, the Admin HTML served from `ovh-xboard` includes `Reset Failover`, `resetDomainFailover`, `failover-reset`, and `domainFailoverNodeReasons` UI hooks. A proxy check through `zgo` on `127.0.0.1:8443` to `https://ipinfo.io/json` still returned exit IP `91.230.73.88` (`AS50131 Spartan Host Ltd`, Dallas, Texas, US).
 - Domain onboarding readiness checks are deployed in `v2026.06.13-oncheck1`. `POST /api/domains/<domain>/onboarding-check` returns a read-only checklist covering domain enablement, node assignment, active node readiness, Cloudflare settings, certificate presence/expiry/sync, failover node count, DNS plan, certificate plan, and failover plan. The Domains UI exposes this as `Onboarding Check`. This is covered by `TestAdminHTMLSmoke`, `TestDomainOnboardingStaticChecksBlockUnsafeDomain`, and `TestDomainOnboardingStaticChecksReadyWithSyncedCertAndFailover`.
 - On `v2026.06.13-oncheck1`, the Admin HTML served from `ovh-xboard` includes `Onboarding Check`, `checkDomainOnboarding`, `renderOnboardingCheck`, and `/onboarding-check`. A temporary domain `codex-oncheck.invalid` assigned to `zgo` returned `status=blocked`, `ready=false`, `summary=1 error(s), 1 warning(s)`, with `cloudflare_settings=warn` and `certificate=error`; the temporary domain was deleted after verification.
+- Domain onboarding jobs are deployed in `v2026.06.13-domainjob1`. `POST /api/domains/<domain>/onboarding-run` creates an async `onboard_domain` job that runs initial readiness checks, optionally issues or renews the certificate, optionally waits for assigned node certificate sync, optionally syncs Cloudflare DNS, optionally enables failover, and records final readiness. The Domains UI exposes this as `Run Onboarding` with issue-cert, wait-cert-sync, sync-DNS, enable-failover, and wait-time controls. This is covered by `TestAdminHTMLSmoke` and `TestDomainOnboardingBlockingChecksAllowMissingCertWhenIssuing`.
+- On `v2026.06.13-domainjob1`, the Admin HTML served from `ovh-xboard` includes `Run Onboarding`, `domainRunIssueCert`, `runDomainOnboarding`, and `/onboarding-run`. A temporary domain `codex-domainjob.invalid` assigned to `zgo` started an `onboard_domain` job with writes disabled; it failed as expected at `initial-readiness` because Cloudflare settings and certificate are still missing, and `/api/jobs/<job_id>` returned structured steps `load-job:succeeded`, `load-domain:succeeded`, `initial-readiness:failed`. The temporary domain was deleted after verification.
