@@ -64,14 +64,6 @@ jobs:
             ./dist/default_darwin_arm64/${{ env.APP_NAME }}
             ./dist/default_windows_amd64_v1/${{ env.APP_NAME }}.exe
 
-      - name: Release
-        uses: goreleaser/goreleaser-action@v6
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Docker - Set up Buildx
         id: buildx
         uses: docker/setup-buildx-action@v3
@@ -105,3 +97,11 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Release
+        uses: goreleaser/goreleaser-action@v6
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
