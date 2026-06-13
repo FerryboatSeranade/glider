@@ -1952,6 +1952,107 @@ func TestFailoverTargetOnlySwitchesWhenActiveIsUnhealthy(t *testing.T) {
 	}
 }
 
+func TestEvaluateDomainFailoverUsesThresholdCooldownAndManualLock(t *testing.T) {
+	now := time.Now().UTC()
+	nodes := map[string]NodeHeartbeat{
+		"active":  {NodeID: "active", UpdatedAt: now.Add(-10 * time.Minute)},
+		"standby": {NodeID: "standby", UpdatedAt: now},
+	}
+	d := dbDomain{
+		Enabled:         true,
+		FailoverEnabled: true,
+		ActiveNodeID:    "active",
+		NodeIDs:         []string{"active", "standby"},
+		FailoverPolicy: domainFailoverPolicy{
+			FailThreshold:   3,
+			CooldownSeconds: 300,
+		},
+	}
+	first := evaluateDomainFailover(d, nodes, now)
+	if first.ShouldSwitch || first.State.ActiveFailureCount != 1 {
+		t.Fatalf("first decision = %#v", first)
+	}
+	d.FailoverState = first.State
+	second := evaluateDomainFailover(d, nodes, now.Add(time.Second))
+	if second.ShouldSwitch || second.State.ActiveFailureCount != 2 {
+		t.Fatalf("second decision = %#v", second)
+	}
+	d.FailoverState = second.State
+	third := evaluateDomainFailover(d, nodes, now.Add(2*time.Second))
+	if !third.ShouldSwitch || third.Target.NodeID != "standby" || third.State.ActiveFailureCount != 0 {
+		t.Fatalf("third decision = %#v", third)
+	}
+	if third.State.CooldownUntil == nil || !third.State.CooldownUntil.After(now) {
+		t.Fatalf("cooldown was not set: %#v", third.State)
+	}
+
+	d.ActiveNodeID = "active"
+	d.FailoverState = domainFailoverState{ActiveFailureCount: 2, CooldownUntil: third.State.CooldownUntil}
+	cooling := evaluateDomainFailover(d, nodes, now.Add(10*time.Second))
+	if cooling.ShouldSwitch || cooling.State.ActiveFailureCount != 3 || cooling.State.LastError != "cooldown active" {
+		t.Fatalf("cooling decision = %#v", cooling)
+	}
+
+	d.FailoverState = domainFailoverState{ActiveFailureCount: 2}
+	d.FailoverPolicy.ManualLock = true
+	locked := evaluateDomainFailover(d, nodes, now.Add(20*time.Second))
+	if locked.ShouldSwitch || locked.State.LastError != "manual lock enabled" {
+		t.Fatalf("locked decision = %#v", locked)
+	}
+}
+
+func TestEvaluateDomainFailoverAutoFailbackToPrimary(t *testing.T) {
+	now := time.Now().UTC()
+	nodes := map[string]NodeHeartbeat{
+		"primary": {NodeID: "primary", UpdatedAt: now},
+		"standby": {NodeID: "standby", UpdatedAt: now},
+	}
+	d := dbDomain{
+		Enabled:         true,
+		FailoverEnabled: true,
+		ActiveNodeID:    "standby",
+		NodeIDs:         []string{"primary", "standby"},
+		FailoverPolicy: domainFailoverPolicy{
+			AutoFailback:    true,
+			PrimaryNodeID:   "primary",
+			CooldownSeconds: 120,
+		},
+	}
+	decision := evaluateDomainFailover(d, nodes, now)
+	if !decision.ShouldSwitch || decision.Target.NodeID != "primary" || decision.Reason != "primary node recovered" {
+		t.Fatalf("auto failback decision = %#v", decision)
+	}
+	if decision.State.CooldownUntil == nil || !decision.State.CooldownUntil.After(now) {
+		t.Fatalf("cooldown missing after failback: %#v", decision.State)
+	}
+
+	cooldown := now.Add(30 * time.Second)
+	d.FailoverState.CooldownUntil = &cooldown
+	decision = evaluateDomainFailover(d, nodes, now.Add(10*time.Second))
+	if decision.ShouldSwitch || decision.State.LastError != "cooldown active" {
+		t.Fatalf("cooldown should block failback: %#v", decision)
+	}
+}
+
+func TestNormalizeDomainValidatesPrimaryNodeAssignment(t *testing.T) {
+	d := dbDomain{
+		Domain:         "proxy.example.com",
+		Enabled:        true,
+		NodeIDs:        []string{"node-a"},
+		FailoverPolicy: domainFailoverPolicy{PrimaryNodeID: "node-b"},
+	}
+	if err := normalizeDomain(&d); err == nil {
+		t.Fatalf("normalizeDomain succeeded with unassigned primary node")
+	}
+	d.FailoverPolicy.PrimaryNodeID = ""
+	if err := normalizeDomain(&d); err != nil {
+		t.Fatalf("normalizeDomain() error = %v", err)
+	}
+	if d.FailoverPolicy.PrimaryNodeID != "node-a" {
+		t.Fatalf("primary node default = %q, want node-a", d.FailoverPolicy.PrimaryNodeID)
+	}
+}
+
 func TestCertificateRenewDue(t *testing.T) {
 	now := time.Now().UTC()
 	if !certificateRenewDue(dbDomain{}) {

@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -145,6 +146,11 @@ func startAdminServer(conf *Config, pxySw *proxy.Switcher, applier *ConfigApplie
 	mux.HandleFunc("/api/rules/health", srv.handleRulesHealth)
 	mux.HandleFunc("/api/nodes", srv.handleNodes)
 	mux.HandleFunc("/api/nodes/", srv.handleNodeAction)
+	mux.HandleFunc("/api/servers", srv.handleServers)
+	mux.HandleFunc("/api/servers/", srv.handleServerAction)
+	mux.HandleFunc("/api/jobs", srv.handleJobs)
+	mux.HandleFunc("/api/jobs/", srv.handleJobAction)
+	mux.HandleFunc("/api/events", srv.handleEvents)
 	mux.HandleFunc("/api/domains", srv.handleDomains)
 	mux.HandleFunc("/api/domains/", srv.handleDomainAction)
 	mux.HandleFunc("/api/settings/cloudflare", srv.handleCloudflareSettings)
@@ -979,6 +985,8 @@ type domainResponse struct {
 	NodeIDs         []string               `json:"node_ids,omitempty"`
 	ActiveNodeID    string                 `json:"active_node_id,omitempty"`
 	FailoverEnabled bool                   `json:"failover_enabled,omitempty"`
+	FailoverPolicy  domainFailoverPolicy   `json:"failover_policy,omitempty"`
+	FailoverState   domainFailoverState    `json:"failover_state,omitempty"`
 	RenewBeforeDays int                    `json:"renew_before_days,omitempty"`
 	DNSProvider     string                 `json:"dns_provider,omitempty"`
 	Cloudflare      cloudflareDomainConfig `json:"cloudflare,omitempty"`
@@ -998,6 +1006,9 @@ type domainRuntimeStatus struct {
 	CertSyncedNodes       int                  `json:"cert_synced_nodes"`
 	CertAssignedNodes     int                  `json:"cert_assigned_nodes"`
 	FailoverStatus        string               `json:"failover_status"`
+	FailoverFailures      int                  `json:"failover_failures"`
+	FailoverThreshold     int                  `json:"failover_threshold"`
+	FailoverCooldownUntil *time.Time           `json:"failover_cooldown_until,omitempty"`
 	FailoverReadyNodes    int                  `json:"failover_ready_nodes"`
 	FailoverBlockedReason string               `json:"failover_blocked_reason,omitempty"`
 	AssignedNodeStatus    []domainNodeCertSync `json:"assigned_node_status,omitempty"`
@@ -1024,6 +1035,8 @@ func newDomainResponse(d dbDomain, nodes map[string]NodeHeartbeat, now time.Time
 		NodeIDs:         redacted.NodeIDs,
 		ActiveNodeID:    redacted.ActiveNodeID,
 		FailoverEnabled: redacted.FailoverEnabled,
+		FailoverPolicy:  failoverPolicyWithDefaultsForDomain(redacted),
+		FailoverState:   redacted.FailoverState,
 		RenewBeforeDays: redacted.RenewBeforeDays,
 		DNSProvider:     redacted.DNSProvider,
 		Cloudflare:      redacted.Cloudflare,
@@ -1059,6 +1072,9 @@ func domainRuntime(d dbDomain, nodes map[string]NodeHeartbeat, now time.Time) do
 		CertSyncedNodes:       certSynced,
 		CertAssignedNodes:     len(d.NodeIDs),
 		FailoverStatus:        domainFailoverStatusValue(d, failoverReady),
+		FailoverFailures:      d.FailoverState.ActiveFailureCount,
+		FailoverThreshold:     failoverPolicyWithDefaultsForDomain(d).FailThreshold,
+		FailoverCooldownUntil: d.FailoverState.CooldownUntil,
 		FailoverReadyNodes:    failoverReady,
 		FailoverBlockedReason: domainFailoverBlockedReason(d, failoverReady),
 		AssignedNodeStatus:    nodeStates,
@@ -1114,6 +1130,13 @@ func domainFailoverStatusValue(d dbDomain, ready int) string {
 	}
 	if !d.FailoverEnabled {
 		return "failover disabled"
+	}
+	policy := failoverPolicyWithDefaultsForDomain(d)
+	if policy.ManualLock {
+		return "failover locked"
+	}
+	if d.FailoverState.CooldownUntil != nil && d.FailoverState.CooldownUntil.After(time.Now().UTC()) {
+		return "failover cooling down"
 	}
 	if len(d.NodeIDs) < 2 {
 		return "failover needs nodes"
@@ -1225,7 +1248,16 @@ func (s *adminServer) handleDomainSyncDNS(w http.ResponseWriter, r *http.Request
 		err = updateErr
 	}
 	if err == nil && nodeID != d.ActiveNodeID {
-		if updateErr := s.store.UpdateDomainActiveNode(context.Background(), domain, nodeID); updateErr != nil {
+		now := time.Now().UTC()
+		state := d.FailoverState
+		state.ActiveFailureCount = 0
+		state.LastError = ""
+		state.LastReason = "manual dns sync"
+		state.LastFromNodeID = d.ActiveNodeID
+		state.LastToNodeID = nodeID
+		state.LastSwitchAt = &now
+		state.CooldownUntil = nil
+		if updateErr := s.store.SwitchDomainActiveNode(context.Background(), domain, nodeID, state); updateErr != nil {
 			err = updateErr
 		}
 	}
@@ -1233,6 +1265,19 @@ func (s *adminServer) handleDomainSyncDNS(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	s.recordEvent(dbEvent{
+		Type:    "domain.dns_synced",
+		Message: "domain DNS synced",
+		Domain:  domain,
+		NodeID:  nodeID,
+		Metadata: map[string]any{
+			"from_node_id": d.ActiveNodeID,
+			"to_node_id":   nodeID,
+			"record_name":  cfConfig.RecordName,
+			"record_type":  cfConfig.RecordType,
+			"target":       node.PublicIP,
+		},
+	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":      "ok",
 		"cloudflare":  cfConfig,
@@ -1614,6 +1659,297 @@ func (s *adminServer) handleNodeTokenAction(w http.ResponseWriter, r *http.Reque
 	}
 }
 
+func (s *adminServer) handleServers(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		servers, err := s.store.Servers(ctx)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"servers": servers,
+			"now":     time.Now().UTC(),
+		})
+	case http.MethodPost:
+		var payload serverUpsertPayload
+		if err := decodeJSON(r, &payload); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		server, secrets := serverFromPayload(payload)
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		if err := s.store.UpsertServer(ctx, server, secrets); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.recordEvent(dbEvent{
+			Type:     "server.saved",
+			Message:  "server saved",
+			ServerID: server.ServerID,
+			NodeID:   firstNonEmpty(server.NodeID, server.ServerID),
+			Metadata: map[string]any{"host": server.Host, "ssh_user": server.SSHUser},
+		})
+		saved, err := s.store.GetServer(ctx, server.ServerID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, redactServerSecrets(*saved))
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *adminServer) handleServerAction(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w, r) {
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/servers/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("server id required"))
+		return
+	}
+	serverID, err := url.PathUnescape(parts[0])
+	if err != nil || strings.TrimSpace(serverID) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid server id"))
+		return
+	}
+	serverID = strings.TrimSpace(serverID)
+	action := ""
+	if len(parts) > 1 {
+		action = parts[1]
+	}
+	switch {
+	case action == "" && r.Method == http.MethodGet:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		server, err := s.store.GetServer(ctx, serverID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, redactServerSecrets(*server))
+	case action == "" && r.Method == http.MethodPut:
+		var payload serverUpsertPayload
+		if err := decodeJSON(r, &payload); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		payload.ServerID = serverID
+		server, secrets := serverFromPayload(payload)
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		if err := s.store.UpsertServer(ctx, server, secrets); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.recordEvent(dbEvent{
+			Type:     "server.saved",
+			Message:  "server saved",
+			ServerID: serverID,
+			NodeID:   firstNonEmpty(server.NodeID, server.ServerID),
+			Metadata: map[string]any{"host": server.Host, "ssh_user": server.SSHUser},
+		})
+		saved, err := s.store.GetServer(ctx, serverID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, redactServerSecrets(*saved))
+	case action == "" && r.Method == http.MethodDelete:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		if err := s.store.DeleteServer(ctx, serverID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.recordEvent(dbEvent{
+			Type:     "server.deleted",
+			Severity: "warn",
+			Message:  "server deleted",
+			ServerID: serverID,
+		})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	case action == "test-ssh" && r.Method == http.MethodPost:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		job, err := s.createSSHTestJob(ctx, serverID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.recordEvent(dbEvent{
+			Type:     "server.ssh_test_queued",
+			Message:  "ssh test queued",
+			ServerID: serverID,
+			JobID:    job.JobID,
+		})
+		writeJSON(w, http.StatusAccepted, job)
+	case action == "deploy-node" && r.Method == http.MethodPost:
+		var payload deployNodePayload
+		if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		job, err := s.createDeployNodeJob(ctx, serverID, payload)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.recordEvent(dbEvent{
+			Type:     "server.deploy_queued",
+			Message:  "node deploy queued",
+			ServerID: serverID,
+			NodeID:   job.NodeID,
+			JobID:    job.JobID,
+			Metadata: map[string]any{"image": job.Request.Image, "deploy_dir": job.Request.DeployDir},
+		})
+		writeJSON(w, http.StatusAccepted, job)
+	case action == "restart-node" && r.Method == http.MethodPost:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		job, err := s.createNodeOperationJob(ctx, serverID, jobTypeRestartNode, nodeOperationPayload{})
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.recordEvent(dbEvent{
+			Type:     "server.restart_queued",
+			Message:  "node restart queued",
+			ServerID: serverID,
+			NodeID:   job.NodeID,
+			JobID:    job.JobID,
+		})
+		writeJSON(w, http.StatusAccepted, job)
+	case action == "upgrade-node" && r.Method == http.MethodPost:
+		var payload nodeOperationPayload
+		if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		job, err := s.createNodeOperationJob(ctx, serverID, jobTypeUpgradeNode, payload)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.recordEvent(dbEvent{
+			Type:     "server.upgrade_queued",
+			Message:  "node upgrade queued",
+			ServerID: serverID,
+			NodeID:   job.NodeID,
+			JobID:    job.JobID,
+			Metadata: map[string]any{"image": job.Request.Image},
+		})
+		writeJSON(w, http.StatusAccepted, job)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *adminServer) handleJobs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireToken(w, r) {
+		return
+	}
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	jobs, err := s.store.Jobs(ctx, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"jobs": jobs,
+		"now":  time.Now().UTC(),
+	})
+}
+
+func (s *adminServer) handleJobAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireToken(w, r) {
+		return
+	}
+	jobID, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/jobs/"))
+	if err != nil || strings.TrimSpace(jobID) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid job id"))
+		return
+	}
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	job, err := s.store.GetJob(ctx, strings.TrimSpace(jobID))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *adminServer) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireToken(w, r) {
+		return
+	}
+	limit := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	events, err := s.store.Events(ctx, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"events": events,
+		"now":    time.Now().UTC(),
+	})
+}
+
+func (s *adminServer) recordEvent(event dbEvent) {
+	if s == nil || s.store == nil {
+		return
+	}
+	if strings.TrimSpace(event.EventID) == "" {
+		event.EventID = newID("evt")
+	}
+	if strings.TrimSpace(event.Actor) == "" {
+		event.Actor = "admin"
+	}
+	if err := s.store.SaveEvent(context.Background(), event); err != nil {
+		log.Printf("[admin] save event %s failed: %v", event.Type, err)
+	}
+}
+
 func (s *adminServer) handleRule(w http.ResponseWriter, r *http.Request) {
 	if !s.requireToken(w, r) {
 		return
@@ -1765,7 +2101,13 @@ func (s *adminServer) reconcileDomainFailover(ctx context.Context) error {
 		if !d.Enabled || !d.FailoverEnabled || len(d.NodeIDs) == 0 {
 			continue
 		}
-		next, ok := failoverTarget(d, nodeMap)
+		decision := evaluateDomainFailover(d, nodeMap, time.Now().UTC())
+		if decision.StateChanged {
+			if err := s.store.UpdateDomainFailoverState(context.Background(), d.Domain, decision.State); err != nil {
+				log.Printf("[admin] save failover state for %s failed: %v", d.Domain, err)
+			}
+		}
+		next, ok := decision.Target, decision.ShouldSwitch
 		if !ok {
 			continue
 		}
@@ -1775,12 +2117,35 @@ func (s *adminServer) reconcileDomainFailover(ctx context.Context) error {
 			err = updateErr
 		}
 		if err == nil {
-			err = s.store.UpdateDomainActiveNode(context.Background(), d.Domain, next.NodeID)
+			err = s.store.SwitchDomainActiveNode(context.Background(), d.Domain, next.NodeID, decision.State)
 		}
 		if err != nil {
 			log.Printf("[admin] failover %s to %s failed: %v", d.Domain, next.NodeID, err)
+			s.recordEvent(dbEvent{
+				Type:     "domain.failover_failed",
+				Severity: "error",
+				Message:  "domain failover failed",
+				Domain:   d.Domain,
+				NodeID:   next.NodeID,
+				Metadata: map[string]any{"error": err.Error(), "from_node_id": decision.State.LastFromNodeID, "to_node_id": next.NodeID},
+			})
 			continue
 		}
+		s.recordEvent(dbEvent{
+			Type:    "domain.failover_switched",
+			Message: "domain failover switched active node",
+			Domain:  d.Domain,
+			NodeID:  next.NodeID,
+			Metadata: map[string]any{
+				"from_node_id":   decision.State.LastFromNodeID,
+				"to_node_id":     next.NodeID,
+				"reason":         decision.Reason,
+				"cooldown_until": decision.State.CooldownUntil,
+				"record_name":    cfConfig.RecordName,
+				"record_type":    cfConfig.RecordType,
+				"target":         next.PublicIP,
+			},
+		})
 		log.Printf("[admin] failed over %s to node %s", d.Domain, next.NodeID)
 	}
 	return nil
@@ -1856,10 +2221,146 @@ func failoverTarget(d dbDomain, nodes map[string]NodeHeartbeat) (NodeHeartbeat, 
 	return next, true
 }
 
+type failoverDecision struct {
+	ShouldSwitch bool
+	Target       NodeHeartbeat
+	State        domainFailoverState
+	StateChanged bool
+	Reason       string
+}
+
+func evaluateDomainFailover(d dbDomain, nodes map[string]NodeHeartbeat, now time.Time) failoverDecision {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	state := d.FailoverState
+	state.LastCheckAt = &now
+	policy := failoverPolicyWithDefaultsForDomain(d)
+	decision := failoverDecision{State: state}
+	if !d.Enabled || !d.FailoverEnabled || len(d.NodeIDs) == 0 {
+		return decision
+	}
+	active := nodes[d.ActiveNodeID]
+	if nodeHealthyAt(active, now) {
+		if state.ActiveFailureCount != 0 || strings.TrimSpace(state.LastError) != "" {
+			state.ActiveFailureCount = 0
+			state.LastError = ""
+			decision.State = state
+			decision.StateChanged = true
+		}
+		if policy.AutoFailback && !policy.ManualLock && strings.TrimSpace(policy.PrimaryNodeID) != "" && d.ActiveNodeID != policy.PrimaryNodeID {
+			if state.CooldownUntil != nil && state.CooldownUntil.After(now) {
+				state.LastError = "cooldown active"
+				decision.State = state
+				decision.Reason = state.LastError
+				decision.StateChanged = true
+				return decision
+			}
+			primary := nodes[policy.PrimaryNodeID]
+			if nodeHealthyAt(primary, now) && nodeReadyForDomainAt(primary, d, now) {
+				cooldownUntil := now.Add(time.Duration(policy.CooldownSeconds) * time.Second)
+				state.LastFromNodeID = d.ActiveNodeID
+				state.LastToNodeID = primary.NodeID
+				state.LastSwitchAt = &now
+				state.CooldownUntil = &cooldownUntil
+				state.ActiveFailureCount = 0
+				state.LastError = ""
+				state.LastReason = "primary node recovered"
+				decision.ShouldSwitch = true
+				decision.Target = primary
+				decision.State = state
+				decision.StateChanged = true
+				decision.Reason = state.LastReason
+			}
+		}
+		return decision
+	}
+	state.ActiveFailureCount++
+	state.LastFailureAt = &now
+	state.LastReason = activeFailureReason(d.ActiveNodeID, active)
+	decision.StateChanged = true
+
+	if policy.ManualLock {
+		state.LastError = "manual lock enabled"
+		decision.State = state
+		decision.Reason = state.LastError
+		return decision
+	}
+	if state.CooldownUntil != nil && state.CooldownUntil.After(now) {
+		state.LastError = "cooldown active"
+		decision.State = state
+		decision.Reason = state.LastError
+		return decision
+	}
+	if state.ActiveFailureCount < policy.FailThreshold {
+		state.LastError = fmt.Sprintf("waiting for failure threshold %d/%d", state.ActiveFailureCount, policy.FailThreshold)
+		decision.State = state
+		decision.Reason = state.LastError
+		return decision
+	}
+	next, ok := firstHealthyAssignedNodeAt(d, nodes, now)
+	if !ok || next.NodeID == d.ActiveNodeID {
+		state.LastError = "no healthy failover candidate"
+		decision.State = state
+		decision.Reason = state.LastError
+		return decision
+	}
+	cooldownUntil := now.Add(time.Duration(policy.CooldownSeconds) * time.Second)
+	state.LastFromNodeID = d.ActiveNodeID
+	state.LastToNodeID = next.NodeID
+	state.LastSwitchAt = &now
+	state.CooldownUntil = &cooldownUntil
+	state.ActiveFailureCount = 0
+	state.LastError = ""
+	state.LastReason = "active node unhealthy"
+	decision.ShouldSwitch = true
+	decision.Target = next
+	decision.State = state
+	decision.Reason = state.LastReason
+	return decision
+}
+
+func failoverPolicyWithDefaultsForDomain(d dbDomain) domainFailoverPolicy {
+	policy := failoverPolicyWithDefaults(d.FailoverPolicy)
+	policy.PrimaryNodeID = strings.TrimSpace(policy.PrimaryNodeID)
+	if policy.PrimaryNodeID == "" && len(d.NodeIDs) > 0 {
+		policy.PrimaryNodeID = d.NodeIDs[0]
+	}
+	return policy
+}
+
+func failoverPolicyWithDefaults(policy domainFailoverPolicy) domainFailoverPolicy {
+	if policy.FailThreshold <= 0 {
+		policy.FailThreshold = 3
+	}
+	if policy.CooldownSeconds <= 0 {
+		policy.CooldownSeconds = 300
+	}
+	policy.PrimaryNodeID = strings.TrimSpace(policy.PrimaryNodeID)
+	return policy
+}
+
+func activeFailureReason(activeNodeID string, active NodeHeartbeat) string {
+	if strings.TrimSpace(activeNodeID) == "" {
+		return "active node not selected"
+	}
+	if strings.TrimSpace(active.NodeID) == "" {
+		return "active node heartbeat missing"
+	}
+	if strings.TrimSpace(active.Error) != "" {
+		return "active node error: " + active.Error
+	}
+	return "active node heartbeat stale"
+}
+
 func firstHealthyAssignedNode(d dbDomain, nodes map[string]NodeHeartbeat) (NodeHeartbeat, bool) {
+	return firstHealthyAssignedNodeAt(d, nodes, time.Now().UTC())
+}
+
+func firstHealthyAssignedNodeAt(d dbDomain, nodes map[string]NodeHeartbeat, now time.Time) (NodeHeartbeat, bool) {
 	for _, nodeID := range d.NodeIDs {
 		node := nodes[nodeID]
-		if isNodeHealthy(node) && nodeReadyForDomain(node, d) {
+		if nodeHealthyAt(node, now) && nodeReadyForDomainAt(node, d, now) {
 			return node, true
 		}
 	}
@@ -2653,9 +3154,10 @@ const adminHTML = `<!doctype html>
         <button id="tabBtnOverview" class="active" onclick="showTab('overview')">Overview</button>
         <button id="tabBtnUsers" onclick="showTab('users')">Users</button>
         <button id="tabBtnRules" onclick="showTab('rules')">Rules</button>
-        <button id="tabBtnChecks" onclick="showTab('checks')">Connectivity</button>
-        <button id="tabBtnNodes" onclick="showTab('nodes')">Nodes</button>
-        <button id="tabBtnCerts" onclick="showTab('certs')">Domains</button>
+	        <button id="tabBtnChecks" onclick="showTab('checks')">Connectivity</button>
+	        <button id="tabBtnNodes" onclick="showTab('nodes')">Nodes</button>
+	        <button id="tabBtnServers" onclick="showTab('servers')">Servers</button>
+	        <button id="tabBtnCerts" onclick="showTab('certs')">Domains</button>
       </nav>
       <div class="side-card">
         <label for="adminToken">Admin token</label>
@@ -2789,16 +3291,73 @@ const adminHTML = `<!doctype html>
           </div>
         </section>
 
-        <section id="tabNodes" class="tabs">
-          <div class="panel">
-            <div class="panel-head"><div class="panel-title">Nodes</div><span id="nodesCount" class="pill">0</span></div>
-            <div class="panel-body">
-              <div id="nodesTable" class="table-wrap">No nodes have reported yet.</div>
-            </div>
-          </div>
-        </section>
+	        <section id="tabNodes" class="tabs">
+	          <div class="panel">
+	            <div class="panel-head"><div class="panel-title">Nodes</div><span id="nodesCount" class="pill">0</span></div>
+	            <div class="panel-body">
+	              <div id="nodesTable" class="table-wrap">No nodes have reported yet.</div>
+	            </div>
+	          </div>
+	        </section>
 
-        <section id="tabCerts" class="tabs">
+	        <section id="tabServers" class="tabs">
+	          <div class="grid">
+	            <div class="panel">
+	              <div class="panel-head"><div class="panel-title">Servers</div><span id="serversCount" class="pill">0</span></div>
+	              <div class="search-row"><input id="serverSearch" placeholder="Search servers, hosts, nodes" oninput="renderServers()"></div>
+	              <div id="serversList" class="list"></div>
+	            </div>
+	            <div class="panel">
+	              <div class="panel-head"><div class="panel-title">Server Provisioning</div><span id="selectedServerStatus" class="pill">new</span></div>
+	              <div class="panel-body">
+	                <div class="form-grid">
+	                  <div><label>Server ID</label><input id="serverID" placeholder="zgo"></div>
+	                  <div><label>Node ID</label><input id="serverNodeID" placeholder="zgo"></div>
+	                  <div><label>Name</label><input id="serverName" placeholder="friendly name"></div>
+	                  <div><label>Host</label><input id="serverHost" placeholder="203.0.113.10"></div>
+	                  <div><label>SSH port</label><input id="serverSSHPort" type="number" min="1" value="22"></div>
+	                  <div><label>SSH user</label><input id="serverSSHUser" value="root"></div>
+	                  <div><label>Auth type</label><select id="serverAuthType"><option value="auto">Auto</option><option value="password">Password</option><option value="private_key">Private key</option></select></div>
+	                  <div><label>Deploy dir</label><input id="serverDeployDir" value="/root/data/docker_data/glider"></div>
+	                  <div class="wide"><label>Image</label><input id="serverImage" value="ghcr.io/ferryboatseranade/glider:latest"></div>
+	                  <div><label>Proxy ports</label><input id="serverProxyPorts" value="443:443,8443:8443"></div>
+	                  <div><label>Traffic iface</label><input id="serverTrafficIface" value="eth0"></div>
+	                  <div><label>Password</label><input id="serverPassword" type="password" autocomplete="new-password" placeholder="leave blank to keep"></div>
+	                  <div><label>Key passphrase</label><input id="serverPassphrase" type="password" autocomplete="new-password" placeholder="optional"></div>
+	                  <div class="wide"><label>Private key</label><textarea id="serverPrivateKey" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></div>
+	                  <div><label>Central URL</label><input id="deployCentralURL" placeholder="http://15.204.95.51:8444"></div>
+	                  <div><label>Node token</label><input id="deployNodeToken" type="password" autocomplete="new-password" placeholder="at least 16 characters"></div>
+	                  <div><label>Sync interval</label><input id="deploySyncInterval" value="30s"></div>
+	                  <div><label>Upgrade image</label><input id="upgradeImage" placeholder="ghcr.io/ferryboatseranade/glider:v..."></div>
+	                  <div class="checkbox-row"><input id="deployInstallDocker" type="checkbox" checked><label for="deployInstallDocker">Install Docker if missing</label></div>
+	                </div>
+	                <div class="actions">
+	                  <button class="primary" onclick="saveServer()">Save Server</button>
+	                  <button onclick="testServerSSH()">Test SSH</button>
+	                  <button onclick="deployServerNode()">Deploy Node</button>
+	                  <button onclick="restartServerNode()">Restart Node</button>
+	                  <button onclick="upgradeServerNode()">Upgrade Node</button>
+	                  <button class="danger" onclick="deleteServer()">Delete</button>
+	                </div>
+	                <div id="serverResult" class="result">Save a server, test SSH, then deploy node mode.</div>
+	              </div>
+	            </div>
+	          </div>
+	          <div class="panel">
+	            <div class="panel-head"><div class="panel-title">Provisioning Jobs</div><span id="jobsCount" class="pill">0</span></div>
+	            <div class="panel-body">
+	              <div id="jobsTable" class="table-wrap">No jobs yet.</div>
+	            </div>
+	          </div>
+	          <div class="panel">
+	            <div class="panel-head"><div class="panel-title">Recent Events</div><span id="eventsCount" class="pill">0</span></div>
+	            <div class="panel-body">
+	              <div id="eventsTable" class="table-wrap">No events yet.</div>
+	            </div>
+	          </div>
+	        </section>
+
+	        <section id="tabCerts" class="tabs">
           <div class="panel">
             <div class="panel-head"><div class="panel-title">Cloudflare Settings</div><span id="cfTokenStatus" class="pill">not configured</span></div>
             <div class="panel-body">
@@ -2836,23 +3395,28 @@ const adminHTML = `<!doctype html>
                   <div><label>Record type</label><select id="domainRecordType"><option value="">Auto</option><option value="A">A</option><option value="AAAA">AAAA</option></select></div>
                   <div><label>TTL</label><input id="domainTTL" type="number" min="1" value="1"></div>
                   <div><label>Renew before days</label><input id="domainRenewBefore" type="number" min="1" value="30"></div>
+                  <div><label>Fail threshold</label><input id="domainFailThreshold" type="number" min="1" value="3"></div>
+                  <div><label>Cooldown seconds</label><input id="domainCooldownSeconds" type="number" min="1" value="300"></div>
+                  <div><label>Primary node</label><select id="domainPrimaryNode"></select></div>
                   <div class="checkbox-row"><input id="domainEnabled" type="checkbox" checked><label for="domainEnabled">Enabled</label></div>
                   <div class="checkbox-row"><input id="domainProxied" type="checkbox"><label for="domainProxied">Cloudflare proxied</label></div>
-	                  <div class="checkbox-row"><input id="domainFailover" type="checkbox"><label for="domainFailover">Heartbeat failover</label></div>
-	                  <div><label>ACME email</label><input id="domainACMEEmail" placeholder="admin@example.com"></div>
-	                  <div><label>ACME directory</label><input id="domainACMEDirectory" placeholder="Let's Encrypt production"></div>
-	                  <div class="wide"><label>Import fullchain PEM</label><textarea id="domainImportFullchain" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
-	                  <div class="wide"><label>Import private key PEM</label><textarea id="domainImportKey" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
-	                </div>
-	                <div class="actions">
-	                  <button class="primary" onclick="saveDomain()">Save Domain</button>
-	                  <button onclick="previewDomainDNS()">Preview DNS</button>
-	                  <button onclick="syncDomainDNS()">Sync DNS</button>
-	                  <button onclick="previewDomainCert()">Preview Cert</button>
-	                  <button onclick="issueDomainCert()">Issue Cert</button>
-	                  <button onclick="importDomainCert()">Import Cert</button>
-	                  <button class="danger" onclick="deleteDomain()">Delete</button>
-	                </div>
+                  <div class="checkbox-row"><input id="domainFailover" type="checkbox"><label for="domainFailover">Heartbeat failover</label></div>
+                  <div class="checkbox-row"><input id="domainManualLock" type="checkbox"><label for="domainManualLock">Manual lock active node</label></div>
+                  <div class="checkbox-row"><input id="domainAutoFailback" type="checkbox"><label for="domainAutoFailback">Auto failback</label></div>
+                  <div><label>ACME email</label><input id="domainACMEEmail" placeholder="admin@example.com"></div>
+                  <div><label>ACME directory</label><input id="domainACMEDirectory" placeholder="Let's Encrypt production"></div>
+                  <div class="wide"><label>Import fullchain PEM</label><textarea id="domainImportFullchain" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+                  <div class="wide"><label>Import private key PEM</label><textarea id="domainImportKey" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
+                </div>
+                <div class="actions">
+                  <button class="primary" onclick="saveDomain()">Save Domain</button>
+                  <button onclick="previewDomainDNS()">Preview DNS</button>
+                  <button onclick="syncDomainDNS()">Sync DNS</button>
+                  <button onclick="previewDomainCert()">Preview Cert</button>
+                  <button onclick="issueDomainCert()">Issue Cert</button>
+                  <button onclick="importDomainCert()">Import Cert</button>
+                  <button class="danger" onclick="deleteDomain()">Delete</button>
+                </div>
                 <div id="domainResult" class="result">Select or save a domain. Cloudflare and ACME credentials stay on the admin server.</div>
               </div>
             </div>
@@ -2868,6 +3432,9 @@ let usersCache = [];
 let rulesCache = [];
 let nodesCache = [];
 let domainsCache = [];
+let serversCache = [];
+let jobsCache = [];
+let eventsCache = [];
 let configStatus = {};
 let cloudflareSettings = null;
 let rulesHealthCache = null;
@@ -2880,13 +3447,14 @@ const titles = {
   rules: ['Rules', 'Edit forwarding rules stored in MongoDB.'],
   checks: ['Connectivity', 'Probe route exit IPs and rule health.'],
   nodes: ['Nodes', 'Heartbeat, config version, traffic, and node errors.'],
+  servers: ['Servers', 'SSH inventory, remote provisioning, and node deployment jobs.'],
   certs: ['Domains', 'Cloudflare DNS, node assignment, and certificate bundles.']
 };
 
 function $(id) { return document.getElementById(id); }
 
 function showTab(name) {
-  ['overview','users','rules','checks','nodes','certs'].forEach(tab => {
+  ['overview','users','rules','checks','nodes','servers','certs'].forEach(tab => {
     $('tab' + cap(tab)).classList.toggle('active', tab === name);
     $('tabBtn' + cap(tab)).classList.toggle('active', tab === name);
   });
@@ -2895,6 +3463,11 @@ function showTab(name) {
   if (name === 'nodes') {
     loadConfigStatus();
     loadNodes();
+  }
+  if (name === 'servers') {
+    loadServers();
+    loadJobs();
+    loadEvents();
   }
   if (name === 'certs') {
     loadCloudflareSettings();
@@ -3037,7 +3610,7 @@ function clearToken() {
 
 async function refreshAll(opts) {
   const options = opts || {};
-  await Promise.all([loadConfigStatus(options), loadRules(options), loadUsers(options), loadNodes(options), loadDomains(options), loadCloudflareSettings(options), loadLatestRulesHealth()]);
+  await Promise.all([loadConfigStatus(options), loadRules(options), loadUsers(options), loadNodes(options), loadServers(options), loadJobs(options), loadEvents(options), loadDomains(options), loadCloudflareSettings(options), loadLatestRulesHealth()]);
   renderStats();
 }
 
@@ -3098,6 +3671,39 @@ async function loadDomains(options) {
   }
 }
 
+async function loadServers(options) {
+  try {
+    const data = await fetchJSON('/api/servers');
+    serversCache = data.servers || [];
+    renderServers();
+    maybeClearStatus(options);
+  } catch (e) {
+    setStatus(e.message, 'err');
+  }
+}
+
+async function loadJobs(options) {
+  try {
+    const data = await fetchJSON('/api/jobs?limit=50');
+    jobsCache = data.jobs || [];
+    renderJobs();
+    maybeClearStatus(options);
+  } catch (e) {
+    setStatus(e.message, 'err');
+  }
+}
+
+async function loadEvents(options) {
+  try {
+    const data = await fetchJSON('/api/events?limit=100');
+    eventsCache = data.events || [];
+    renderEvents();
+    maybeClearStatus(options);
+  } catch (e) {
+    setStatus(e.message, 'err');
+  }
+}
+
 async function loadCloudflareSettings(options) {
   try {
     cloudflareSettings = await fetchJSON('/api/settings/cloudflare');
@@ -3145,6 +3751,9 @@ function renderStats() {
   $('usersCount').textContent = visibleUsers().length + '/' + usersCache.length;
   $('rulesCount').textContent = visibleRules().length + '/' + rulesCache.length;
   $('nodesCount').textContent = nodesCache.length;
+  if ($('serversCount')) $('serversCount').textContent = visibleServers().length + '/' + serversCache.length;
+  if ($('jobsCount')) $('jobsCount').textContent = jobsCache.length;
+  if ($('eventsCount')) $('eventsCount').textContent = eventsCache.length;
   if ($('domainsCount')) $('domainsCount').textContent = visibleDomains().length + '/' + domainsCache.length;
 }
 
@@ -3164,6 +3773,12 @@ function visibleDomains() {
   const q = (($('domainSearch') && $('domainSearch').value) || '').toLowerCase().trim();
   if (!q) return domainsCache;
   return domainsCache.filter(d => [d.domain, d.active_node_id, (d.node_ids || []).join(' '), domainStatus(d), dnsStatus(d), certStatus(d), certRenewStatus(d), domainCertSyncStatus(d), domainFailoverStatus(d)].join(' ').toLowerCase().includes(q));
+}
+
+function visibleServers() {
+  const q = (($('serverSearch') && $('serverSearch').value) || '').toLowerCase().trim();
+  if (!q) return serversCache;
+  return serversCache.filter(s => [s.server_id, s.name, s.node_id, s.host, s.status, s.image].join(' ').toLowerCase().includes(q));
 }
 
 function renderRules() {
@@ -3245,6 +3860,278 @@ function renderNodes(nowValue) {
   renderStats();
 }
 
+function renderServers() {
+  const list = $('serversList');
+  if (!list) return;
+  const visible = visibleServers();
+  list.innerHTML = '';
+  if (!visible.length) list.innerHTML = '<div class="empty">No matching servers.</div>';
+  visible.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'item';
+    const status = s.status || 'saved';
+    item.innerHTML = '<div class="item-main"><div class="item-title">' + escapeHTML(s.server_id) + '</div><div class="item-sub">' + escapeHTML(s.host || '-') + ' · node ' + escapeHTML(s.node_id || '-') + ' · ' + escapeHTML(status) + '</div></div><div class="item-actions">' + statusPill(serverStatusTone(status)) + '<button>Deploy</button></div>';
+    item.querySelector('.item-main').onclick = () => selectServer(s.server_id);
+    item.querySelector('button').onclick = () => {
+      selectServerIntoForm(s);
+      deployServerNode();
+    };
+    list.appendChild(item);
+  });
+  renderStats();
+}
+
+function serverStatusTone(status) {
+  status = String(status || '').toLowerCase();
+  if (status === 'ssh_ok' || status === 'deployed') return 'ok';
+  if (status === 'unreachable' || status === 'error') return 'error';
+  return status || 'saved';
+}
+
+function renderJobs() {
+  const wrap = $('jobsTable');
+  if (!wrap) return;
+  if (!jobsCache.length) {
+    wrap.innerHTML = '<div class="empty">No jobs yet.</div>';
+    renderStats();
+    return;
+  }
+  wrap.innerHTML = '<table><thead><tr><th>Job</th><th>Status</th><th>Target</th><th>Created</th><th>Finished</th><th>Error</th><th>Logs</th></tr></thead><tbody>' + jobsCache.map(job => {
+    const logs = (job.logs || []).slice(-4).map(l => '<div class="compact">' + escapeHTML(formatDate(l.at)) + ' ' + escapeHTML(l.message) + '</div>').join('');
+    return '<tr>' +
+      '<td><strong>' + escapeHTML(job.type || '-') + '</strong><div class="compact mono">' + escapeHTML(job.job_id || '-') + '</div></td>' +
+      '<td>' + statusPill(job.status || 'unknown') + '</td>' +
+      '<td>server ' + escapeHTML(job.server_id || '-') + '<div class="compact">node ' + escapeHTML(job.node_id || '-') + '</div></td>' +
+      '<td>' + escapeHTML(formatDate(job.created_at)) + '</td>' +
+      '<td>' + escapeHTML(formatDate(job.finished_at)) + '</td>' +
+      '<td>' + escapeHTML(job.error || '-') + '</td>' +
+      '<td>' + (logs || '<span class="compact">-</span>') + '</td>' +
+      '</tr>';
+  }).join('') + '</tbody></table>';
+  renderStats();
+}
+
+function renderEvents() {
+  const wrap = $('eventsTable');
+  if (!wrap) return;
+  if (!eventsCache.length) {
+    wrap.innerHTML = '<div class="empty">No events yet.</div>';
+    renderStats();
+    return;
+  }
+  wrap.innerHTML = '<table><thead><tr><th>Time</th><th>Event</th><th>Target</th><th>Message</th><th>Metadata</th></tr></thead><tbody>' + eventsCache.map(event => {
+    return '<tr>' +
+      '<td>' + escapeHTML(formatDate(event.created_at)) + '</td>' +
+      '<td>' + statusPill(event.severity || 'info') + '<div class="compact mono">' + escapeHTML(event.type || '-') + '</div></td>' +
+      '<td>server ' + escapeHTML(event.server_id || '-') + '<div class="compact">node ' + escapeHTML(event.node_id || '-') + '</div><div class="compact">domain ' + escapeHTML(event.domain || '-') + '</div></td>' +
+      '<td>' + escapeHTML(event.message || '-') + '<div class="compact mono">' + escapeHTML(event.job_id || '') + '</div></td>' +
+      '<td class="compact mono">' + escapeHTML(eventMetadata(event.metadata)) + '</td>' +
+      '</tr>';
+  }).join('') + '</tbody></table>';
+  renderStats();
+}
+
+function eventMetadata(metadata) {
+  if (!metadata) return '-';
+  try {
+    return JSON.stringify(metadata);
+  } catch (e) {
+    return String(metadata);
+  }
+}
+
+async function selectServer(serverID) {
+  const s = await fetchJSON('/api/servers/' + encodeURIComponent(serverID));
+  selectServerIntoForm(s);
+  showTab('servers');
+}
+
+function selectServerIntoForm(s) {
+  s = s || {};
+  $('serverID').value = s.server_id || '';
+  $('serverNodeID').value = s.node_id || s.server_id || '';
+  $('serverName').value = s.name || '';
+  $('serverHost').value = s.host || '';
+  $('serverSSHPort').value = s.ssh_port || 22;
+  $('serverSSHUser').value = s.ssh_user || 'root';
+  $('serverAuthType').value = s.auth_type || 'auto';
+  $('serverDeployDir').value = s.deploy_dir || '/root/data/docker_data/glider';
+  $('serverImage').value = s.image || 'ghcr.io/ferryboatseranade/glider:latest';
+  $('upgradeImage').value = s.image || '';
+  $('serverProxyPorts').value = (s.proxy_ports || ['443:443','8443:8443']).join(',');
+  $('serverTrafficIface').value = s.traffic_iface || 'eth0';
+  $('serverPassword').value = '';
+  $('serverPrivateKey').value = '';
+  $('serverPassphrase').value = '';
+  $('selectedServerStatus').textContent = s.status || 'selected';
+  renderServerResult(s);
+}
+
+function renderServerResult(s) {
+  s = s || {};
+  const lines = [
+    'server: ' + escapeHTML(s.server_id || '-'),
+    'host: ' + escapeHTML(s.host || '-') + ':' + escapeHTML(s.ssh_port || 22),
+    'ssh user: ' + escapeHTML(s.ssh_user || 'root'),
+    'node id: ' + escapeHTML(s.node_id || '-'),
+    'deploy dir: ' + escapeHTML(s.deploy_dir || '-'),
+    'image: ' + escapeHTML(s.image || '-'),
+    'credentials: password ' + (s.has_password ? 'yes' : 'no') + ', private key ' + (s.has_private_key ? 'yes' : 'no'),
+    'status: ' + escapeHTML(s.status || '-'),
+    'last ssh test: ' + escapeHTML(formatDate(s.last_test_at)),
+    'last deploy: ' + escapeHTML(formatDate(s.last_deploy_at)),
+    'last deploy job: ' + escapeHTML(s.last_deploy_job || '-')
+  ];
+  if (s.last_error) lines.push('error: ' + escapeHTML(s.last_error));
+  $('serverResult').innerHTML = lines.join('\n');
+}
+
+function serverPayload() {
+  const payload = {
+    server_id: $('serverID').value.trim(),
+    node_id: $('serverNodeID').value.trim(),
+    name: $('serverName').value.trim(),
+    host: $('serverHost').value.trim(),
+    ssh_port: Number($('serverSSHPort').value || 22),
+    ssh_user: $('serverSSHUser').value.trim() || 'root',
+    auth_type: $('serverAuthType').value || 'auto',
+    deploy_dir: $('serverDeployDir').value.trim() || '/root/data/docker_data/glider',
+    image: $('serverImage').value.trim() || 'ghcr.io/ferryboatseranade/glider:latest',
+    proxy_ports: splitCSV($('serverProxyPorts').value),
+    traffic_iface: $('serverTrafficIface').value.trim() || 'eth0'
+  };
+  const password = $('serverPassword').value;
+  const privateKey = $('serverPrivateKey').value;
+  const passphrase = $('serverPassphrase').value;
+  if (password) payload.password = password;
+  if (privateKey) payload.private_key = privateKey;
+  if (passphrase) payload.passphrase = passphrase;
+  return payload;
+}
+
+async function saveServer() {
+  const payload = serverPayload();
+  const saved = await fetchJSON('/api/servers', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  $('selectedServerStatus').textContent = 'saved';
+  selectServerIntoForm(saved);
+  await loadServers();
+}
+
+async function deleteServer() {
+  const serverID = $('serverID').value.trim();
+  if (!serverID) return;
+  if (!confirm('Delete server ' + serverID + '?')) return;
+  await fetchJSON('/api/servers/' + encodeURIComponent(serverID), { method: 'DELETE' });
+  clearServerForm();
+  await loadServers();
+}
+
+function clearServerForm() {
+  ['serverID','serverNodeID','serverName','serverHost','serverPassword','serverPrivateKey','serverPassphrase','deployCentralURL','deployNodeToken','upgradeImage'].forEach(id => { $(id).value = ''; });
+  $('serverSSHPort').value = 22;
+  $('serverSSHUser').value = 'root';
+  $('serverAuthType').value = 'auto';
+  $('serverDeployDir').value = '/root/data/docker_data/glider';
+  $('serverImage').value = 'ghcr.io/ferryboatseranade/glider:latest';
+  $('serverProxyPorts').value = '443:443,8443:8443';
+  $('serverTrafficIface').value = 'eth0';
+  $('deploySyncInterval').value = '30s';
+  $('deployInstallDocker').checked = true;
+  $('selectedServerStatus').textContent = 'new';
+  $('serverResult').textContent = 'Save a server, test SSH, then deploy node mode.';
+}
+
+async function testServerSSH() {
+  const saved = await fetchJSON('/api/servers', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(serverPayload()) });
+  selectServerIntoForm(saved);
+  $('serverResult').textContent = 'Queued SSH test...';
+  const job = await fetchJSON('/api/servers/' + encodeURIComponent(saved.server_id) + '/test-ssh', { method: 'POST' });
+  await pollJob(job.job_id, 'serverResult');
+  await Promise.all([loadServers(), loadJobs()]);
+}
+
+async function deployServerNode() {
+  const saved = await fetchJSON('/api/servers', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(serverPayload()) });
+  const nodeToken = $('deployNodeToken').value.trim();
+  if (!nodeToken) {
+    $('serverResult').textContent = 'Node token is required for deployment.';
+    return;
+  }
+  const payload = {
+    central_url: $('deployCentralURL').value.trim(),
+    node_token: nodeToken,
+    image: $('serverImage').value.trim(),
+    deploy_dir: $('serverDeployDir').value.trim(),
+    proxy_ports: splitCSV($('serverProxyPorts').value),
+    sync_interval: $('deploySyncInterval').value.trim() || '30s',
+    install_docker: $('deployInstallDocker').checked
+  };
+  $('serverResult').textContent = 'Queued node deployment...';
+  const job = await fetchJSON('/api/servers/' + encodeURIComponent(saved.server_id) + '/deploy-node', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  await pollJob(job.job_id, 'serverResult');
+  await Promise.all([loadServers(), loadJobs(), loadNodes()]);
+}
+
+async function restartServerNode() {
+  const serverID = $('serverID').value.trim();
+  if (!serverID) return;
+  $('serverResult').textContent = 'Queued node restart...';
+  const job = await fetchJSON('/api/servers/' + encodeURIComponent(serverID) + '/restart-node', { method: 'POST' });
+  await pollJob(job.job_id, 'serverResult');
+  await Promise.all([loadServers(), loadJobs(), loadEvents(), loadNodes()]);
+}
+
+async function upgradeServerNode() {
+  const serverID = $('serverID').value.trim();
+  if (!serverID) return;
+  const image = $('upgradeImage').value.trim() || $('serverImage').value.trim();
+  if (!image) {
+    $('serverResult').textContent = 'Upgrade image is required.';
+    return;
+  }
+  $('serverResult').textContent = 'Queued node upgrade...';
+  const job = await fetchJSON('/api/servers/' + encodeURIComponent(serverID) + '/upgrade-node', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ image })
+  });
+  await pollJob(job.job_id, 'serverResult');
+  await Promise.all([loadServers(), loadJobs(), loadEvents(), loadNodes()]);
+}
+
+async function pollJob(jobID, resultID) {
+  const el = $(resultID);
+  for (let i = 0; i < 120; i++) {
+    const job = await fetchJSON('/api/jobs/' + encodeURIComponent(jobID));
+    el.innerHTML = renderJobDetail(job);
+    await Promise.all([loadJobs({ preserveStatus: true }), loadEvents({ preserveStatus: true })]);
+    if (job.status === 'succeeded' || job.status === 'failed') return job;
+    await sleep(2000);
+  }
+  return null;
+}
+
+function renderJobDetail(job) {
+  const lines = [
+    'job: ' + escapeHTML(job.job_id || '-'),
+    'type: ' + escapeHTML(job.type || '-'),
+    'status: ' + escapeHTML(job.status || '-'),
+    'server: ' + escapeHTML(job.server_id || '-'),
+    'node: ' + escapeHTML(job.node_id || '-')
+  ];
+  if (job.error) lines.push('error: ' + escapeHTML(job.error));
+  (job.logs || []).forEach(log => lines.push(formatDate(log.at) + ' ' + escapeHTML(log.message)));
+  return lines.join('\n');
+}
+
+function splitCSV(value) {
+  return String(value || '').split(',').map(v => v.trim()).filter(Boolean);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function configSyncStatus(n) {
   const central = configStatus.config_version || '';
   if (!central || !n.config_version) return 'unknown';
@@ -3304,17 +4191,26 @@ function renderDomains() {
 
 function renderDomainNodeControls() {
   const active = $('domainActiveNode');
+  const primary = $('domainPrimaryNode');
   const list = $('domainNodeList');
   if (!active || !list) return;
   const selectedActive = active.value;
+  const selectedPrimary = primary ? primary.value : '';
   const selectedNodes = selectedDomainNodes();
   active.innerHTML = '<option value="">Select node</option>';
+  if (primary) primary.innerHTML = '<option value="">First assigned node</option>';
   list.innerHTML = '';
   nodesCache.forEach(n => {
     const opt = document.createElement('option');
     opt.value = n.node_id;
     opt.textContent = n.node_id + (n.public_ip ? ' · ' + n.public_ip : '');
     active.appendChild(opt);
+    if (primary) {
+      const primaryOpt = document.createElement('option');
+      primaryOpt.value = n.node_id;
+      primaryOpt.textContent = n.node_id + (n.public_ip ? ' · ' + n.public_ip : '');
+      primary.appendChild(primaryOpt);
+    }
 
     const label = document.createElement('label');
     label.innerHTML = '<input type="checkbox" value="' + escapeHTML(n.node_id) + '"> <span>' + escapeHTML(n.node_id) + ' <span class="compact">' + escapeHTML(n.public_ip || '') + '</span></span>';
@@ -3323,6 +4219,7 @@ function renderDomainNodeControls() {
     list.appendChild(label);
   });
   if (selectedActive) active.value = selectedActive;
+  if (primary && selectedPrimary) primary.value = selectedPrimary;
 }
 
 function selectedDomainNodes() {
@@ -3428,9 +4325,15 @@ async function selectDomain(domain) {
 function selectDomainIntoForm(d) {
   d = d || {};
   const cf = d.cloudflare || {};
+  const policy = d.failover_policy || {};
   $('domainName').value = d.domain || '';
   $('domainEnabled').checked = d.enabled !== false;
   $('domainFailover').checked = !!d.failover_enabled;
+  $('domainManualLock').checked = !!policy.manual_lock;
+  $('domainAutoFailback').checked = !!policy.auto_failback;
+  $('domainFailThreshold').value = policy.fail_threshold || 3;
+  $('domainCooldownSeconds').value = policy.cooldown_seconds || 300;
+  $('domainPrimaryNode').value = policy.primary_node_id || '';
   $('domainActiveNode').value = d.active_node_id || '';
   $('domainZoneID').value = cf.zone_id || '';
   $('domainRecordName').value = cf.record_name || d.domain || '';
@@ -3467,6 +4370,11 @@ function renderDomainResult(d) {
     'renew before days: ' + escapeHTML((d && d.renew_before_days) || 30),
     'node cert sync: ' + escapeHTML(domainCertSyncStatus(d)),
     'failover: ' + escapeHTML(domainFailoverStatus(d)),
+    'failover failures: ' + escapeHTML(failoverFailureSummary(d)),
+    'failover cooldown until: ' + escapeHTML(formatDate(((d && d.runtime) || {}).failover_cooldown_until)),
+    'manual lock: ' + (((d && d.failover_policy) || {}).manual_lock ? 'yes' : 'no'),
+    'primary node: ' + escapeHTML(((d && d.failover_policy) || {}).primary_node_id || (((d && d.node_ids) || [])[0] || '-')),
+    'auto failback: ' + (((d && d.failover_policy) || {}).auto_failback ? 'yes' : 'no'),
     'failover ready nodes: ' + escapeHTML(((d && d.runtime) || {}).failover_ready_nodes || 0)
   ];
   if (d && d.runtime && d.runtime.failover_blocked_reason) lines.push('failover blocked: ' + escapeHTML(d.runtime.failover_blocked_reason));
@@ -3479,6 +4387,12 @@ function findNode(nodeID) {
   return nodesCache.find(n => n.node_id === nodeID);
 }
 
+function failoverFailureSummary(d) {
+  const runtime = (d && d.runtime) || {};
+  const policy = (d && d.failover_policy) || {};
+  return String(runtime.failover_failures || 0) + '/' + String(runtime.failover_threshold || policy.fail_threshold || 3);
+}
+
 async function saveDomain() {
   const domain = $('domainName').value.trim();
   const nodeIDs = selectedDomainNodes();
@@ -3489,6 +4403,13 @@ async function saveDomain() {
     node_ids: nodeIDs,
     active_node_id: activeNode,
     failover_enabled: $('domainFailover').checked,
+    failover_policy: {
+      fail_threshold: Number($('domainFailThreshold').value || 3),
+      cooldown_seconds: Number($('domainCooldownSeconds').value || 300),
+      manual_lock: $('domainManualLock').checked,
+      auto_failback: $('domainAutoFailback').checked,
+      primary_node_id: $('domainPrimaryNode').value || ''
+    },
     renew_before_days: Number($('domainRenewBefore').value || 30),
     dns_provider: 'cloudflare',
     cloudflare: {
@@ -3647,9 +4568,14 @@ function clearDomainForm() {
   $('domainRecordType').value = '';
   $('domainTTL').value = 1;
   $('domainRenewBefore').value = 30;
+  $('domainFailThreshold').value = 3;
+  $('domainCooldownSeconds').value = 300;
+  $('domainPrimaryNode').value = '';
   $('domainEnabled').checked = true;
   $('domainProxied').checked = false;
   $('domainFailover').checked = false;
+  $('domainManualLock').checked = false;
+  $('domainAutoFailback').checked = false;
   $('domainActiveNode').value = '';
   Array.from($('domainNodeList').querySelectorAll('input[type=checkbox]')).forEach(i => { i.checked = false; });
   $('selectedDomainStatus').textContent = 'new';

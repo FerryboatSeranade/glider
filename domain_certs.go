@@ -1122,6 +1122,7 @@ func normalizeDomain(d *dbDomain) error {
 	if d.RenewBeforeDays <= 0 {
 		d.RenewBeforeDays = 30
 	}
+	d.FailoverPolicy = failoverPolicyWithDefaults(d.FailoverPolicy)
 	if d.Cloudflare.TTL < 0 {
 		return fmt.Errorf("cloudflare ttl must be zero or positive")
 	}
@@ -1147,6 +1148,13 @@ func normalizeDomain(d *dbDomain) error {
 		return fmt.Errorf("unsupported cloudflare record type %q", d.Cloudflare.RecordType)
 	}
 	d.NodeIDs = uniqueNonEmpty(d.NodeIDs)
+	d.FailoverPolicy.PrimaryNodeID = strings.TrimSpace(d.FailoverPolicy.PrimaryNodeID)
+	if d.FailoverPolicy.PrimaryNodeID == "" && len(d.NodeIDs) > 0 {
+		d.FailoverPolicy.PrimaryNodeID = d.NodeIDs[0]
+	}
+	if d.FailoverPolicy.PrimaryNodeID != "" && !stringInSlice(d.NodeIDs, d.FailoverPolicy.PrimaryNodeID) {
+		return fmt.Errorf("primary node %q is not assigned to domain %s", d.FailoverPolicy.PrimaryNodeID, d.Domain)
+	}
 	d.ActiveNodeID = strings.TrimSpace(d.ActiveNodeID)
 	if len(d.NodeIDs) == 0 {
 		d.ActiveNodeID = ""
@@ -1156,6 +1164,16 @@ func normalizeDomain(d *dbDomain) error {
 		return fmt.Errorf("active node %q is not assigned to domain %s", d.ActiveNodeID, d.Domain)
 	}
 	return nil
+}
+
+func stringInSlice(values []string, value string) bool {
+	value = strings.TrimSpace(value)
+	for _, candidate := range values {
+		if strings.TrimSpace(candidate) == value {
+			return true
+		}
+	}
+	return false
 }
 
 var domainNameRe = regexp.MustCompile(`^(\*\.)?[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$`)

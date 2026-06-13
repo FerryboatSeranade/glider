@@ -108,3 +108,12 @@ The current hosts already pull `v2026.06.08-control56` from GHCR. Keep `pull_pol
 - Use the Admin UI `Verify Token` action after saving the token. Enter `account_id` for Cloudflare account-owned tokens, enter a `Zone test domain` for zone lookup, and enable `DNS edit test` when you want to prove write/delete permission with a temporary TXT record.
 - `deploy/scripts/domain_onboarding_check.py` can validate a real domain after Cloudflare settings are saved. Its default mode checks Admin auth, node heartbeat, Cloudflare zone read, saved domain existence, DNS preview, and certificate preview. It only saves Cloudflare settings, saves a domain assignment, changes Cloudflare DNS, or issues a certificate when run with `--save-cloudflare-settings`, `--save-domain`, `--sync-dns`, or `--issue-cert`. When saving Cloudflare settings, existing account ID and ACME fields are preserved unless a replacement value or explicit clear flag is supplied.
 - The onboarding helper behavior is covered by `deploy/scripts/domain_onboarding_check_test.py`, and GitHub Actions runs those Python unittests alongside `go test ./...`.
+
+## Next Code Under Validation
+
+- The current working branch adds a Servers tab and API for SSH inventory, credential storage, SSH test jobs, remote node-mode deployment jobs, node restart/upgrade jobs, and recent audit events.
+- New collections: `servers` and `jobs`. Server responses redact SSH password/private-key/passphrase material; with `GLIDER_SETTINGS_KEY`, newly saved SSH secrets are encrypted before MongoDB storage.
+- `POST /api/servers/<server_id>/deploy-node` writes a single node deployment directory on the target VPS, including `.env`, `compose.yml`, `glider.conf`, `rules.d/`, `cache/`, and `certs/`, then runs `docker compose pull && docker compose up -d`.
+- Domain failover now has `failover_policy` and `failover_state`: consecutive failure threshold, cooldown, manual active-node lock, primary node, auto-failback, failure count, last switch, and cooldown-until are recorded in MongoDB and surfaced in the Domains UI.
+- `GET /api/events` shows recent server, job, DNS sync, and failover audit events.
+- This branch has not yet been deployed to `ovh-xboard` or `zgo`; the current remote runtime information above still reflects the last deployed image unless a later rollout updates it.
