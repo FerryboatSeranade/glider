@@ -19,14 +19,15 @@ import (
 )
 
 const (
-	jobTypeSSHTest      = "ssh_test"
-	jobTypePreflight    = "preflight_node"
-	jobTypeInspectNode  = "inspect_node"
-	jobTypeDeployNode   = "deploy_node"
-	jobTypeOnboardNode  = "onboard_node"
-	jobTypeRestartNode  = "restart_node"
-	jobTypeUpgradeNode  = "upgrade_node"
-	jobTypeRollbackNode = "rollback_node"
+	jobTypeSSHTest       = "ssh_test"
+	jobTypePreflight     = "preflight_node"
+	jobTypeInspectNode   = "inspect_node"
+	jobTypeDeployNode    = "deploy_node"
+	jobTypeOnboardNode   = "onboard_node"
+	jobTypeRestartNode   = "restart_node"
+	jobTypeUpgradeNode   = "upgrade_node"
+	jobTypeRollbackNode  = "rollback_node"
+	jobTypeOnboardDomain = "onboard_domain"
 
 	jobStatusQueued    = "queued"
 	jobStatusRunning   = "running"
@@ -68,6 +69,18 @@ type deployNodePayload struct {
 
 type nodeOperationPayload struct {
 	Image string `json:"image"`
+}
+
+type domainOnboardingRunPayload struct {
+	IssueCert            bool   `json:"issue_cert"`
+	SyncDNS              bool   `json:"sync_dns"`
+	EnableFailover       bool   `json:"enable_failover"`
+	WaitCertSync         bool   `json:"wait_cert_sync"`
+	WaitCertSyncSeconds  int    `json:"wait_cert_sync_seconds"`
+	SkipInitialReadiness bool   `json:"skip_initial_readiness"`
+	Email                string `json:"email"`
+	DirectoryURL         string `json:"directory_url"`
+	NodeID               string `json:"node_id"`
 }
 
 type sshRunner struct {
@@ -212,6 +225,35 @@ func (s *adminServer) createNodeOperationJob(ctx context.Context, serverID, jobT
 	return job, nil
 }
 
+func (s *adminServer) createDomainOnboardingJob(ctx context.Context, domain string, payload domainOnboardingRunPayload) (dbJob, error) {
+	d, err := s.store.GetDomain(ctx, domain)
+	if err != nil {
+		return dbJob{}, err
+	}
+	req := dbJobRequest{
+		Domain:               d.Domain,
+		NodeID:               firstNonEmpty(payload.NodeID, d.ActiveNodeID),
+		IssueCert:            payload.IssueCert,
+		SyncDNS:              payload.SyncDNS,
+		EnableFailover:       payload.EnableFailover,
+		WaitCertSync:         payload.WaitCertSync,
+		WaitCertSyncSeconds:  payload.WaitCertSyncSeconds,
+		SkipInitialReadiness: payload.SkipInitialReadiness,
+		Email:                strings.TrimSpace(payload.Email),
+		DirectoryURL:         strings.TrimSpace(payload.DirectoryURL),
+	}
+	if req.WaitCertSyncSeconds <= 0 {
+		req.WaitCertSyncSeconds = 180
+	}
+	job := newJob(jobTypeOnboardDomain, "", req.NodeID, req)
+	job.Domain = d.Domain
+	if err := s.store.CreateJob(ctx, job); err != nil {
+		return dbJob{}, err
+	}
+	go s.runDomainOnboardingJob(job.JobID, d.Domain)
+	return job, nil
+}
+
 func newJob(jobType, serverID, nodeID string, req dbJobRequest) dbJob {
 	return dbJob{
 		JobID:     newID("job"),
@@ -219,6 +261,7 @@ func newJob(jobType, serverID, nodeID string, req dbJobRequest) dbJob {
 		Status:    jobStatusQueued,
 		ServerID:  strings.TrimSpace(serverID),
 		NodeID:    strings.TrimSpace(nodeID),
+		Domain:    strings.TrimSpace(req.Domain),
 		CreatedAt: time.Now().UTC(),
 		Request:   req,
 	}
@@ -671,6 +714,240 @@ func (s *adminServer) runNodeOperationJob(jobID, serverID string) {
 	})
 }
 
+func (s *adminServer) runDomainOnboardingJob(jobID, domain string) {
+	ctx := context.Background()
+	_ = s.store.StartJob(ctx, jobID)
+	logger := jobLogger{store: s.store, jobID: jobID}
+	var job *dbJob
+	if err := logger.Step("load-job", "load domain onboarding job", func() error {
+		var err error
+		job, err = s.store.GetJob(ctx, jobID)
+		return err
+	}); err != nil {
+		s.finishDomainJob(jobID, domain, "", err)
+		return
+	}
+	req := job.Request
+	domain = firstNonEmpty(req.Domain, domain, job.Domain)
+	if domain == "" {
+		s.finishDomainJob(jobID, "", req.NodeID, fmt.Errorf("domain required"))
+		return
+	}
+	if req.WaitCertSyncSeconds <= 0 {
+		req.WaitCertSyncSeconds = 180
+	}
+
+	var d *dbDomain
+	if err := logger.Step("load-domain", fmt.Sprintf("load domain %s", domain), func() error {
+		var err error
+		d, err = s.store.GetDomain(ctx, domain)
+		if err == nil && req.NodeID == "" {
+			req.NodeID = d.ActiveNodeID
+		}
+		return err
+	}); err != nil {
+		s.finishDomainJob(jobID, domain, req.NodeID, err)
+		return
+	}
+
+	if !req.SkipInitialReadiness {
+		if err := logger.Step("initial-readiness", "check domain prerequisites before writes", func() error {
+			resp, err := s.domainOnboardingCheck(ctx, domain)
+			if err != nil {
+				return err
+			}
+			blocking := domainOnboardingBlockingChecks(resp.Checks, req.IssueCert)
+			logger.Log("initial readiness: %s", resp.Summary)
+			for _, check := range blocking {
+				logger.Log("blocking check %s: %s", check.Name, check.Message)
+			}
+			if len(blocking) > 0 {
+				return fmt.Errorf("domain onboarding blocked by %d required check(s)", len(blocking))
+			}
+			return nil
+		}); err != nil {
+			s.finishDomainJob(jobID, domain, req.NodeID, err)
+			return
+		}
+	}
+
+	if req.IssueCert {
+		if err := logger.Step("issue-cert", "issue or renew certificate through Cloudflare DNS-01", func() error {
+			var err error
+			d, err = s.store.GetDomain(ctx, domain)
+			if err != nil {
+				return err
+			}
+			settings, err := s.effectiveCloudflareSettings(ctx)
+			if err != nil {
+				return err
+			}
+			email := firstNonEmpty(req.Email, settings.ACMEEmail)
+			directoryURL := firstNonEmpty(req.DirectoryURL, settings.ACMEDirectoryURL)
+			plan, err := s.domainCertificatePlan(ctx, *d, email, directoryURL)
+			if err != nil {
+				return err
+			}
+			logger.Log("certificate plan action=%s zone=%s challenge=%s", plan.Action, firstNonEmpty(plan.ZoneName, plan.ZoneID), plan.ChallengeRecord)
+			cert, err := issueCertificateWithCloudflareTokenZone(ctx, *d, email, directoryURL, settings.APIToken, plan.ZoneID)
+			if err != nil {
+				failed := certificateFailure(d.Certificate, err)
+				_ = s.store.UpdateDomainCertificate(context.Background(), domain, failed)
+				return err
+			}
+			if err := s.store.UpdateDomainCertificate(context.Background(), domain, cert); err != nil {
+				return err
+			}
+			logger.Log("certificate version %s expires %s", shortVersion(cert.Version), formatTimeForLog(cert.ExpiresAt))
+			return nil
+		}); err != nil {
+			s.finishDomainJob(jobID, domain, req.NodeID, err)
+			return
+		}
+	}
+
+	waitNodes := domainOnboardingWaitNodeIDs(*d, req)
+	if req.WaitCertSync {
+		if err := logger.Step("wait-cert-sync", "wait for assigned node certificate heartbeat", func() error {
+			var err error
+			d, err = s.store.GetDomain(ctx, domain)
+			if err != nil {
+				return err
+			}
+			return s.waitForDomainCertificateSync(ctx, logger, *d, waitNodes, time.Duration(req.WaitCertSyncSeconds)*time.Second)
+		}); err != nil {
+			s.finishDomainJob(jobID, domain, req.NodeID, err)
+			return
+		}
+	}
+
+	if req.SyncDNS {
+		if err := logger.Step("sync-dns", "sync Cloudflare DNS to selected active node", func() error {
+			var err error
+			d, err = s.store.GetDomain(ctx, domain)
+			if err != nil {
+				return err
+			}
+			nodeID := firstNonEmpty(req.NodeID, d.ActiveNodeID)
+			if nodeID == "" {
+				return fmt.Errorf("active node required")
+			}
+			node, err := s.store.GetNode(ctx, nodeID)
+			if err != nil {
+				return err
+			}
+			if err := validateDomainDNSTarget(*d, *node, time.Now().UTC()); err != nil {
+				return err
+			}
+			settings, err := s.effectiveCloudflareSettings(ctx)
+			if err != nil {
+				return err
+			}
+			cfConfig, err := syncCloudflareDNSWithToken(ctx, *d, *node, settings.APIToken)
+			if updateErr := s.store.UpdateDomainCloudflare(context.Background(), domain, cfConfig); updateErr != nil && err == nil {
+				err = updateErr
+			}
+			if err != nil {
+				return err
+			}
+			if nodeID != d.ActiveNodeID {
+				now := time.Now().UTC()
+				state := d.FailoverState
+				state.ActiveFailureCount = 0
+				state.LastError = ""
+				state.LastReason = "domain onboarding dns sync"
+				state.LastFromNodeID = d.ActiveNodeID
+				state.LastToNodeID = nodeID
+				state.LastSwitchAt = &now
+				state.CooldownUntil = nil
+				if err := s.store.SwitchDomainActiveNode(context.Background(), domain, nodeID, state); err != nil {
+					return err
+				}
+			}
+			logger.Log("DNS synced %s %s -> %s", cfConfig.RecordType, cfConfig.RecordName, node.PublicIP)
+			s.recordEvent(dbEvent{
+				Type:    "domain.dns_synced",
+				Message: "domain DNS synced",
+				Domain:  domain,
+				NodeID:  nodeID,
+				JobID:   jobID,
+				Metadata: map[string]any{
+					"from_node_id": d.ActiveNodeID,
+					"to_node_id":   nodeID,
+					"record_name":  cfConfig.RecordName,
+					"record_type":  cfConfig.RecordType,
+					"target":       node.PublicIP,
+				},
+			})
+			return nil
+		}); err != nil {
+			s.finishDomainJob(jobID, domain, req.NodeID, err)
+			return
+		}
+	}
+
+	if req.EnableFailover {
+		if err := logger.Step("enable-failover", "enable domain heartbeat failover policy", func() error {
+			var err error
+			d, err = s.store.GetDomain(ctx, domain)
+			if err != nil {
+				return err
+			}
+			if len(d.NodeIDs) < 2 {
+				return fmt.Errorf("failover requires at least two assigned nodes")
+			}
+			d.FailoverEnabled = true
+			d.FailoverPolicy = failoverPolicyWithDefaultsForDomain(*d)
+			if d.FailoverPolicy.PrimaryNodeID != "" && !stringInSlice(d.NodeIDs, d.FailoverPolicy.PrimaryNodeID) {
+				d.FailoverPolicy.PrimaryNodeID = d.NodeIDs[0]
+			}
+			if err := s.store.UpsertDomain(context.Background(), *d); err != nil {
+				return err
+			}
+			logger.Log("failover enabled threshold=%d cooldown=%ds manual_lock=%t", d.FailoverPolicy.FailThreshold, d.FailoverPolicy.CooldownSeconds, d.FailoverPolicy.ManualLock)
+			return nil
+		}); err != nil {
+			s.finishDomainJob(jobID, domain, req.NodeID, err)
+			return
+		}
+	}
+
+	if err := logger.Step("final-readiness", "check final domain onboarding readiness", func() error {
+		resp, err := s.domainOnboardingCheck(ctx, domain)
+		if err != nil {
+			return err
+		}
+		logger.Log("final readiness: %s", resp.Summary)
+		blocking := domainOnboardingBlockingChecks(resp.Checks, false)
+		for _, check := range blocking {
+			logger.Log("blocking check %s: %s", check.Name, check.Message)
+		}
+		if len(blocking) > 0 {
+			return fmt.Errorf("domain onboarding finished with %d blocking check(s)", len(blocking))
+		}
+		return nil
+	}); err != nil {
+		s.finishDomainJob(jobID, domain, req.NodeID, err)
+		return
+	}
+
+	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
+	s.recordEvent(dbEvent{
+		Type:    "domain.onboarding_succeeded",
+		Message: "domain onboarding succeeded",
+		Domain:  domain,
+		NodeID:  req.NodeID,
+		JobID:   jobID,
+		Metadata: map[string]any{
+			"issue_cert":        req.IssueCert,
+			"sync_dns":          req.SyncDNS,
+			"enable_failover":   req.EnableFailover,
+			"wait_cert_sync":    req.WaitCertSync,
+			"wait_cert_seconds": req.WaitCertSyncSeconds,
+		},
+	})
+}
+
 func (s *adminServer) finishProvisionJob(jobID, serverID, nodeID, serverStatus string, err error) {
 	errText := ""
 	if err != nil {
@@ -698,6 +975,27 @@ func (s *adminServer) finishProvisionJob(jobID, serverID, nodeID, serverStatus s
 		Metadata: map[string]any{"error": errText, "server_status": serverStatus},
 	})
 	_ = nodeID
+}
+
+func (s *adminServer) finishDomainJob(jobID, domain, nodeID string, err error) {
+	errText := ""
+	if err != nil {
+		errText = err.Error()
+	}
+	if errText == "" {
+		errText = "domain job failed"
+	}
+	_ = s.store.AppendJobLog(context.Background(), jobID, "error: "+errText)
+	_ = s.store.FinishJob(context.Background(), jobID, jobStatusFailed, errText)
+	s.recordEvent(dbEvent{
+		Type:     "domain.onboarding_failed",
+		Severity: "error",
+		Message:  "domain onboarding failed",
+		Domain:   domain,
+		NodeID:   nodeID,
+		JobID:    jobID,
+		Metadata: map[string]any{"error": errText},
+	})
 }
 
 type jobLogger struct {
@@ -1184,6 +1482,70 @@ func (s *adminServer) waitForNodeHeartbeat(ctx context.Context, logger jobLogger
 		case <-ticker.C:
 		}
 	}
+}
+
+func domainOnboardingWaitNodeIDs(d dbDomain, req dbJobRequest) []string {
+	if req.EnableFailover || len(d.NodeIDs) > 1 {
+		return uniqueNonEmpty(d.NodeIDs)
+	}
+	return uniqueNonEmpty([]string{firstNonEmpty(req.NodeID, d.ActiveNodeID)})
+}
+
+func (s *adminServer) waitForDomainCertificateSync(ctx context.Context, logger jobLogger, d dbDomain, nodeIDs []string, timeout time.Duration) error {
+	domain := strings.TrimSpace(d.Domain)
+	version := strings.TrimSpace(d.Certificate.Version)
+	if domain == "" {
+		return fmt.Errorf("domain required")
+	}
+	if version == "" || !domainCertificateUsable(d.Certificate, time.Now().UTC()) {
+		return fmt.Errorf("usable certificate required before waiting for node sync")
+	}
+	nodeIDs = uniqueNonEmpty(nodeIDs)
+	if len(nodeIDs) == 0 {
+		nodeIDs = uniqueNonEmpty(d.NodeIDs)
+	}
+	if len(nodeIDs) == 0 {
+		return fmt.Errorf("at least one assigned node required")
+	}
+	if timeout <= 0 {
+		timeout = 180 * time.Second
+	}
+	deadline := time.Now().UTC().Add(timeout)
+	logger.Log("waiting up to %s for certificate %s on nodes %s", timeout.Round(time.Second), shortVersion(version), strings.Join(nodeIDs, ", "))
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		now := time.Now().UTC()
+		missing := make([]string, 0)
+		for _, nodeID := range nodeIDs {
+			cctx, cancel := withTimeout(ctx)
+			node, err := s.store.GetNode(cctx, nodeID)
+			cancel()
+			if err != nil || !nodeHasDomainCertificateVersionAt(*node, domain, version, now) {
+				missing = append(missing, nodeID)
+			}
+		}
+		if len(missing) == 0 {
+			logger.Log("certificate %s synced to %d node(s)", shortVersion(version), len(nodeIDs))
+			return nil
+		}
+		if now.After(deadline) {
+			return fmt.Errorf("certificate %s not synced to nodes before timeout: %s", shortVersion(version), strings.Join(missing, ", "))
+		}
+		logger.Log("waiting for certificate sync on nodes: %s", strings.Join(missing, ", "))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func formatTimeForLog(t *time.Time) string {
+	if t == nil || t.IsZero() {
+		return "unknown"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 func generateNodeToken() string {

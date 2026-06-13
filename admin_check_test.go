@@ -184,6 +184,14 @@ func TestAdminHTMLSmoke(t *testing.T) {
 		"checkDomainOnboarding",
 		"renderOnboardingCheck",
 		"/onboarding-check",
+		"Run Onboarding",
+		"runDomainOnboarding",
+		"/onboarding-run",
+		"domainRunIssueCert",
+		"domainRunWaitCertSync",
+		"domainRunSyncDNS",
+		"domainRunEnableFailover",
+		"domainRunWaitCertSyncSeconds",
 		"account token only",
 		"token owner",
 		"Zone test domain",
@@ -511,6 +519,22 @@ func TestDomainOnboardingStaticChecksBlockUnsafeDomain(t *testing.T) {
 		if check.Status != status || !check.Required {
 			t.Fatalf("check %s = %#v, want status %s and required", name, check, status)
 		}
+	}
+}
+
+func TestDomainOnboardingBlockingChecksAllowMissingCertWhenIssuing(t *testing.T) {
+	checks := []domainOnboardingCheck{
+		{Name: "domain_enabled", Status: "ok", Required: true, Message: "domain is enabled"},
+		{Name: "certificate", Status: "error", Required: true, Message: "certificate has not been issued or imported"},
+		{Name: "active_node", Status: "error", Required: true, Message: "active node heartbeat stale"},
+	}
+	blocking := domainOnboardingBlockingChecks(checks, true)
+	if len(blocking) != 1 || blocking[0].Name != "active_node" {
+		t.Fatalf("blocking with cert issuance = %#v, want only active_node", blocking)
+	}
+	blocking = domainOnboardingBlockingChecks(checks, false)
+	if len(blocking) != 2 {
+		t.Fatalf("blocking without cert issuance = %#v, want certificate and active_node", blocking)
 	}
 }
 

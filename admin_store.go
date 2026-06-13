@@ -188,6 +188,16 @@ type dbJobRequest struct {
 	InstallDocker        bool     `bson:"install_docker,omitempty" json:"install_docker,omitempty"`
 	SyncInterval         string   `bson:"sync_interval,omitempty" json:"sync_interval,omitempty"`
 	WaitHeartbeatSeconds int      `bson:"wait_heartbeat_seconds,omitempty" json:"wait_heartbeat_seconds,omitempty"`
+	Domain               string   `bson:"domain,omitempty" json:"domain,omitempty"`
+	NodeID               string   `bson:"node_id,omitempty" json:"node_id,omitempty"`
+	IssueCert            bool     `bson:"issue_cert,omitempty" json:"issue_cert,omitempty"`
+	SyncDNS              bool     `bson:"sync_dns,omitempty" json:"sync_dns,omitempty"`
+	EnableFailover       bool     `bson:"enable_failover,omitempty" json:"enable_failover,omitempty"`
+	WaitCertSync         bool     `bson:"wait_cert_sync,omitempty" json:"wait_cert_sync,omitempty"`
+	WaitCertSyncSeconds  int      `bson:"wait_cert_sync_seconds,omitempty" json:"wait_cert_sync_seconds,omitempty"`
+	SkipInitialReadiness bool     `bson:"skip_initial_readiness,omitempty" json:"skip_initial_readiness,omitempty"`
+	Email                string   `bson:"email,omitempty" json:"email,omitempty"`
+	DirectoryURL         string   `bson:"directory_url,omitempty" json:"directory_url,omitempty"`
 }
 
 type dbEvent struct {

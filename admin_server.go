@@ -962,6 +962,8 @@ func (s *adminServer) handleDomainAction(w http.ResponseWriter, r *http.Request)
 		s.handleDomainDNSPlan(w, r, domain)
 	case action == "onboarding-check" && r.Method == http.MethodPost:
 		s.handleDomainOnboardingCheck(w, r, domain)
+	case action == "onboarding-run" && r.Method == http.MethodPost:
+		s.handleDomainOnboardingRun(w, r, domain)
 	case action == "failover-plan" && r.Method == http.MethodPost:
 		s.handleDomainFailoverPlan(w, r, domain)
 	case action == "failover-run" && r.Method == http.MethodPost:
@@ -1406,6 +1408,36 @@ func (s *adminServer) handleDomainOnboardingCheck(w http.ResponseWriter, r *http
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *adminServer) handleDomainOnboardingRun(w http.ResponseWriter, r *http.Request, domain string) {
+	var payload domainOnboardingRunPayload
+	if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	ctx, cancel := withTimeout(r.Context())
+	defer cancel()
+	job, err := s.createDomainOnboardingJob(ctx, domain, payload)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.recordEvent(dbEvent{
+		Type:    "domain.onboarding_queued",
+		Message: "domain onboarding queued",
+		Domain:  job.Domain,
+		NodeID:  job.NodeID,
+		JobID:   job.JobID,
+		Metadata: map[string]any{
+			"issue_cert":        job.Request.IssueCert,
+			"sync_dns":          job.Request.SyncDNS,
+			"enable_failover":   job.Request.EnableFailover,
+			"wait_cert_sync":    job.Request.WaitCertSync,
+			"wait_cert_seconds": job.Request.WaitCertSyncSeconds,
+		},
+	})
+	writeJSON(w, http.StatusAccepted, job)
+}
+
 func (s *adminServer) domainOnboardingCheck(ctx context.Context, domain string) (domainOnboardingCheckResponse, error) {
 	d, err := s.store.GetDomain(ctx, domain)
 	if err != nil {
@@ -1662,15 +1694,28 @@ func domainOnboardingResponse(d dbDomain, runtime domainRuntimeStatus, settings 
 }
 
 func domainOnboardingReady(checks []domainOnboardingCheck) bool {
+	return len(domainOnboardingBlockingChecks(checks, false)) == 0
+}
+
+func domainOnboardingBlockingChecks(checks []domainOnboardingCheck, allowMissingCertificate bool) []domainOnboardingCheck {
+	blocking := make([]domainOnboardingCheck, 0)
 	for _, check := range checks {
 		if !check.Required {
 			continue
 		}
 		if check.Status == "error" || check.Status == "warn" {
-			return false
+			if allowMissingCertificate && check.Name == "certificate" && isMissingCertificateCheck(check) {
+				continue
+			}
+			blocking = append(blocking, check)
 		}
 	}
-	return true
+	return blocking
+}
+
+func isMissingCertificateCheck(check domainOnboardingCheck) bool {
+	msg := strings.ToLower(strings.TrimSpace(check.Message))
+	return check.Name == "certificate" && strings.Contains(msg, "not been issued")
 }
 
 func domainOnboardingSummary(checks []domainOnboardingCheck) string {
@@ -4450,6 +4495,11 @@ const adminHTML = `<!doctype html>
                   <div class="checkbox-row"><input id="domainFailover" type="checkbox"><label for="domainFailover">Heartbeat failover</label></div>
                   <div class="checkbox-row"><input id="domainManualLock" type="checkbox"><label for="domainManualLock">Manual lock active node</label></div>
                   <div class="checkbox-row"><input id="domainAutoFailback" type="checkbox"><label for="domainAutoFailback">Auto failback</label></div>
+                  <div class="checkbox-row"><input id="domainRunIssueCert" type="checkbox" checked><label for="domainRunIssueCert">Run issue cert</label></div>
+                  <div class="checkbox-row"><input id="domainRunWaitCertSync" type="checkbox" checked><label for="domainRunWaitCertSync">Wait cert sync</label></div>
+                  <div class="checkbox-row"><input id="domainRunSyncDNS" type="checkbox" checked><label for="domainRunSyncDNS">Run DNS sync</label></div>
+                  <div class="checkbox-row"><input id="domainRunEnableFailover" type="checkbox"><label for="domainRunEnableFailover">Enable failover in run</label></div>
+                  <div><label>Cert sync wait seconds</label><input id="domainRunWaitCertSyncSeconds" type="number" min="15" value="180"></div>
                   <div><label>ACME email</label><input id="domainACMEEmail" placeholder="admin@example.com"></div>
                   <div><label>ACME directory</label><input id="domainACMEDirectory" placeholder="Let's Encrypt production"></div>
                   <div class="wide"><label>Import fullchain PEM</label><textarea id="domainImportFullchain" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
@@ -4458,6 +4508,7 @@ const adminHTML = `<!doctype html>
                 <div class="actions">
                   <button class="primary" onclick="saveDomain()">Save Domain</button>
                   <button onclick="checkDomainOnboarding()">Onboarding Check</button>
+                  <button onclick="runDomainOnboarding()">Run Onboarding</button>
                   <button onclick="previewDomainDNS()">Preview DNS</button>
                   <button onclick="syncDomainDNS()">Sync DNS</button>
                   <button onclick="previewDomainFailover()">Preview Failover</button>
@@ -4988,7 +5039,7 @@ function renderJobs() {
     return '<tr>' +
       '<td><strong>' + escapeHTML(job.type || '-') + '</strong><div class="compact mono">' + escapeHTML(job.job_id || '-') + '</div></td>' +
       '<td>' + statusPill(job.status || 'unknown') + '</td>' +
-      '<td>server ' + escapeHTML(job.server_id || '-') + '<div class="compact">node ' + escapeHTML(job.node_id || '-') + '</div></td>' +
+      '<td>server ' + escapeHTML(job.server_id || '-') + '<div class="compact">node ' + escapeHTML(job.node_id || '-') + '</div><div class="compact">domain ' + escapeHTML(job.domain || '-') + '</div></td>' +
       '<td>' + escapeHTML(formatDate(job.created_at)) + '</td>' +
       '<td>' + escapeHTML(formatDate(job.finished_at)) + '</td>' +
       '<td>' + escapeHTML(job.error || '-') + '</td>' +
@@ -5289,7 +5340,8 @@ function renderJobDetail(job) {
     'type: ' + escapeHTML(job.type || '-'),
     'status: ' + escapeHTML(job.status || '-'),
     'server: ' + escapeHTML(job.server_id || '-'),
-    'node: ' + escapeHTML(job.node_id || '-')
+    'node: ' + escapeHTML(job.node_id || '-'),
+    'domain: ' + escapeHTML(job.domain || '-')
   ];
   if (job.error) lines.push('error: ' + escapeHTML(job.error));
   if ((job.steps || []).length) {
@@ -5738,6 +5790,30 @@ async function checkDomainOnboarding() {
   await loadDomains();
 }
 
+async function runDomainOnboarding() {
+  const domain = $('domainName').value.trim();
+  if (!domain) return;
+  await saveDomain();
+  const payload = {
+    issue_cert: $('domainRunIssueCert').checked,
+    wait_cert_sync: $('domainRunWaitCertSync').checked,
+    sync_dns: $('domainRunSyncDNS').checked,
+    enable_failover: $('domainRunEnableFailover').checked,
+    wait_cert_sync_seconds: Number($('domainRunWaitCertSyncSeconds').value || 180),
+    node_id: $('domainActiveNode').value,
+    email: $('domainACMEEmail').value.trim(),
+    directory_url: $('domainACMEDirectory').value.trim()
+  };
+  $('domainResult').textContent = 'Queued domain onboarding...';
+  const job = await fetchJSON('/api/domains/' + encodeURIComponent(domain) + '/onboarding-run', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  await pollJob(job.job_id, 'domainResult');
+  await Promise.all([loadDomains(), loadJobs(), loadEvents(), loadNodes()]);
+}
+
 async function previewDomainDNS() {
   const domain = $('domainName').value.trim();
   if (!domain) return;
@@ -5862,6 +5938,11 @@ function clearDomainForm() {
   $('domainFailover').checked = false;
   $('domainManualLock').checked = false;
   $('domainAutoFailback').checked = false;
+  $('domainRunIssueCert').checked = true;
+  $('domainRunWaitCertSync').checked = true;
+  $('domainRunSyncDNS').checked = true;
+  $('domainRunEnableFailover').checked = false;
+  $('domainRunWaitCertSyncSeconds').value = 180;
   $('domainActiveNode').value = '';
   Array.from($('domainNodeList').querySelectorAll('input[type=checkbox]')).forEach(i => { i.checked = false; });
   $('selectedDomainStatus').textContent = 'new';
