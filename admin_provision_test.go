@@ -53,6 +53,21 @@ func TestReplaceComposeImage(t *testing.T) {
 	}
 }
 
+func TestHostPortFromMapping(t *testing.T) {
+	cases := map[string]string{
+		"443:443":             "443",
+		"127.0.0.1:8443:8443": "8443",
+		"[::1]:9443:443/tcp":  "9443",
+		"8443":                "8443",
+		"bad":                 "",
+	}
+	for input, want := range cases {
+		if got := hostPortFromMapping(input); got != want {
+			t.Fatalf("hostPortFromMapping(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestServerUpdateDefaultsAndRedactsSecrets(t *testing.T) {
 	t.Setenv(settingsKeyEnv, "0123456789abcdef0123456789abcdef")
 	password := "root-password"

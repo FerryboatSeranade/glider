@@ -1793,6 +1793,23 @@ func (s *adminServer) handleServerAction(w http.ResponseWriter, r *http.Request)
 			JobID:    job.JobID,
 		})
 		writeJSON(w, http.StatusAccepted, job)
+	case action == "preflight-node" && r.Method == http.MethodPost:
+		ctx, cancel := withTimeout(r.Context())
+		defer cancel()
+		job, err := s.createPreflightNodeJob(ctx, serverID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		s.recordEvent(dbEvent{
+			Type:     "server.preflight_queued",
+			Message:  "node preflight queued",
+			ServerID: serverID,
+			NodeID:   job.NodeID,
+			JobID:    job.JobID,
+			Metadata: map[string]any{"deploy_dir": job.Request.DeployDir, "image": job.Request.Image},
+		})
+		writeJSON(w, http.StatusAccepted, job)
 	case action == "deploy-node" && r.Method == http.MethodPost:
 		var payload deployNodePayload
 		if err := decodeJSON(r, &payload); err != nil && !errors.Is(err, io.EOF) {
@@ -3334,6 +3351,7 @@ const adminHTML = `<!doctype html>
 	                <div class="actions">
 	                  <button class="primary" onclick="saveServer()">Save Server</button>
 	                  <button onclick="testServerSSH()">Test SSH</button>
+	                  <button onclick="preflightServerNode()">Preflight</button>
 	                  <button onclick="deployServerNode()">Deploy Node</button>
 	                  <button onclick="restartServerNode()">Restart Node</button>
 	                  <button onclick="upgradeServerNode()">Upgrade Node</button>
@@ -3883,8 +3901,8 @@ function renderServers() {
 
 function serverStatusTone(status) {
   status = String(status || '').toLowerCase();
-  if (status === 'ssh_ok' || status === 'deployed') return 'ok';
-  if (status === 'unreachable' || status === 'error') return 'error';
+  if (status === 'ssh_ok' || status === 'preflight_ok' || status === 'deployed' || status === 'restarted' || status === 'upgraded') return 'ok';
+  if (status === 'unreachable' || status === 'preflight_failed' || status === 'error') return 'error';
   return status || 'saved';
 }
 
@@ -4070,6 +4088,15 @@ async function deployServerNode() {
   const job = await fetchJSON('/api/servers/' + encodeURIComponent(saved.server_id) + '/deploy-node', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   await pollJob(job.job_id, 'serverResult');
   await Promise.all([loadServers(), loadJobs(), loadNodes()]);
+}
+
+async function preflightServerNode() {
+  const saved = await fetchJSON('/api/servers', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(serverPayload()) });
+  selectServerIntoForm(saved);
+  $('serverResult').textContent = 'Queued node preflight...';
+  const job = await fetchJSON('/api/servers/' + encodeURIComponent(saved.server_id) + '/preflight-node', { method: 'POST' });
+  await pollJob(job.job_id, 'serverResult');
+  await Promise.all([loadServers(), loadJobs(), loadEvents(), loadNodes()]);
 }
 
 async function restartServerNode() {

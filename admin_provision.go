@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 
 const (
 	jobTypeSSHTest     = "ssh_test"
+	jobTypePreflight   = "preflight_node"
 	jobTypeDeployNode  = "deploy_node"
 	jobTypeRestartNode = "restart_node"
 	jobTypeUpgradeNode = "upgrade_node"
@@ -73,6 +75,24 @@ func (s *adminServer) createSSHTestJob(ctx context.Context, serverID string) (db
 		return dbJob{}, err
 	}
 	go s.runSSHTestJob(job.JobID, serverID)
+	return job, nil
+}
+
+func (s *adminServer) createPreflightNodeJob(ctx context.Context, serverID string) (dbJob, error) {
+	server, err := s.store.GetServer(ctx, serverID)
+	if err != nil {
+		return dbJob{}, err
+	}
+	req := dbJobRequest{
+		Image:      firstNonEmpty(server.Image, "ghcr.io/ferryboatseranade/glider:latest"),
+		DeployDir:  firstNonEmpty(server.DeployDir, "/root/data/docker_data/glider"),
+		ProxyPorts: normalizeStringList(firstNonEmptySlice(server.ProxyPorts, []string{"443:443", "8443:8443"})),
+	}
+	job := newJob(jobTypePreflight, serverID, server.NodeID, req)
+	if err := s.store.CreateJob(ctx, job); err != nil {
+		return dbJob{}, err
+	}
+	go s.runPreflightNodeJob(job.JobID, serverID)
 	return job, nil
 }
 
@@ -189,6 +209,50 @@ func (s *adminServer) runSSHTestJob(jobID, serverID string) {
 		ServerID: serverID,
 		NodeID:   server.NodeID,
 		JobID:    jobID,
+	})
+}
+
+func (s *adminServer) runPreflightNodeJob(jobID, serverID string) {
+	ctx := context.Background()
+	_ = s.store.StartJob(ctx, jobID)
+	logger := jobLogger{store: s.store, jobID: jobID}
+	job, err := s.store.GetJob(ctx, jobID)
+	if err != nil {
+		s.finishProvisionJob(jobID, serverID, "", "error", err)
+		return
+	}
+	server, err := s.store.GetServer(ctx, serverID)
+	if err != nil {
+		s.finishProvisionJob(jobID, serverID, "", "error", err)
+		return
+	}
+	runner, err := connectSSH(ctx, *server, logger)
+	if err != nil {
+		s.finishProvisionJob(jobID, serverID, server.NodeID, "unreachable", err)
+		return
+	}
+	defer runner.Close()
+	req := job.Request
+	if req.DeployDir == "" {
+		req.DeployDir = firstNonEmpty(server.DeployDir, "/root/data/docker_data/glider")
+	}
+	if len(req.ProxyPorts) == 0 {
+		req.ProxyPorts = firstNonEmptySlice(server.ProxyPorts, []string{"443:443", "8443:8443"})
+	}
+	if err := preflightNodeOverSSH(ctx, runner, logger, *server, req); err != nil {
+		s.finishProvisionJob(jobID, serverID, server.NodeID, "preflight_failed", err)
+		return
+	}
+	now := time.Now().UTC()
+	_ = s.store.UpdateServerStatus(context.Background(), serverID, "preflight_ok", "", &now, nil, jobID)
+	_ = s.store.FinishJob(context.Background(), jobID, jobStatusSucceeded, "")
+	s.recordEvent(dbEvent{
+		Type:     "server.preflight_succeeded",
+		Message:  "node preflight succeeded",
+		ServerID: serverID,
+		NodeID:   server.NodeID,
+		JobID:    jobID,
+		Metadata: map[string]any{"deploy_dir": req.DeployDir, "image": req.Image, "proxy_ports": req.ProxyPorts},
 	})
 }
 
@@ -503,6 +567,73 @@ func ensureDocker(ctx context.Context, runner *sshRunner, logger jobLogger) erro
 	out, err = runner.Run(ctx, cmd)
 	logger.Log("%s", strings.TrimSpace(out))
 	return err
+}
+
+func preflightNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger, server dbServer, req dbJobRequest) error {
+	deployDir := firstNonEmpty(req.DeployDir, server.DeployDir, "/root/data/docker_data/glider")
+	logger.Log("preflight deploy directory %s", deployDir)
+	checks := []string{
+		"printf 'host '; hostname || true",
+		"printf 'user '; id -un",
+		"printf 'kernel '; uname -sr",
+		"printf 'docker '; docker --version 2>/dev/null || printf 'missing'",
+		"printf 'compose '; docker compose version 2>/dev/null || printf 'missing'",
+		"printf 'deploy_dir '; if test -d " + shellQuote(deployDir) + "; then printf 'exists'; else printf 'missing'; fi",
+		"printf 'compose_file '; if test -f " + shellQuote(deployDir+"/compose.yml") + "; then printf 'exists'; else printf 'missing'; fi",
+		"printf 'container '; docker inspect glider --format '{{.Config.Image}} {{.State.Status}}' 2>/dev/null || printf 'missing'",
+		"printf 'disk '; df -h " + shellQuote(deployDir) + " 2>/dev/null | tail -n 1 || df -h / | tail -n 1",
+		"printf 'memory '; free -m 2>/dev/null | awk 'NR==2{print $2\"MB total, \"$7\"MB available\"}' || true",
+	}
+	for _, cmd := range checks {
+		out, err := runner.Run(ctx, cmd)
+		if strings.TrimSpace(out) != "" {
+			logger.Log("%s", strings.TrimSpace(out))
+		}
+		if err != nil {
+			return err
+		}
+	}
+	for _, mapping := range normalizeStringList(req.ProxyPorts) {
+		hostPort := hostPortFromMapping(mapping)
+		if hostPort == "" {
+			logger.Log("port %s skipped: could not parse host port", mapping)
+			continue
+		}
+		cmd := fmt.Sprintf("printf 'port %s '; if (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || true) | awk '{print $4}' | grep -Eq '(^|:|\\])%s$'; then printf 'listening'; else printf 'free'; fi", hostPort, hostPort)
+		out, err := runner.Run(ctx, cmd)
+		if strings.TrimSpace(out) != "" {
+			logger.Log("%s", strings.TrimSpace(out))
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func hostPortFromMapping(mapping string) string {
+	mapping = strings.TrimSpace(strings.Trim(mapping, `"'`))
+	if mapping == "" {
+		return ""
+	}
+	if strings.Contains(mapping, "/") {
+		mapping = strings.SplitN(mapping, "/", 2)[0]
+	}
+	parts := strings.Split(mapping, ":")
+	candidates := []string{mapping}
+	if len(parts) >= 2 {
+		candidates = append(candidates, parts[len(parts)-2])
+	}
+	if len(parts) == 1 {
+		candidates = append(candidates, parts[0])
+	}
+	for _, part := range candidates {
+		part = strings.Trim(part, "[] ")
+		if _, err := strconv.Atoi(part); err == nil {
+			return part
+		}
+	}
+	return ""
 }
 
 func deployNodeOverSSH(ctx context.Context, runner *sshRunner, logger jobLogger, server dbServer, req dbJobRequest, nodeToken string) error {
