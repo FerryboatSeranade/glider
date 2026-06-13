@@ -638,7 +638,7 @@ func normalizeServer(srv *dbServer) error {
 	if srv.SSHUser = strings.TrimSpace(srv.SSHUser); srv.SSHUser == "" {
 		srv.SSHUser = "root"
 	}
-	srv.AuthType = strings.ToLower(strings.TrimSpace(srv.AuthType))
+	srv.AuthType = normalizeServerAuthType(srv.AuthType)
 	if srv.AuthType == "" {
 		srv.AuthType = "auto"
 	}
@@ -660,6 +660,15 @@ func normalizeServer(srv *dbServer) error {
 		srv.ProxyPorts = []string{"443:443", "8443:8443"}
 	}
 	return nil
+}
+
+func normalizeServerAuthType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "key", "private-key", "privatekey", "ssh_key", "ssh-key":
+		return "private_key"
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
 }
 
 func normalizeStringList(values []string) []string {

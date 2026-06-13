@@ -602,6 +602,7 @@ Servers and remote provisioning:
 
 - The Admin panel includes a Servers tab for VPS inventory and SSH-based node provisioning.
 - A server record stores `server_id`, `node_id`, host, SSH port/user, auth type, password or private key, deploy directory, image tag, proxy port mappings, and traffic interface. API responses redact passwords, private keys, and passphrases.
+- Server `auth_type` accepts `auto`, `password`, and `private_key`. For API automation, common private-key aliases such as `key`, `private-key`, `privatekey`, `ssh_key`, and `ssh-key` are normalized to `private_key`.
 - Server credentials use the same `GLIDER_SETTINGS_KEY` secret storage path as Cloudflare settings. If `GLIDER_SETTINGS_KEY` is set, new SSH passwords/private keys are encrypted before they are written to MongoDB.
 - Admin exposes `GET|POST /api/servers`, `GET|PUT|DELETE /api/servers/<server_id>`, `POST /api/servers/<server_id>/test-ssh`, `POST /api/servers/<server_id>/deploy-node`, `POST /api/servers/<server_id>/restart-node`, `POST /api/servers/<server_id>/upgrade-node`, `GET /api/jobs`, `GET /api/jobs/<job_id>`, and `GET /api/events`.
 - SSH tests, node deployments, restarts, and upgrades run as asynchronous jobs. The Servers tab shows the latest job status and logs; API clients can poll `/api/jobs/<job_id>`.

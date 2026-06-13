@@ -86,3 +86,26 @@ func TestServerUpdateDefaultsAndRedactsSecrets(t *testing.T) {
 		t.Fatalf("secrets leaked in redacted server: %#v", redacted)
 	}
 }
+
+func TestServerAuthTypeAliases(t *testing.T) {
+	t.Setenv(settingsKeyEnv, "0123456789abcdef0123456789abcdef")
+	for _, authType := range []string{"key", "private-key", "privatekey", "ssh_key", "ssh-key", "private_key"} {
+		server, secrets := serverFromPayload(serverUpsertPayload{
+			ServerID:   "zgo",
+			Host:       "38.49.59.207",
+			AuthType:   authType,
+			PrivateKey: stringPtr("test-key"),
+		})
+		set, _, err := serverUpdateDocument(server, secrets, time.Unix(100, 0).UTC())
+		if err != nil {
+			t.Fatalf("serverUpdateDocument(%q) error = %v", authType, err)
+		}
+		if got := set["auth_type"]; got != "private_key" {
+			t.Fatalf("auth_type %q normalized to %#v, want private_key", authType, got)
+		}
+	}
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
