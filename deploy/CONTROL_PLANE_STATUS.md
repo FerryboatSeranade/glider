@@ -111,13 +111,14 @@ The current hosts already pull `v2026.06.08-control56` from GHCR. Keep `pull_pol
 
 ## Current Provisioning Rollout
 
-- `ovh-xboard` is running Admin image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision3` from `/root/data/docker_data/glider-admin`.
-- `zgo` is registered in the Admin `servers` collection with `server_id=zgo`, `node_id=zgo`, host `38.49.59.207`, deploy directory `/root/data/docker_data/glider`, image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision3`, and redacted private-key credentials.
+- `ovh-xboard` is running Admin image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision4` from `/root/data/docker_data/glider-admin`.
+- `zgo` is registered in the Admin `servers` collection with `server_id=zgo`, `node_id=zgo`, host `38.49.59.207`, deploy directory `/root/data/docker_data/glider`, image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision4`, and redacted private-key credentials.
 - The Admin-side SSH test job `job-kG4nGtsnzpZ07hQK` succeeded from `ovh-xboard` to `zgo` using the stored server credentials.
-- The Admin-side upgrade job `job-XXxFxGl-B4oRCFe0` succeeded and upgraded `zgo` to image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision3`.
-- After the upgrade, `zgo` reported container `glider` running, compose image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision3`, published ports `443` and `8443`, and no Admin `8444` listener.
+- The Admin-side preflight job `job-twvPYHTPqsFvdUUy` succeeded from `ovh-xboard` to `zgo`, reporting Docker `29.1.3`, Docker Compose `2.40.3`, deploy directory and compose file present, container `glider` running, `19G` free disk, `1234MB` available memory, and ports `443`/`8443` listening.
+- The Admin-side upgrade job `job-ybmMWnZ3Ve9A5Z3S` succeeded and upgraded `zgo` to image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision4`.
+- After the upgrade, `zgo` reported container `glider` running, compose image `ghcr.io/ferryboatseranade/glider:v2026.06.13-provision4`, published ports `443` and `8443`, and no Admin `8444` listener.
 - A proxy check through `zgo` on `127.0.0.1:8443` to `https://ipinfo.io/json` returned exit IP `91.230.73.88` (`AS50131 Spartan Host Ltd`, Dallas, Texas, US), confirming the data plane stayed functional after the Admin-driven upgrade.
-- Admin `/api/servers` now reports `zgo` status `upgraded`, `has_private_key=true`, and `last_deploy_job=job-XXxFxGl-B4oRCFe0`.
+- Admin `/api/servers` now reports `zgo` status `upgraded`, `has_private_key=true`, and `last_deploy_job=job-ybmMWnZ3Ve9A5Z3S`.
 - Admin `/api/nodes` reports `zgo` heartbeat with public IP `38.49.59.207`, config version `d4aa2e1bd01a91de...`, cert version `e3b0c44298fc1c14...`, and no config or certificate sync error.
 - Server `auth_type` now accepts private-key aliases such as `key`, `private-key`, `privatekey`, `ssh_key`, and `ssh-key`, normalizing them to `private_key` for API automation. This is covered by `TestServerAuthTypeAliases`.
-- The current branch adds a non-destructive server preflight job at `POST /api/servers/<server_id>/preflight-node`. It checks SSH reachability, Docker/Compose availability, deploy directory and compose file presence, current `glider` container state, disk/memory summary, and selected proxy port listeners before running a deploy or upgrade. It is covered by `TestHostPortFromMapping` and `TestAdminHTMLSmoke`.
+- The current branch adds a non-destructive server preflight job at `POST /api/servers/<server_id>/preflight-node`. It checks SSH reachability, Docker/Compose availability, deploy directory and compose file presence, current `glider` container state, disk/memory summary, and selected proxy port listeners before running a deploy or upgrade. It is covered by `TestHostPortFromMapping` and `TestAdminHTMLSmoke`, and deployed in `v2026.06.13-provision4`.
